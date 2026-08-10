@@ -1,0 +1,15 @@
+C:\Users\lenovo\Downloads\StockSmokeEnhancer\bin\StockSmokeEnhancer.dll
+C:\Users\lenovo\Downloads\StockSmokeEnhancer\bin\StockSmokeEnhancer.pdb
+C:\Users\lenovo\Downloads\StockSmokeEnhancer\obj\Debug\StockSmokeEnhancer.csproj.AssemblyReference.cache
+C:\Users\lenovo\Downloads\StockSmokeEnhancer\obj\Debug\StockSmokeEnhancer.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\lenovo\Downloads\StockSmokeEnhancer\obj\Debug\StockSmokeEnhancer.csproj.CoreCompileInputs.cache
+C:\Users\lenovo\Downloads\StockSmokeEnhancer\obj\Debug\StockSmokeEnhancer.dll
+C:\Users\lenovo\Downloads\StockSmokeEnhancer\obj\Debug\StockSmokeEnhancer.pdb
+C:\Users\lenovo\Downloads\VolumetricContrails\StockSmokeEnhancer\bin\StockSmokeEnhancer.dll
+C:\Users\lenovo\Downloads\VolumetricContrails\StockSmokeEnhancer\bin\StockSmokeEnhancer.pdb
+C:\Users\lenovo\Downloads\VolumetricContrails\StockSmokeEnhancer\obj\Debug\StockSmokeEnhancer.csproj.AssemblyReference.cache
+C:\Users\lenovo\Downloads\VolumetricContrails\StockSmokeEnhancer\obj\Debug\StockSmokeEnhancer.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\lenovo\Downloads\VolumetricContrails\StockSmokeEnhancer\obj\Debug\StockSmokeEnhancer.csproj.CoreCompileInputs.cache
+C:\Users\lenovo\Downloads\VolumetricContrails\StockSmokeEnhancer\obj\Debug\StockSmokeEnhancer.dll
+C:\Users\lenovo\Downloads\VolumetricContrails\StockSmokeEnhancer\obj\Debug\StockSmokeEnhancer.pdb
+C:\Users\lenovo\Downloads\VolumetricContrails\StockSmokeEnhancer\obj\Debug\StockSmokeEnhancer.sourcelink.json
