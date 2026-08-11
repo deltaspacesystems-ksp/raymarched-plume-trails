@@ -1,4 +1,4 @@
-Volumetric(in the future) Contrails mod for KSP!
+Volumetric(soon!!!!!!!) Contrails mod for KSP!
 
 # VolumetricContrails
 
