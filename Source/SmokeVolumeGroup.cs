@@ -56,6 +56,11 @@ namespace VolumetricContrails
 
         private const float BlendRadiusMultiplier = 1.4f; // jak mocno kule "rozciągają się" poza swój promień przy zlewaniu
 
+        // Musi się zgadzać z domyślną wartością _ReferenceRadius w SmokeVolumeMat -
+        // używane TYLKO do wyliczenia _TileRadiusRatio (skalowanie szumu rzeźbiącego
+        // per-kafelek, patrz BakeActiveTile), nie zmienia samego materiału.
+        private const float ShaderReferenceRadius = 18f;
+
         // Jaka część budżetu kłębów (fizyka/spawnowanie) jest zarezerwowana dla
         // osiadłych - bez tego gęste spawnowanie aktywnych przy dużej prędkości
         // wypychało z jednej wspólnej puli starsze, osiadłe kłęby dużo szybciej niż
@@ -87,7 +92,13 @@ namespace VolumetricContrails
         private float fadeStartAltitude;
         private float fadeEndAltitude;
         private const float GroundBounceDamping = 0.35f;
-        private const float VelocityConvergeRate = 0.35f;
+        // Było 0.35 (stała czasowa ~2.9s) - prędkość wyrzutu z silnika (ejectionSpeed
+        // w LaunchSmokeController) tłumiła się do dryfu (wiatr+buoyancy) zanim
+        // ruch zdążył być widoczny, zwłaszcza tuż po starcie gdy sama rakieta
+        // ledwo się rusza (niskie TWR) - kłąb wyglądał jak "przyklejony" do
+        // silnika zamiast widocznie wystrzelony. Wolniejsza konwergencja (~4.5s)
+        // zostawia wyrzutowej prędkości więcej czasu, zanim ustąpi dryfowi.
+        private const float VelocityConvergeRate = 0.22f;
 
         // Margines boxa: promień*BoxRadiusMarginMultiplier PLUS stały zapas w metrach
         // na domain warp w shaderze (_VortexStrength + _SilhouetteWarpStrength
@@ -111,6 +122,16 @@ namespace VolumetricContrails
             public RenderTexture densityTex;
             public RenderTexture blurredTex;
         }
+
+        // WYCOFANE: throttling pieczenia kafelków (odświeżanie co N klatek zamiast
+        // co klatkę, "temporal upscaling" inspirowany EVE). Przyczyna: tileIndex
+        // NIE jest stabilnym ID fizycznego fragmentu ogona w czasie - granice
+        // chunków przesuwają się co klatkę wraz z nowymi punktami. Throttlowany
+        // (zamrożony) kafelek zostawał na STAREJ pozycji, podczas gdy sąsiedni,
+        // świeżo odpieczony kafelek już "poszedł dalej" wraz z przesuniętą
+        // granicą chunku - dawało to okresowe, widoczne dziury w ogonie. Do
+        // ponownego rozważenia dopiero z ID kafelka stabilnym względem
+        // fizycznego fragmentu ogona, nie względem pozycji w liście.
 
         private readonly List<ActiveTile> activeTiles = new List<ActiveTile>();
         private readonly Vector4[] tileCentersBuffer = new Vector4[MaxTextureLayerPuffs];
@@ -410,24 +431,27 @@ namespace VolumetricContrails
             }
         }
 
+        // TYMCZASOWO wyłączony wzrost promienia z wiekiem (był: Lerp(startSize,
+        // maxSize, eased(age/lifeTime)) - rozszerzający się "kalafior") - user
+        // chce na razie jednolitą grubość ogona, żeby ustabilizować bazę przed
+        // powrotem do stylizacji rozszerzania (osobne zadanie na później).
         private float SizeForPuff(Puff p)
         {
-            float t = Mathf.Clamp01(p.age / lifeTime);
-            float eased = 1f - Mathf.Pow(1f - t, growthSharpness);
-            return Mathf.Lerp(startSize, maxSize, eased) * p.sizeMultiplier;
+            return startSize * p.sizeMultiplier;
         }
 
-        // Fade-in STAŁYM czasem (nie ułamkiem lifeTime!) - kłąb musi stać się
-        // widoczny prawie od razu, niezależnie jak długo potem żyje.
-        private const float FadeInDuration = 0.15f;
-
+        // WYCOFANE: fade-in alfy na starcie - przy nowej, kafelkowej architekturze
+        // dawało widoczne "bloby" (młode, jeszcze małe kłęby dostawały DODATKOWO
+        // obniżoną alfę na starcie, więc świeży fragment ogona blisko silnika
+        // wyglądał jak odizolowana, słabo połączona plama zamiast płynnie
+        // zwężającej się reszty). Kłąb jest teraz w pełnej alfie od razu po
+        // spawnie - tylko fade-out pod koniec życia zostaje.
         private float AlphaForAge(float age, bool settled)
         {
             float effectiveLifeTime = settled ? settledLifeTime : lifeTime;
             float t = Mathf.Clamp01(age / effectiveLifeTime);
-            float fadeIn = Mathf.Clamp01(age / FadeInDuration);
             float fadeOut = 1f - Mathf.Clamp01((t - 0.65f) / 0.35f);
-            return fadeIn * fadeOut;
+            return fadeOut;
         }
 
         private float AlphaForAltitude(Vector3 worldPos)
@@ -593,6 +617,7 @@ namespace VolumetricContrails
             Vector3 boxMin = Vector3.positiveInfinity;
             Vector3 boxMax = Vector3.negativeInfinity;
             int count = 0;
+            float radiusSum = 0f;
 
             for (int i = rangeStart; i < rangeEnd && count < MaxTextureLayerPuffs; i++)
             {
@@ -603,8 +628,17 @@ namespace VolumetricContrails
                 tileCentersBuffer[count] = new Vector4(pos.x, pos.y, pos.z, 0f);
                 tileRadiiBuffer[count] = radius;
                 count++;
+                radiusSum += radius;
 
-                float boundRadius = radius * BoxRadiusMarginMultiplier + BoxFixedWarpMargin;
+                // Stały margines (BoxFixedWarpMargin) był dobrany pod warp GRUBYCH,
+                // referencyjnych kłębów - na cienkim, młodym kłębie (mały promień)
+                // sam warp jest teraz proporcjonalnie mały (patrz _TileRadiusRatio w
+                // shaderze), więc pełny 15m margines tylko zjadał budżet tekseli
+                // stałej rozdzielczości 28^3 kosztem samego kształtu dymu (kłąb
+                // wypadał na 1-2 tekslach = widoczna "kulka" zamiast płynnej gęstości).
+                // Skalujemy margines tym samym stosunkiem promień/referencja.
+                float warpMarginScale = Mathf.Clamp(radius / ShaderReferenceRadius, 0.15f, 1f);
+                float boundRadius = radius * BoxRadiusMarginMultiplier + BoxFixedWarpMargin * warpMarginScale;
                 boxMin = Vector3.Min(boxMin, pos - Vector3.one * boundRadius);
                 boxMax = Vector3.Max(boxMax, pos + Vector3.one * boundRadius);
             }
@@ -649,10 +683,14 @@ namespace VolumetricContrails
             tile.renderer.transform.position = boxCenter;
             tile.renderer.transform.localScale = boxExtents * 2f;
 
+            float avgRadius = radiusSum / count;
+            float tileRadiusRatio = Mathf.Clamp(avgRadius / ShaderReferenceRadius, 0.05f, 1f);
+
             tile.propertyBlock.Clear();
             tile.propertyBlock.SetTexture("_DensityTex", tile.blurredTex);
             tile.propertyBlock.SetVector("_BoxCenter", new Vector4(boxCenter.x, boxCenter.y, boxCenter.z, 0f));
             tile.propertyBlock.SetVector("_BoxExtents", new Vector4(boxExtents.x, boxExtents.y, boxExtents.z, 0f));
+            tile.propertyBlock.SetFloat("_TileRadiusRatio", tileRadiusRatio);
             ApplyCameraInsideMarchReduction(tile.propertyBlock, boxCenter, boxExtents);
             tile.renderer.SetPropertyBlock(tile.propertyBlock);
         }

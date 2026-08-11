@@ -14,6 +14,7 @@ Shader "VolumetricContrails/SmokeVolume"
     // odczytem tekstury), nie perturbacją per-kula odległości jak w v1.
     Properties
     {
+        _DepthBiasDistance ("Depth Bias Distance (m) - przyciąga geometrię do kamery TYLKO na potrzeby testu głębi, pomaga wygrywać z cienkimi strukturami typu wieża startowa", Float) = 6.0
         _NoiseScale ("Detail Noise Scale", Float) = 0.15
         _WorleyScale ("Worley Noise Scale (kalafiorowatość - detal wewnętrzny)", Float) = 0.35
         _ScrollSpeed ("Noise Scroll Speed", Vector) = (0.03, 0.05, 0.02, 0)
@@ -26,6 +27,7 @@ Shader "VolumetricContrails/SmokeVolume"
         _SilhouetteNoiseScale ("Silhouette Erosion Noise Scale", Float) = 0.1
         _EdgeErosionStrength ("Edge Erosion Strength (0=gładka krawędź, wyżej=poszarpana)", Range(0,1)) = 0.85
         _ReferenceRadius ("Reference Radius (m) - promień przy którym powyższe skale są 'poprawnie' dostrojone; cieńsze partie warstwy polyline dostają proporcjonalnie mniejszy/gęstszy szum (ten sam kalafior, mniejszy)", Float) = 18.0
+        _TileRadiusRatio ("Tile Radius Ratio (per-instance, ustawiane z C# per kafelek = średni promień kłębów w kafelku / _ReferenceRadius) - domyślnie 1.0 dla warstwy osiadłej (grube kłęby, blisko referencji)", Float) = 1.0
 
         _BaseColor ("Base Color", Color) = (1, 1, 1, 1)
         _MarchSteps ("March Steps", Int) = 24
@@ -121,6 +123,7 @@ Shader "VolumetricContrails/SmokeVolume"
             fixed4 _SunlitColor;
             fixed4 _ShadowColor;
             float _ReferenceRadius;
+            float _TileRadiusRatio;
             int _MarchSteps;
             float _Density;
             float _Absorption;
@@ -169,11 +172,25 @@ Shader "VolumetricContrails/SmokeVolume"
             sampler3D _DensityTex; // wypełniana przez SmokeVolumeSplat.compute, raz na klatkę
 #endif
 
+            // Ile metrów geometria kafelka jest "przyciągana" w stronę kamery TYLKO
+            // dla testu głębi (nie wpływa na sam raymarching - worldPos w o.worldPos
+            // zostaje ORYGINALNY, nieobciążony). Pomaga wygrywać depth test z
+            // cienkimi strukturami sceny (np. wieża startowa) bez pełnej kamery
+            // wykluczającej z depth bufora (ta dwukrotnie crashowała grę - patrz
+            // LaunchpadOcclusionExcluder.cs, obecnie wyłączony). Mały, stały bias -
+            // za duży zacząłby przebijać się przez samą rakietę, tak jak wcześniejsza
+            // próba z globalnym ZTest Always.
+            float _DepthBiasDistance;
+
             v2f vert (appdata v)
             {
                 v2f o;
-                o.pos = UnityObjectToClipPos(v.vertex);
-                o.worldPos = mul(unity_ObjectToWorld, v.vertex).xyz;
+                float3 worldPos = mul(unity_ObjectToWorld, v.vertex).xyz;
+                float3 viewDir = normalize(worldPos - _WorldSpaceCameraPos);
+                float3 biasedWorldPos = worldPos - viewDir * _DepthBiasDistance;
+
+                o.pos = mul(UNITY_MATRIX_VP, float4(biasedWorldPos, 1.0));
+                o.worldPos = worldPos; // NIEobciążony - raymarching w frag() musi liczyć się od prawdziwej geometrii
                 o.screenPos = ComputeScreenPos(o.pos);
                 return o;
             }
@@ -491,9 +508,25 @@ Shader "VolumetricContrails/SmokeVolume"
             // chmura u ziemi, zwarta i stabilna, dobrze się mieści w stałej rozdzielczości.
             float DensityAt(float3 p, out float bumpFactor, out float outRadiusRatio)
             {
-                outRadiusRatio = 1.0;
-                float3 vortexOffset = DomainWarp(p, _VortexScale, _VortexStrength, 0.08);
-                float3 silhouetteOffset = DomainWarp(p, _SilhouetteWarpScale, _SilhouetteWarpStrength, 0.03);
+                // _TileRadiusRatio przychodzi per-instancję z C# (BakeActiveTile) -
+                // bez tego szum rzeźbiący (freqScale = 1/radiusRatio w
+                // ApplyDetailAndErosion) był zawsze dostrojony pod GRUBĄ referencyjną
+                // chmurę (18m) niezależnie od tego, czy kafelek zawiera świeże,
+                // cienkie kłęby tuż przy silniku - te same, za duże komórki Worleya
+                // wycinały cienkie kłęby na kilka rozłącznych brył zamiast
+                // proporcjonalnie drobnej rzeźby ("pojedyncze cząstki zanim się
+                // połączą"). Warstwa osiadła zostawia domyślne 1.0 z Properties (nie
+                // ustawia tego property).
+                float radiusRatio = clamp(_TileRadiusRatio, 0.05, 1.0);
+                outRadiusRatio = radiusRatio;
+
+                // Skalowane tak samo jak w wycofanej wersji polyline (patrz
+                // DensityAt powyżej w gałęzi SMOKE_VOLUME_POLYLINE) - bez tego
+                // przesunięcie warpu byłoby stałe niezależnie od promienia kafelka,
+                // więc na cienkim kłębie mogłoby przesuwać próbkę daleko poza jego
+                // faktyczny rozmiar.
+                float3 vortexOffset = DomainWarp(p, _VortexScale / radiusRatio, _VortexStrength * radiusRatio, 0.08);
+                float3 silhouetteOffset = DomainWarp(p, _SilhouetteWarpScale / radiusRatio, _SilhouetteWarpStrength * radiusRatio, 0.03);
                 float3 pWarped = p + vortexOffset + silhouetteOffset;
 
                 float3 boxMin = _BoxCenter - _BoxExtents;
@@ -501,7 +534,7 @@ Shader "VolumetricContrails/SmokeVolume"
                 if (any(uv < 0.0) || any(uv > 1.0)) { bumpFactor = 0.0; return 0.0; }
 
                 float coverage = tex3Dlod(_DensityTex, float4(uv, 0.0)).r;
-                return ApplyDetailAndErosion(coverage, p, pWarped, 1.0, bumpFactor);
+                return ApplyDetailAndErosion(coverage, p, pWarped, radiusRatio, bumpFactor);
             }
 #endif
 

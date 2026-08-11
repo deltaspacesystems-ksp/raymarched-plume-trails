@@ -18,8 +18,12 @@ namespace VolumetricContrails
         public float spawnInterval = 0.2f;
 
         // Wyrzut z silnika - LEKKI, nie gwałtowny (zgodnie z ostatnią wskazówką:
-        // "ma tylko lekko go wyrzucać").
-        public float ejectionSpeed = 12f;
+        // "ma tylko lekko go wyrzucać"). Podniesione z 12 - przy tamtej wartości
+        // i szybkiej konwergencji do dryfu (patrz VelocityConvergeRate) ruch był
+        // praktycznie niewidoczny, zwłaszcza tuż po starcie przy niskim TWR, gdy
+        // sama rakieta ledwo się odrywa od ziemi - kłąb wyglądał jak przyklejony
+        // do silnika zamiast wyrzucony.
+        public float ejectionSpeed = 25f;
 
         // Podniesione (było 25) - teraz gdy budżet aktywnych kłębów nie jest już
         // sztucznie ograniczony do rozmiaru tablicy shadera (patrz EnforcePuffBudget
@@ -77,12 +81,19 @@ namespace VolumetricContrails
 
         // Jaki ułamek promienia kłębu może maksymalnie dzielić środki dwóch kolejnych
         // kłębów, żeby ich miękkie krawędzie (patrz _BlendRadiusMultiplier w shaderze)
-        // nadal się nachodziły. Poniżej tej wartości - wymuszamy dodatkowy spawn
-        // niezależnie od spawnTimer, bo inaczej przy dużej prędkości rakiety odległość
-        // między kolejnymi kłębami (czysto czasowy spawnInterval) rośnie wraz z
-        // prędkością i kłęby przestają się zlewać ("paciorki na sznurku").
-        private const float MaxSpawnSpacingFraction = 0.5f;
-        private const float MinSpawnSpacing = 1.0f;
+        // nadal się nachodziły - to JEDYNY trigger spawnu (patrz shouldSpawn), czysto
+        // dystansowy, bez komponentu czasowego.
+        // Podniesione (było 0.5/1.0) - teraz gdy wzrost promienia jest TYMCZASOWO
+        // wyłączony (SizeForPuff w SmokeVolumeGroup zwraca stały startSize przez
+        // całe życie kłębu, patrz komentarz tam), gęstsze odstępy z poprzedniego
+        // strojenia (dobrane pod CIENKĄ młodą końcówkę rosnącego ogona) są teraz
+        // stosowane wzdłuż CAŁEJ długości ogona - przy typowym locie (kilka km
+        // wysokości w ciągu lifeTime) to tysiące zbędnie gęstych punktów, dużo
+        // więcej kafelków (MaxActiveTiles) niż potrzeba, stąd zły performance.
+        // Wciąż bezpiecznie poniżej _BlendRadiusMultiplier (1.4x promienia) więc
+        // sąsiednie kule nadal solidnie się zlewają.
+        private const float MaxSpawnSpacingFraction = 0.65f;
+        private const float MinSpawnSpacing = 1.8f;
 
         // Jeśli odcinek do "dogonienia" jest podejrzanie długi (np. silniki chwilowo
         // przestały spełniać warunki na kilka sekund, po czym wróciły daleko od
@@ -179,6 +190,10 @@ namespace VolumetricContrails
                             // wymagałby dziesiątek kłębów na klatkę, żeby go dogonić.
                             float maxSpacing = Mathf.Max(currentRadius * MaxSpawnSpacingFraction, MinSpawnSpacing);
 
+                            // PRÓBA czysto dystansowego triggera (bez spawnTimer) cofnięta -
+                            // przy silnym spadku FPS (np. trawa Parallaxa blisko kamery)
+                            // dawała widoczne, rozłączne "koraliki" zamiast ciągłego ogona.
+                            // Wraca timer JAKO DODATKOWY trigger obok dystansu.
                             g.spawnTimer -= TimeWarp.fixedDeltaTime;
                             bool timerElapsed = g.spawnTimer <= 0f;
                             bool outranSpacing = g.lastSpawnPos.HasValue
