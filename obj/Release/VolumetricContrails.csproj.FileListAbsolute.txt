@@ -1,8 +1,0 @@
-C:\Users\lenovo\Downloads\VolumetricContrails\bin\VolumetricContrails.dll
-C:\Users\lenovo\Downloads\VolumetricContrails\bin\VolumetricContrails.pdb
-C:\Users\lenovo\Downloads\VolumetricContrails\obj\Release\VolumetricContrails.csproj.AssemblyReference.cache
-C:\Users\lenovo\Downloads\VolumetricContrails\obj\Release\VolumetricContrails.GeneratedMSBuildEditorConfig.editorconfig
-C:\Users\lenovo\Downloads\VolumetricContrails\obj\Release\VolumetricContrails.csproj.CoreCompileInputs.cache
-C:\Users\lenovo\Downloads\VolumetricContrails\obj\Release\VolumetricContrails.sourcelink.json
-C:\Users\lenovo\Downloads\VolumetricContrails\obj\Release\VolumetricContrails.dll
-C:\Users\lenovo\Downloads\VolumetricContrails\obj\Release\VolumetricContrails.pdb
