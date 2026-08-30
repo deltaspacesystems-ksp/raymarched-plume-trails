@@ -1,0 +1,235 @@
+// bakes puffs (union of soft spheres) into a 3d density texture once per
+// frame, fragment shader just samples it instead of summing per pixel
+#pragma kernel Splat
+#pragma kernel Blur
+#pragma kernel BakeNoise
+
+#define MAX_PUFFS 256
+
+RWTexture3D<float> _DensityTex;
+RWTexture3D<float> _BlurredTex; // blur target
+
+int _PuffCount;
+float4 _PuffCenters[MAX_PUFFS]; // world space, .w unused
+float _PuffRadii[MAX_PUFFS];
+float _BlendRadiusMultiplier;
+
+float3 _BoxMin;
+float3 _BoxSize;
+uint3 _Resolution;
+
+[numthreads(4,4,4)]
+void Splat(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Resolution.x || id.y >= _Resolution.y || id.z >= _Resolution.z) return;
+
+    float3 uv = (float3(id) + 0.5) / float3(_Resolution);
+    float3 worldPos = _BoxMin + uv * _BoxSize;
+
+    float density = 0.0;
+    for (int i = 0; i < _PuffCount; i++)
+    {
+        float3 center = _PuffCenters[i].xyz;
+        float radius = _PuffRadii[i];
+        if (radius <= 0.0) continue;
+
+        float blendRadius = radius * _BlendRadiusMultiplier;
+        float d = distance(worldPos, center);
+        if (d >= blendRadius) continue;
+
+        float t = saturate(1.0 - d / blendRadius);
+        // max, not sum. Summing saturates any two overlapping puffs to 1.0, so the cloud
+        // collapses into one uniform mass instead of many separate billows.
+        density = max(density, t * t * (3.0 - 2.0 * t));
+    }
+
+    _DensityTex[id] = saturate(density);
+}
+
+// simple 3x3x3 box blur on the baked density, softens sphere-shaped edges
+[numthreads(4,4,4)]
+void Blur(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Resolution.x || id.y >= _Resolution.y || id.z >= _Resolution.z) return;
+
+    float sum = 0.0;
+    int count = 0;
+
+    for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++)
+    {
+        int3 p = int3(id) + int3(dx, dy, dz);
+        if (p.x < 0 || p.y < 0 || p.z < 0) continue;
+        if (p.x >= (int)_Resolution.x || p.y >= (int)_Resolution.y || p.z >= (int)_Resolution.z) continue;
+
+        sum += _DensityTex[uint3(p)];
+        count++;
+    }
+
+    _BlurredTex[id] = sum / max(count, 1);
+}
+
+// ---------------------------------------------------------------------------
+// One-time tileable noise bake.
+//
+// Evaluating fbm/perlin-worley at every density sample cost roughly 500 hash calls
+// each, up to ~160 times per pixel once the light march is counted. Baked once, all
+// of that becomes a few filtered fetches.
+//
+// Everything here must be PERIODIC so the texture tiles: the lattice hash wraps
+// modulo the period and octave frequencies step by exactly 2. Octaves are offset
+// from each other rather than scaled by 2.02, which would break periodicity.
+//
+// Baking also band-limits the noise for free - nothing finer than a texel can be
+// stored - and sub-texel procedural detail was a source of sparkle.
+// ---------------------------------------------------------------------------
+
+RWTexture3D<float4> _NoiseOut;
+uint3 _NoiseResolution;
+float _NoisePeriod; // lattice cells covered by the full texture
+
+float hashTiled(float3 cell, float period)
+{
+    cell = fmod(cell + period, period); // wrap so opposite faces agree
+    float3 p = frac(cell * 0.3183099 + 0.1);
+    p *= 17.0;
+    return frac(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+
+float3 hash3Tiled(float3 cell, float period)
+{
+    return float3(
+        hashTiled(cell, period),
+        hashTiled(cell + float3(11.1, 7.3, 3.7), period),
+        hashTiled(cell + float3(23.7, 2.1, 19.4), period));
+}
+
+float valueNoiseTiled(float3 p, float period)
+{
+    float3 i = floor(p);
+    float3 f = frac(p);
+    f = f * f * (3.0 - 2.0 * f);
+
+    float n000 = hashTiled(i + float3(0,0,0), period);
+    float n100 = hashTiled(i + float3(1,0,0), period);
+    float n010 = hashTiled(i + float3(0,1,0), period);
+    float n110 = hashTiled(i + float3(1,1,0), period);
+    float n001 = hashTiled(i + float3(0,0,1), period);
+    float n101 = hashTiled(i + float3(1,0,1), period);
+    float n011 = hashTiled(i + float3(0,1,1), period);
+    float n111 = hashTiled(i + float3(1,1,1), period);
+
+    float nx00 = lerp(n000, n100, f.x);
+    float nx10 = lerp(n010, n110, f.x);
+    float nx01 = lerp(n001, n101, f.x);
+    float nx11 = lerp(n011, n111, f.x);
+
+    float nxy0 = lerp(nx00, nx10, f.y);
+    float nxy1 = lerp(nx01, nx11, f.y);
+
+    return lerp(nxy0, nxy1, f.z);
+}
+
+// 3 octaves, not 4: at 128^3 over _NoisePeriod = 8 cells a 4th octave would land
+// on ~2 texels, i.e. right at Nyquist, and alias inside the texture itself
+float fbmTiled(float3 p, float period, float3 offset)
+{
+    // A standard 0.5 gain spreads energy evenly enough that the two fine octaves dominate
+    // what the eye picks up - lots of detail but all small, i.e. fluff. Real cloud billows
+    // put nearly all the energy in the largest octave. Steepening the falloff does not
+    // change any octave's feature SIZE, it changes which octave you are looking at.
+    float v = 0.0;
+    float amp = 0.5;
+    float freq = 1.0;
+    float norm = 0.0;
+    for (int i = 0; i < 3; i++)
+    {
+        v += amp * valueNoiseTiled(p * freq + offset, period * freq);
+        norm += amp;
+        freq *= 2.0;
+        amp *= 0.35;
+        offset += float3(19.3, 7.7, 13.1); // decorrelate octaves without breaking tiling
+    }
+    return v / norm; // accumulated, so the gain above can change without a stale constant
+}
+
+float worleyNoiseTiled(float3 p, float period)
+{
+    float3 baseCell = floor(p);
+    float minDist = 8.0;
+
+    for (int x = -1; x <= 1; x++)
+    for (int y = -1; y <= 1; y++)
+    for (int z = -1; z <= 1; z++)
+    {
+        float3 cell = baseCell + float3(x, y, z);
+        // hash the WRAPPED cell but place the feature point at the unwrapped one,
+        // so cells continue correctly across the seam
+        float3 cellPoint = cell + hash3Tiled(cell, period);
+        float d = length(p - cellPoint);
+        minDist = min(minDist, d);
+    }
+
+    return minDist;
+}
+
+// three worley octaves, used to carve coverage (not just tint it)
+float worleyFbmTiled(float3 p, float period)
+{
+    // Same reasoning as fbmTiled's gain: the 4x octave is small cells, and small cells
+    // are exactly the fluff. Worley is the channel that decides how big a BILLOW is, so
+    // it matters even more here than in the perlin fbm.
+    float sum = 0.0;
+    float amp = 0.55;
+    float freq = 1.0;
+    for (int i = 0; i < 3; i++)
+    {
+        sum += (1.0 - saturate(worleyNoiseTiled(p * freq, period * freq))) * amp;
+        freq *= 2.0;
+        amp *= 0.35;
+    }
+    return saturate(sum);
+}
+
+// perlin fbm eroded by a worley basis - billowy base shape with worley-carved gaps.
+// This is what makes the cauliflower: plain value noise only undulates, it has no
+// mechanism to cut hollows into the coverage. Worley's cell structure is exactly
+// that mechanism.
+float perlinWorleyTiled(float3 p, float period)
+{
+    float perlin = fbmTiled(p, period, float3(0, 0, 0));
+    float worley = worleyFbmTiled(p * 2.0, period * 2.0);
+    float floorLevel = (1.0 - worley) * 0.6;
+    float eroded = saturate((perlin - floorLevel) / max(1.0 - floorLevel, 0.0001));
+    // 0.6 -> 0.85. The cauliflower comes from WORLEY, not from perlin: worley's cells
+    // are round, so remapping by it produces bulges with curved boundaries, while perlin
+    // on its own only undulates and reads as fog. At 0.6 the result was still mostly
+    // perlin, which is why the surface came out as fuzz on a tube rather than as
+    // billows - the real-cloud recipes this follows lean much harder on the worley side.
+    //
+    // Safe to push now in a way it was not before: the detail octave that samples this
+    // channel is add-only since _DetailBias, so a more aggressive basis adds rounder
+    // lumps instead of carving deeper holes.
+    return saturate(lerp(perlin, eroded, 0.85));
+}
+
+[numthreads(4,4,4)]
+void BakeNoise(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _NoiseResolution.x || id.y >= _NoiseResolution.y || id.z >= _NoiseResolution.z) return;
+
+    float3 uvw = (float3(id) + 0.5) / float3(_NoiseResolution);
+    float3 p = uvw * _NoisePeriod;
+
+    // RGB is exactly the vector field DomainWarp needs (it wanted three fbm values
+    // at fixed offsets), so a warp costs ONE fetch instead of three fbm evaluations.
+    // A carries the perlin-worley used by detail buildup and edge erosion.
+    float4 outValue;
+    outValue.r = fbmTiled(p, _NoisePeriod, float3(37.2, 17.1, 5.3));
+    outValue.g = fbmTiled(p, _NoisePeriod, float3(-11.3, 44.5, 8.1));
+    outValue.b = fbmTiled(p, _NoisePeriod, float3(5.7, -22.9, 13.6));
+    outValue.a = perlinWorleyTiled(p, _NoisePeriod);
+
+    _NoiseOut[id] = outValue;
+}
