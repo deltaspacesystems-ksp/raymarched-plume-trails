@@ -1,0 +1,87 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <AssemblyName>VolumetricContrails</AssemblyName>
+    <RootNamespace>VolumetricContrails</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputPath>bin\</OutputPath>
+    <Version>0.1.0</Version>
+    <AssemblyVersion>0.1.0.0</AssemblyVersion>
+    <FileVersion>0.1.0.0</FileVersion>
+
+    <!-- Path to your KSP install's Managed folder, which holds Assembly-CSharp.dll and
+         the UnityEngine assemblies this plugin compiles against. Those DLLs ship with
+         KSP and are deliberately NOT redistributed here, so every builder must point
+         this at their own install.
+
+         Override without editing this file, either way:
+           dotnet build -p:KSPManagedDir="C:\Path\To\KSP\KSP_x64_Data\Managed"
+         or via a git-ignored Directory.Build.props next to this file:
+           <Project><PropertyGroup>
+             <KSPManagedDir>C:\Path\To\KSP\KSP_x64_Data\Managed</KSPManagedDir>
+           </PropertyGroup></Project> -->
+    <KSPManagedDir Condition="'$(KSPManagedDir)' == ''">D:\ksp for mod testing\KSP_x64_Data\Managed</KSPManagedDir>
+
+    <!-- Optional: point at a GameData/VolumetricContrails/Plugins folder to deploy every
+         build straight into a KSP install. Empty by default so a plain clone builds
+         without writing anywhere outside its own directory. -->
+    <KSPDeployDir Condition="'$(KSPDeployDir)' == ''"></KSPDeployDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="UnityEditorScripts\**\*.cs" />
+    <Compile Remove="old\**\*.cs" />
+    <Compile Remove="StockSmokeEnhancer\**\*.cs" />
+    <!-- kept for reference/rollback only, never built -->
+    <Compile Remove="Snapshots\**\*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="Assembly-CSharp">
+      <HintPath>$(KSPManagedDir)\Assembly-CSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>$(KSPManagedDir)\UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(KSPManagedDir)\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.AssetBundleModule">
+      <HintPath>$(KSPManagedDir)\UnityEngine.AssetBundleModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.PhysicsModule">
+      <HintPath>$(KSPManagedDir)\UnityEngine.PhysicsModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.ParticleSystemModule">
+      <HintPath>$(KSPManagedDir)\UnityEngine.ParticleSystemModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.AnimationModule">
+      <HintPath>$(KSPManagedDir)\UnityEngine.AnimationModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.IMGUIModule">
+      <HintPath>$(KSPManagedDir)\UnityEngine.IMGUIModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- Texture2D.LoadImage, for the toolbar icon -->
+    <Reference Include="UnityEngine.ImageConversionModule">
+      <HintPath>$(KSPManagedDir)\UnityEngine.ImageConversionModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <Target Name="CopyToGameData" AfterTargets="Build" Condition="'$(KSPDeployDir)' != ''">
+    <Copy SourceFiles="$(OutputPath)$(AssemblyName).dll" DestinationFolder="$(KSPDeployDir)" />
+  </Target>
+
+</Project>
