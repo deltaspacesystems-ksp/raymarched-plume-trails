@@ -1,9 +1,15 @@
 # Volumetric Plume Trails mod for KSP!
 
 
-
 <sub> h </sub>
+
+# Images
+
+<img width="1399" height="1072" alt="Screenshot 2026-08-30 021905" src="https://github.com/user-attachments/assets/c8a8a356-89b2-4713-bbdb-4a76e3cdf8bb" />
+
+
 # Licence
+
 
 Shield: [![CC BY-NC-SA 4.0][cc-by-nc-sa-shield]][cc-by-nc-sa]
 
