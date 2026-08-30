@@ -1,0 +1,27 @@
+ManifestFileVersion: 0
+CRC: 3392785534
+Hashes:
+  AssetFileHash:
+    serializedVersion: 2
+    Hash: bb1d4a545cd52e5e28908014acfb7dbd
+  TypeTreeHash:
+    serializedVersion: 2
+    Hash: 7ed60c6f4461c0a50b033e31d0641f4c
+HashAppended: 0
+ClassTypes:
+- Class: 21
+  Script: {instanceID: 0}
+- Class: 28
+  Script: {instanceID: 0}
+- Class: 48
+  Script: {instanceID: 0}
+- Class: 72
+  Script: {instanceID: 0}
+SerializeReferenceClassIdentifiers: []
+Assets:
+- Assets/VolumetricContrails/ContrailMat.mat
+- Assets/VolumetricContrails/SmokeVolumeSplat.compute
+- Assets/VolumetricContrails/SmokeMat.mat
+- Assets/VolumetricContrails/SmokeVolumeMat.mat
+- Assets/VolumetricContrails/PuffMat.mat
+Dependencies: []
