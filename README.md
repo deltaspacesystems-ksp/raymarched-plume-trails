@@ -1,8 +1,8 @@
-Volumetric Plume Trails mod for KSP!
-
-need to do this
+# Volumetric Plume Trails mod for KSP!
 
 
+
+<sub> h </sub>
 # Licence
 
 Shield: [![CC BY-NC-SA 4.0][cc-by-nc-sa-shield]][cc-by-nc-sa]
