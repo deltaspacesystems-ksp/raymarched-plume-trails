@@ -1,5 +1,7 @@
 # Volumetric Plume Trails mod for KSP!
-
+need to fill thjis with info
+# Our Discord Server
+https://discord.gg/2CwBFzyqa
 
 <sub> h </sub>
 
