@@ -11,7 +11,8 @@ https://discord.gg/2CwBFzyqa
 
 # Credits❤️
 Credits to Blackrack and KSA for inspiring me to do this mod
-CRedits to Kyle Kerman (discord:chez_tasty_26158) for making a veeeeeery peak icon for this mod❤️
+
+Credits to Kyle Kerman (discord:chez_tasty_26158) for making a veeeeeery peak icon for this mod❤️
 
 # Licence
 
