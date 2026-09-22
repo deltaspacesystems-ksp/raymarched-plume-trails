@@ -48,7 +48,7 @@ namespace VolumetricContrails
             if (touched > 0)
             {
                 Debug.Log(string.Format(
-                    "[HairyBlob] Enabled depth texture on {0} of {1} cameras.",
+                    "[PlumeTrails] Enabled depth texture on {0} of {1} cameras.",
                     touched, cameras.Length));
             }
         }

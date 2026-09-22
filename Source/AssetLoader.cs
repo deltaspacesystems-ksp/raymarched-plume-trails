@@ -28,7 +28,7 @@ namespace VolumetricContrails
         private const string SmokeCompositeShaderAssetName = "SmokeComposite";
 
         // Directory this DLL was loaded from, i.e. <GameData>/<whatever>/Plugins.
-        private static string AssemblyDirectory()
+        internal static string AssemblyDirectory()
         {
             return Path.GetDirectoryName(
                 System.Reflection.Assembly.GetExecutingAssembly().Location);
@@ -71,7 +71,7 @@ namespace VolumetricContrails
             // otherwise undiagnosable from a log - every requirement below can fail
             // silently. Ask for these lines first in any blank-screen report.
             Debug.Log(string.Format(
-                "[HairyBlob] graphics: device={0} shaderLevel={1} computeShaders={2} " +
+                "[PlumeTrails] graphics: device={0} shaderLevel={1} computeShaders={2} " +
                 "3dTex={3} randomWrite={4} ARGBHalf3D={5}",
                 SystemInfo.graphicsDeviceType,
                 SystemInfo.graphicsShaderLevel,
@@ -88,18 +88,18 @@ namespace VolumetricContrails
 
             if (bundlePath == null)
             {
-                Debug.LogError("[HairyBlob] AssetBundle '" + BundleFileName + "' not found. Expected it "
+                Debug.LogError("[PlumeTrails] AssetBundle '" + BundleFileName + "' not found. Expected it "
                     + "in a 'Bundles' folder next to this plugin's own folder. Checked alongside the "
                     + "assembly at: " + AssemblyDirectory()
                     + " and at the legacy path GameData/" + BundleRelativePath);
                 return;
             }
 
-            Debug.Log("[HairyBlob] Loading AssetBundle from: " + bundlePath);
+            Debug.Log("[PlumeTrails] Loading AssetBundle from: " + bundlePath);
             AssetBundle bundle = AssetBundle.LoadFromFile(bundlePath);
             if (bundle == null)
             {
-                Debug.LogError("[HairyBlob] AssetBundle.LoadFromFile returned null. The Unity version " +
+                Debug.LogError("[PlumeTrails] AssetBundle.LoadFromFile returned null. The Unity version " +
                     "used to build the bundle probably does not match KSP's.");
                 return;
             }
@@ -110,14 +110,14 @@ namespace VolumetricContrails
             ShaderCache.SmokeCompositeShader = bundle.LoadAsset<Shader>(SmokeCompositeShaderAssetName);
             if (ShaderCache.SmokeCompositeShader == null)
             {
-                Debug.LogError("[HairyBlob] Composite shader '" + SmokeCompositeShaderAssetName +
+                Debug.LogError("[PlumeTrails] Composite shader '" + SmokeCompositeShaderAssetName +
                     "' missing from the bundle - smoke will not be drawn. Rebuild the AssetBundle.");
             }
 
             ShaderCache.SmokeVolumeSplatCompute = bundle.LoadAsset<ComputeShader>(SmokeVolumeSplatComputeAssetName);
             if (ShaderCache.SmokeVolumeSplatCompute == null)
             {
-                Debug.LogError("[HairyBlob] Compute shader '" + SmokeVolumeSplatComputeAssetName + "' missing from the bundle.");
+                Debug.LogError("[PlumeTrails] Compute shader '" + SmokeVolumeSplatComputeAssetName + "' missing from the bundle.");
             }
             else
             {
@@ -146,7 +146,7 @@ namespace VolumetricContrails
             // KSP forced to OpenGL or DX9 is the usual cause; this needs SM5.0.
             if (!SystemInfo.supportsComputeShaders)
             {
-                Debug.LogError("[HairyBlob] GPU/graphics API reports NO compute shader support (device: "
+                Debug.LogError("[PlumeTrails] GPU/graphics API reports NO compute shader support (device: "
                     + SystemInfo.graphicsDeviceType + "). The noise volume cannot be baked and the smoke "
                     + "will not render. If KSP was launched with -force-glcore, -force-opengl or "
                     + "-force-d3d9, remove that flag so it runs on DirectX 11.");
@@ -155,7 +155,7 @@ namespace VolumetricContrails
 
             if (!SystemInfo.SupportsRenderTextureFormat(RenderTextureFormat.ARGBHalf))
             {
-                Debug.LogError("[HairyBlob] ARGBHalf render textures are unsupported on this device ("
+                Debug.LogError("[PlumeTrails] ARGBHalf render textures are unsupported on this device ("
                     + SystemInfo.graphicsDeviceType + ") - cannot bake the noise volume.");
                 return;
             }
@@ -163,7 +163,7 @@ namespace VolumetricContrails
             int kernel = compute.FindKernel("BakeNoise");
             if (kernel < 0)
             {
-                Debug.LogError("[HairyBlob] Compute shader has no 'BakeNoise' kernel - the bundle is " +
+                Debug.LogError("[PlumeTrails] Compute shader has no 'BakeNoise' kernel - the bundle is " +
                     "older than the plugin. Rebuild the AssetBundle.");
                 return;
             }
@@ -183,7 +183,7 @@ namespace VolumetricContrails
             // writable 3D target can be refused even where compute itself is supported.
             if (!tex.Create())
             {
-                Debug.LogError("[HairyBlob] Failed to create the " + NoiseResolution + "^3 ARGBHalf 3D "
+                Debug.LogError("[PlumeTrails] Failed to create the " + NoiseResolution + "^3 ARGBHalf 3D "
                     + "render texture (randomWrite). The smoke will not render. Device: "
                     + SystemInfo.graphicsDeviceType + ", shader level " + SystemInfo.graphicsShaderLevel + ".");
                 return;
@@ -201,7 +201,7 @@ namespace VolumetricContrails
             Shader.SetGlobalFloat("_NoiseTilePeriod", NoisePeriod);
 
             Debug.Log(string.Format(
-                "[HairyBlob] Baked {0}^3 noise texture, period {1} cells.",
+                "[PlumeTrails] Baked {0}^3 noise texture, period {1} cells.",
                 NoiseResolution, NoisePeriod));
         }
 
@@ -210,7 +210,7 @@ namespace VolumetricContrails
             Material mat = bundle.LoadAsset<Material>(materialAssetName);
             if (mat == null)
             {
-                Debug.LogError("[HairyBlob] Material '" + materialAssetName + "' missing from the bundle.");
+                Debug.LogError("[PlumeTrails] Material '" + materialAssetName + "' missing from the bundle.");
                 return;
             }
 
@@ -220,13 +220,13 @@ namespace VolumetricContrails
             // this GPU, Unity silently swaps in the error shader instead of raising.
             if (!target.isSupported)
             {
-                Debug.LogError("[HairyBlob] Shader '" + target.name + "' is NOT supported on this GPU ("
+                Debug.LogError("[PlumeTrails] Shader '" + target.name + "' is NOT supported on this GPU ("
                     + SystemInfo.graphicsDeviceType + ", shader level " + SystemInfo.graphicsShaderLevel
                     + "). It needs shader model 3.5 or better. The smoke will not render.");
                 return;
             }
 
-            Debug.Log("[HairyBlob] Loaded shader from '" + materialAssetName + "': " + target.name
+            Debug.Log("[PlumeTrails] Loaded shader from '" + materialAssetName + "': " + target.name
                 + " (supported)");
         }
     }

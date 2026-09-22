@@ -8,6 +8,11 @@ namespace VolumetricContrails
         public Vector3 position;
         public Vector3 forward;
         public float throttle;
+        // Delivered thrust as a fraction of rated. For a solid motor this is the one that
+        // matters: throttle is pinned at 1 for its whole burn, while the thrust itself
+        // follows the grain's curve and tails off at the end - which is exactly when the
+        // real exhaust thins out.
+        public float thrustFraction;
         public float isp; // realIsp, for exhaust ejection speed scaling
         public uint partId;
     }
@@ -17,6 +22,34 @@ namespace VolumetricContrails
     {
         // verniers below this fraction of the strongest engine are ignored
         private const float RelativeThrustThreshold = 0.2f;
+
+        // Solid rocket motor?
+        //
+        // Two tests, because each misses something the other catches. engineType is KSP's
+        // own flag and survives propellant renames, but not every part pack sets it.
+        // Burning SolidFuel covers those. Either is enough.
+        //
+        // Dense launch smoke is a property of SOLID propellant: the aluminium in the grain
+        // burns to aluminium oxide, and those particles are what make the thick white
+        // column. Kerolox leaves far less and hydrolox essentially none, so emitting only
+        // from these is not a simplification - it is the real distinction.
+        public static bool IsSolidRocket(ModuleEngines engine)
+        {
+            if (engine == null) return false;
+            if (engine.engineType == EngineType.SolidBooster) return true;
+            if (engine.propellants == null) return false;
+            for (int i = 0; i < engine.propellants.Count; i++)
+            {
+                if (engine.propellants[i] != null && engine.propellants[i].name == "SolidFuel") return true;
+            }
+            return false;
+        }
+
+        // Whether this engine may emit at all under the current mode.
+        private static bool Emits(ModuleEngines engine)
+        {
+            return !SmokeTuning.SrbOnly || IsSolidRocket(engine);
+        }
 
         public static float GetVesselMaxEngineThrust(Vessel vessel)
         {
@@ -45,6 +78,7 @@ namespace VolumetricContrails
                     if (!engine.EngineIgnited || engine.flameout) continue;
                     if (engine.currentThrottle <= 0.001f) continue;
                     if (engine.maxThrust < minThrust) continue;
+                    if (!Emits(engine)) continue;
 
                     foreach (Transform t in engine.thrustTransforms)
                     {
@@ -54,6 +88,9 @@ namespace VolumetricContrails
                             position = t.position,
                             forward = t.forward,
                             throttle = engine.currentThrottle,
+                            thrustFraction = engine.maxThrust > 0.001f
+                                ? Mathf.Clamp01(engine.finalThrust / engine.maxThrust)
+                                : 0f,
                             isp = engine.realIsp,
                             partId = part.flightID
                         });
@@ -181,7 +218,7 @@ namespace VolumetricContrails
                 bool hasRealEngine = false;
                 foreach (ModuleEngines engine in engines)
                 {
-                    if (engine.maxThrust >= minThrust) { hasRealEngine = true; break; }
+                    if (engine.maxThrust >= minThrust && Emits(engine)) { hasRealEngine = true; break; }
                 }
                 if (!hasRealEngine) continue;
 

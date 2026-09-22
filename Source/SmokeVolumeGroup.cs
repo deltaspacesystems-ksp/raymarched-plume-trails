@@ -34,6 +34,15 @@ namespace VolumetricContrails
             public Vector3 velocity;
             public float age;
             public float sizeMultiplier;
+            // Final expansion factor this puff will reach, applied OVER its growth rather
+            // than at birth. The plume leaves the nozzle narrow and opens into a bell over
+            // the following seconds; baking the factor into the birth size instead gives a
+            // cone that is already at full width where it meets the engine.
+            public float expansion;
+            // How much exhaust this puff represents, 0..1, fixed at emission: the motor's
+            // delivered thrust and the air it was born into. Separate from expansion,
+            // which is about SIZE - a puff can be wide and still carry little smoke.
+            public float emitDensity;
             // Ground impingement is a ONE-OFF event, not a per-frame force. Otherwise a
             // puff resting on the ground re-triggers the bounce every frame and the kicks
             // accumulate - survivable while the direction was random and they cancelled,
@@ -171,6 +180,7 @@ namespace VolumetricContrails
         private readonly float[] spineRadiiBuffer = new float[MaxSpinePoints];
         private readonly List<Vector3> polylineThinnedPos = new List<Vector3>();
         private readonly List<float> polylineThinnedRadius = new List<float>();
+        private readonly List<float> polylineThinnedDensity = new List<float>();
 
         private const int SpineSmoothPasses = 5;
         private readonly Vector3[] smoothedSpine = new Vector3[MaxSpinePoints];
@@ -191,13 +201,35 @@ namespace VolumetricContrails
 
         // Highest thinning level this trail has ever needed. Only ever rises while the
         // trail is alive, so a spine point that survives one frame keeps surviving.
+        // Identifies this volume in the log. Two engine clusters make two independent
+        // volumes drawn side by side, and without an id the per-frame lines are
+        // indistinguishable - which is exactly the "two different renderings" question.
+        private static int nextInstanceId = 1;
+        private readonly int instanceId = nextInstanceId++;
+        // Last values this volume actually rendered with, for the same diagnostic.
+        private float lastRadiusRatio;
+        private int lastMarchSteps;
+        private Vector3 lastNoiseShift;
+
         private int committedTrailStride = 1;
 
+        // Set by LaunchSmokeController each tick: 1 at sea level, falling as the plume
+        // blooms, so an expanding plume also gets thinner instead of just fatter.
+        public float densityScale = 1f;
+
         // How much the column's width may wander, as a fraction. See ColumnWander.
-        private const float ColumnWanderAmount = 0.30f;
+        // OFF by default. It was meant to stop the trail tapering as an even cone, but the
+        // warp amplitude is capped against the local radius, so wobbling the radius also
+        // wobbles how far the silhouette is displaced - and that reads as the whole column
+        // meandering from side to side rather than as a change in thickness.
 
         private readonly List<Vector3> activeOrderedPos = new List<Vector3>();
         private readonly List<float> activeOrderedRadius = new List<float>();
+        // Runs alongside activeOrderedRadius. A puff carries its own density because the
+        // bloom is a property of the air the puff was born into, not of the vessel now: a
+        // trail reaching from the pad to 24km is thick at the bottom and thin at the top,
+        // and one scale for the whole volume made the entire column vanish at altitude.
+        private readonly List<float> activeOrderedDensity = new List<float>();
 
         private int splatKernel = -1;
         private int blurKernel = -1;
@@ -269,6 +301,10 @@ namespace VolumetricContrails
                 return;
             }
             Vector3 shift = LocalToWorld(noiseAnchorLocal) - noiseAnchorWorld0;
+            lastNoiseShift = shift;
+            // Still published globally so anything without its own block has a value, but
+            // the authoritative copy now goes into each volume's property block - see the
+            // note where it is applied.
             Shader.SetGlobalVector("_SmokeNoiseOffset", new Vector4(shift.x, shift.y, shift.z, 0f));
         }
 
@@ -336,7 +372,7 @@ namespace VolumetricContrails
             }
             else
             {
-                Debug.LogWarning("[HairyBlob] SmokeVolumeSplatCompute is null while creating a SmokeVolumeGroup.");
+                Debug.LogWarning("[PlumeTrails] SmokeVolumeSplatCompute is null while creating a SmokeVolumeGroup.");
             }
         }
 
@@ -364,7 +400,9 @@ namespace VolumetricContrails
         // Off by default, same reasoning as LaunchSmokeController.debugLogging.
         // Per-bounce spam and the pad survey dump. The survey itself still runs either
         // way - it derives the outflow axis - this only gates the logging.
-        private const bool debugBounceLogging = true;   // TEMP: on to verify the trench axis. OFF before tagging.
+        // static, not const: as a const the compiler proves the guarded blocks dead and
+        // warns on every one of them, and the flag can no longer be flipped while running.
+        private static bool debugBounceLogging = false;
         private float lastBounceLogTime = -999f;
 
         public void SetLiveTip(Vector3 worldPos, float radius)
@@ -407,6 +445,10 @@ namespace VolumetricContrails
                 velocity = dir * outwardSpeed,
                 age = 0f,
                 sizeMultiplier = sizeScale,
+                expansion = 1f,
+                // Set explicitly: Puff is a struct, so a field left out here defaults to 0
+                // and the ground cloud would render with no density at all.
+                emitDensity = 1f,
                 bounced = true,  // already on the ground; no impingement impulse wanted
                 isGround = true
             };
@@ -424,10 +466,54 @@ namespace VolumetricContrails
         {
             float t = spawnIndex;
             float w = Mathf.Sin(t * 0.061f) * 0.6f + Mathf.Sin(t * 0.0233f + 1.7f) * 0.4f;
-            return 1f + w * ColumnWanderAmount;
+            return 1f + w * SmokeTuning.ColumnWander;
         }
 
-        public void AddPuff(Vector3 worldPos, Vector3 initialVelocity, float sizeScale = 1f, int burnId = 0)
+        // Sizes arrive at Initialize, but they are live sliders now, so they have to be
+        // refreshed rather than captured once. Existing puffs pick the change up on their
+        // next SizeForPuff, which is what makes the slider readable while flying.
+        // Cut loose from the controller: no more puffs will be added, but the existing
+        // ones keep ageing, drifting and rendering until the last one expires, and then
+        // this object removes itself. Ticked from Update rather than from the vessel,
+        // because the vessel is exactly what has gone away.
+        private bool orphaned;
+
+        public void Orphan()
+        {
+            orphaned = true;
+            transform.SetParent(null, true);
+
+            // The live tip MUST go with the controller that was feeding it.
+            //
+            // Every puff is stored in body-local coordinates and converted on read, so the
+            // trail survives KSP recentring the world on the active vessel. liveTipPos is
+            // the one exception: it is raw world space, which is harmless only because the
+            // controller rewrites it every tick. Once orphaned nobody rewrites it, so the
+            // scene slides out from under a frozen point and the spine stretches a segment
+            // from the abandoned trail towards whatever the origin now follows - which
+            // reads in game as a dead rocket's trail attaching itself to the one you fly.
+            ClearLiveTip();
+        }
+
+        private void Update()
+        {
+            if (!orphaned) return;
+            if (puffs.Count == 0)
+            {
+                SmokeRenderRegistry.Remove(polylineRenderer);
+                Destroy(gameObject);
+                return;
+            }
+            Tick(Time.deltaTime);
+        }
+
+        public void SetSizes(float newStartSize, float newMaxSize)
+        {
+            startSize = newStartSize;
+            maxSize = newMaxSize;
+        }
+
+        public void AddPuff(Vector3 worldPos, Vector3 initialVelocity, float sizeScale = 1f, int burnId = 0, float expansion = 1f, float emitDensity = 1f)
         {
             Vector3 jitter = Random.insideUnitSphere * (startSize * PositionJitterFraction);
             puffs.Add(new Puff
@@ -436,6 +522,8 @@ namespace VolumetricContrails
                 velocity = initialVelocity,
                 age = 0f,
                 sizeMultiplier = Random.Range(0.9f, 1.1f) * ColumnWander(nextSpawnIndex) * sizeScale,
+                expansion = expansion,
+                emitDensity = Mathf.Clamp01(emitDensity),
                 burnId = burnId,
                 spawnIndex = nextSpawnIndex++
             });
@@ -466,7 +554,16 @@ namespace VolumetricContrails
                 // Flattened against local up. windDrift is world-space, and world axes are
                 // not horizontal on a globe, so it carries a stray vertical component and
                 // the whole trail slowly climbs - 1 m/s of it is 150m over a full life.
-                Vector3 target = Vector3.ProjectOnPlane(windDrift, up);
+                // Every puff converges to the SAME world-space drift, so the displacement
+                // is coherent and grows with age: at 1 m/s over a 150s life the oldest
+                // puffs sit 150m downwind of the youngest. That is a shear across the whole
+                // column, and since the old puffs are also the largest it reads as the
+                // trail being blown over sideways rather than as drift.
+                //
+                // Kept, because real smoke does drift - but as a live speed with the
+                // magnitude taken off the direction, so it can be dialled to zero.
+                Vector3 windDir = windDrift.sqrMagnitude > 1e-6f ? windDrift.normalized : Vector3.zero;
+                Vector3 target = Vector3.ProjectOnPlane(windDir * SmokeTuning.WindSpeed, up);
                 // Ground puffs never fully park - a slow outward creep keeps the cloud
                 // spreading after the initial throw has bled off.
                 if (p.isGround)
@@ -483,7 +580,7 @@ namespace VolumetricContrails
                 if (!IsFinite(newWorldPos) || !IsFinite(p.velocity))
                 {
                     Debug.LogWarning(string.Format(
-                        "[HairyBlob] dropping puff with invalid position/velocity (NaN or Inf). pos={0} vel={1} age={2:F1}",
+                        "[PlumeTrails] dropping puff with invalid position/velocity (NaN or Inf). pos={0} vel={1} age={2:F1}",
                         newWorldPos, p.velocity, p.age));
                     p.markedForRemoval = true;
                     puffs[i] = p;
@@ -744,7 +841,7 @@ namespace VolumetricContrails
                     if (debugBounceLogging)
                     {
                         Debug.Log(string.Format(
-                            "[HairyBlob] PAD SURVEY: pad local size {0} -> trench along {1}",
+                            "[PlumeTrails] PAD SURVEY: pad local size {0} -> trench along {1}",
                             size.ToString("F0"), alongForward ? "FORWARD (z)" : "RIGHT (x)"));
                     }
                 }
@@ -758,7 +855,7 @@ namespace VolumetricContrails
                     if (debugBounceLogging)
                     {
                         Debug.Log(string.Format(
-                            "[HairyBlob] PAD SURVEY: using pad transform '{0}' -> axis {1}  "
+                            "[PlumeTrails] PAD SURVEY: using pad transform '{0}' -> axis {1}  "
                             + "(right={2} forward={3})",
                             padTransform.name, padOutflowAxis.ToString("F2"),
                             Vector3.ProjectOnPlane(padTransform.right, up).normalized.ToString("F2"),
@@ -784,19 +881,19 @@ namespace VolumetricContrails
                 if (debugBounceLogging)
                 {
                     Debug.Log(string.Format(
-                        "[HairyBlob] PAD SURVEY: coherence={0:F2} (need {1:F2}), samples={2} (need {3})",
+                        "[PlumeTrails] PAD SURVEY: coherence={0:F2} (need {1:F2}), samples={2} (need {3})",
                         coherence, MinAxisCoherence, slantedCount, MinSlantedSamples));
                 }
             }
 
             if (debugBounceLogging)
             {
-                Debug.Log("[HairyBlob] PAD SURVEY: " + seen.Count + " distinct colliders under/around the pad");
+                Debug.Log("[PlumeTrails] PAD SURVEY: " + seen.Count + " distinct colliders under/around the pad");
                 foreach (var kv in seen)
                 {
-                    Debug.Log("[HairyBlob]   '" + kv.Key + "' " + kv.Value);
+                    Debug.Log("[PlumeTrails]   '" + kv.Key + "' " + kv.Value);
                 }
-                Debug.Log(string.Format("[HairyBlob] PAD SURVEY: {0} slanted samples (>{1:F0}deg), outflow axis {2}",
+                Debug.Log(string.Format("[PlumeTrails] PAD SURVEY: {0} slanted samples (>{1:F0}deg), outflow axis {2}",
                     slantedCount, SlantedMinDegrees, padAxisValid ? padOutflowAxis.ToString("F2") : "NONE - falling back to radial"));
             }
         }
@@ -905,7 +1002,7 @@ namespace VolumetricContrails
                         }
 
                         Debug.Log(string.Format(
-                            "[HairyBlob] bounce: alt={0:F1} age={1:F2} vSpeed={2:F1} penetration={3:F2} hit={4} {5}",
+                            "[PlumeTrails] bounce: alt={0:F1} age={1:F2} vSpeed={2:F1} penetration={3:F2} hit={4} {5}",
                             altitude, age, verticalSpeed, penetration, what, normalInfo));
                     }
 
@@ -949,14 +1046,66 @@ namespace VolumetricContrails
             }
         }
 
+        // Density multiplier for a single puff, from the same eased expansion SizeForPuff
+        // uses - the two have to move together or a puff would be wide before it was thin.
+        //
+        // The exponent is physical rather than dialled in: the exhaust mass flow is fixed,
+        // so a plume N times wider has N^2 the cross-section and 1/N^2 the density, while
+        // a ray crossing it travels N times further. Optical depth therefore falls as 1/N,
+        // which is how a real high-altitude plume manages to be enormous and see-through
+        // at once. See JellyfishThinningPower.
+        private float DensityForPuff(Puff p)
+        {
+            if (SmokeTuning.SrbOnly && !p.isGround)
+            {
+                // Mass conservation along a line. The smoke carried per metre of trail is
+                // fixed at emission, so once the column grows past its normal width its
+                // density falls as 1/r^2 - and the optical depth through it only as 1/r,
+                // since the path through it lengthens. Old, spread-out smoke therefore
+                // fades gradually instead of hanging as the same solid rope for minutes.
+                //
+                // One rule for both kinds of widening: the altitude bloom makes r larger
+                // too, so it is thinned by exactly the same law with no separate term.
+                float r = SizeForPuff(p);
+                float rNominal = maxSize * p.sizeMultiplier;
+                float spread = rNominal > 0.01f ? r / rNominal : 1f;
+                float thin = spread > 1f ? Mathf.Pow(spread, -SmokeTuning.SrbThinningPower) : 1f;
+                return p.emitDensity * thin;
+            }
+
+            float emitted = p.emitDensity;
+            float expansion = Mathf.Max(p.expansion, 1f);
+            if (expansion <= 1.0001f) return emitted;
+            float te = Mathf.Clamp01(p.age / Mathf.Max(SmokeTuning.JellyfishExpandTime, 0.05f));
+            float easedExpansion = 1f - (1f - te) * (1f - te);
+            float current = Mathf.Lerp(1f, expansion, easedExpansion);
+            return emitted / Mathf.Pow(current, SmokeTuning.JellyfishThinningPower);
+        }
+
         private float SizeForPuff(Puff p)
         {
             // Growth is timed independently of lifeTime. Tying the two together means a
             // puff only reaches full size at the end of its life, by which point the
             // rocket is kilometres away and the visible trail is all young thin puffs.
+            float grown;
+            if (SmokeTuning.SrbOnly && !p.isGround)
+            {
+                // Turbulent diffusion: the puff's variance grows linearly with time, so
+                // r^2 = r0^2 + K*t. Fast at first, slowing, but never stopping - which is
+                // how a real cloud of smoke actually spreads, and one curve instead of the
+                // eased ramp plus the separate linear tail bolted on after it.
+                //
+                // K is chosen so the puff still reaches maxSize at growthTime, so the
+                // existing size knobs keep meaning what they did.
+                float r0 = startSize;
+                float k = Mathf.Max((maxSize * maxSize - r0 * r0) / Mathf.Max(growthTime, 0.1f), 0f);
+                grown = Mathf.Sqrt(r0 * r0 + k * p.age);
+                return grown * p.sizeMultiplier * EasedExpansion(p);
+            }
+
             float t = Mathf.Clamp01(p.age / growthTime);
             float eased = 1f - Mathf.Pow(1f - t, growthSharpness);
-            float grown = Mathf.Lerp(startSize, maxSize, eased);
+            grown = Mathf.Lerp(startSize, maxSize, eased);
 
             // Growth does not stop at growthTime - real smoke keeps expanding as it
             // entrains air, and a fixed size afterwards is what made the trail read as a
@@ -965,7 +1114,20 @@ namespace VolumetricContrails
             {
                 grown += (p.age - growthTime) * ContinuedGrowthRate * (p.isGround ? GroundGrowthBoost : 1f);
             }
-            return grown * p.sizeMultiplier;
+            // Expansion gets its OWN, much shorter time constant than growth. Riding the
+            // growth easing put full width tens of kilometres downrange, because at orbital
+            // speed growthTime is a long stretch of trail - but an underexpanded nozzle
+            // opens almost immediately behind itself. Growth is entrainment over minutes;
+            // this is pressure release over a second or two, and they are not the same
+            // process.
+            return grown * p.sizeMultiplier * EasedExpansion(p);
+        }
+
+        private static float EasedExpansion(Puff p)
+        {
+            float te = Mathf.Clamp01(p.age / Mathf.Max(SmokeTuning.JellyfishExpandTime, 0.05f));
+            float easedExpansion = 1f - (1f - te) * (1f - te);
+            return Mathf.Lerp(1f, Mathf.Max(p.expansion, 1f), easedExpansion);
         }
 
         // Absolute time, not a fraction of lifeTime - a fraction makes fade-in take
@@ -982,12 +1144,17 @@ namespace VolumetricContrails
             return fadeIn * fadeOut;
         }
 
+        // Fades toward a FLOOR, not to zero. Thin air gives a thin plume, but the high
+        // altitude bloom is the most striking thing the plume does - fading it out
+        // entirely is what used to make the smoke simply stop existing at 15km.
         private float AlphaForAltitude(Vector3 worldPos)
         {
+            float floor = SmokeTuning.JellyfishEnabled ? SmokeTuning.JellyfishAlphaFloor : 0f;
             double altitude = body.GetAltitude(worldPos);
             if (altitude <= fadeStartAltitude) return 1f;
-            if (altitude >= fadeEndAltitude) return 0f;
-            return 1f - (float)((altitude - fadeStartAltitude) / (fadeEndAltitude - fadeStartAltitude));
+            if (altitude >= fadeEndAltitude) return floor;
+            float t = (float)((altitude - fadeStartAltitude) / (fadeEndAltitude - fadeStartAltitude));
+            return Mathf.Lerp(1f, floor, t);
         }
 
         // ---- active tail (tiled) ----
@@ -1000,6 +1167,7 @@ namespace VolumetricContrails
         {
             public Vector3 pos;
             public float radius;
+            public float density;
             public float key;
         }
         private readonly List<GroundSortEntry> groundScratch = new List<GroundSortEntry>();
@@ -1008,6 +1176,7 @@ namespace VolumetricContrails
         {
             activeOrderedPos.Clear();
             activeOrderedRadius.Clear();
+            activeOrderedDensity.Clear();
             lastEmittedBurnId = int.MinValue;
             needTrailSeparator = false;
 
@@ -1029,7 +1198,7 @@ namespace VolumetricContrails
                 Vector3 wp = LocalToWorld(puffs[i].localPos);
                 if (AlphaForAge(puffs[i].age) * AlphaForAltitude(wp) <= 0.01f) continue;
                 float key = padAxisValid ? Vector3.Dot(wp - padCentre, padOutflowAxis) : wp.x;
-                groundScratch.Add(new GroundSortEntry { pos = wp, radius = SizeForPuff(puffs[i]), key = key });
+                groundScratch.Add(new GroundSortEntry { pos = wp, radius = SizeForPuff(puffs[i]), density = DensityForPuff(puffs[i]), key = key });
             }
 
             if (groundScratch.Count > 0)
@@ -1047,6 +1216,7 @@ namespace VolumetricContrails
                 {
                     activeOrderedPos.Add(groundScratch[i].pos);
                     activeOrderedRadius.Add(groundScratch[i].radius);
+                    activeOrderedDensity.Add(groundScratch[i].density);
                 }
                 // Closing zero-radius point, with a MATCHING one at the first trail puff
                 // below. One alone is not enough: the capsule from it to the trail still
@@ -1054,6 +1224,7 @@ namespace VolumetricContrails
                 // pad up the column. Two give a zero-to-zero capsule, which is invisible.
                 activeOrderedPos.Add(groundScratch[groundScratch.Count - 1].pos);
                 activeOrderedRadius.Add(0f);
+                activeOrderedDensity.Add(1f);
                 needTrailSeparator = true;
             }
 
@@ -1113,8 +1284,10 @@ namespace VolumetricContrails
                         Vector3 dir = (worldPos - prevPos) / Mathf.Max(gap, 0.0001f);
                         activeOrderedPos.Add(prevPos + dir * (prevRadius * 0.5f));
                         activeOrderedRadius.Add(0f);
+                        activeOrderedDensity.Add(1f);
                         activeOrderedPos.Add(worldPos - dir * (radius * 0.5f));
                         activeOrderedRadius.Add(0f);
+                        activeOrderedDensity.Add(1f);
                     }
                 }
 
@@ -1123,17 +1296,20 @@ namespace VolumetricContrails
                     needTrailSeparator = false;
                     activeOrderedPos.Add(worldPos);
                     activeOrderedRadius.Add(0f);
+                    activeOrderedDensity.Add(1f);
                 }
 
                 lastEmittedBurnId = p.burnId;
                 activeOrderedPos.Add(worldPos);
                 activeOrderedRadius.Add(radius);
+                activeOrderedDensity.Add(DensityForPuff(p));
             }
 
             if (hasLiveTip)
             {
                 activeOrderedPos.Add(liveTipPos);
                 activeOrderedRadius.Add(liveTipRadius);
+                activeOrderedDensity.Add(1f);
             }
         }
 
@@ -1176,7 +1352,7 @@ namespace VolumetricContrails
                 lastActiveDebugLogTime = Time.time;
                 double tipAltitude = hasLiveTip ? body.GetAltitude(liveTipPos) : 0.0;
                 Debug.Log(string.Format(
-                    "[HairyBlob] active trail: alt={0:F0} totalPoints={1} tilesUsed={2}/{3}",
+                    "[PlumeTrails] active trail: alt={0:F0} totalPoints={1} tilesUsed={2}/{3}",
                     tipAltitude, totalPoints, usedTiles, activeTiles.Count));
             }
         }
@@ -1289,20 +1465,24 @@ namespace VolumetricContrails
 
             List<Vector3> pos = activeOrderedPos;
             List<float> radius = activeOrderedRadius;
+            List<float> density = activeOrderedDensity;
 
             if (totalPoints > MaxSpinePoints)
             {
                 polylineThinnedPos.Clear();
                 polylineThinnedRadius.Clear();
+                polylineThinnedDensity.Clear();
                 float stride = (float)totalPoints / MaxSpinePoints;
                 for (int i = 0; i < MaxSpinePoints; i++)
                 {
                     int srcIndex = Mathf.Min(totalPoints - 1, Mathf.FloorToInt(i * stride));
                     polylineThinnedPos.Add(activeOrderedPos[srcIndex]);
                     polylineThinnedRadius.Add(activeOrderedRadius[srcIndex]);
+                    polylineThinnedDensity.Add(activeOrderedDensity[srcIndex]);
                 }
                 pos = polylineThinnedPos;
                 radius = polylineThinnedRadius;
+                density = polylineThinnedDensity;
                 totalPoints = MaxSpinePoints;
             }
 
@@ -1331,7 +1511,7 @@ namespace VolumetricContrails
             {
                 float r = smoothedRadii[i];
                 Vector3 p = smoothedSpine[i];
-                spinePointsBuffer[i] = new Vector4(p.x, p.y, p.z, 0f);
+                spinePointsBuffer[i] = new Vector4(p.x, p.y, p.z, density[i]);
                 spineRadiiBuffer[i] = r;
                 radiusSum += r;
 
@@ -1356,7 +1536,17 @@ namespace VolumetricContrails
             polylineRenderer.transform.localScale = boxExtents * 2f;
 
             float avgRadius = radiusSum / totalPoints;
-            float radiusRatio = Mathf.Clamp(avgRadius / ShaderReferenceRadius, 0.05f, 1f);
+            // Clamped to 4, matching the shader's own clamp on the same value - NOT to 1.
+            // Pinning it at 1 tells the shader every puff is reference-sized, so a bloomed
+            // 500m puff gets noise and warp sized for an 18m one: detail roughly thirty
+            // times too fine for the body it sits on, which is the stippled, fuzzy look
+            // rather than a smooth bloom. Confirmed in the log, where it read 1.000 flat
+            // while the plume was hundreds of metres across.
+            // Ceiling matches the shader's own clamp (200). At 4 this pinned for the
+            // entire climb - the log read radiusRatio=4.000 while the plume had bloomed
+            // past 100x - and every scale the shader derives from it came out wrong.
+            float radiusRatio = Mathf.Clamp(avgRadius / ShaderReferenceRadius, 0.05f, 200f);
+            lastRadiusRatio = radiusRatio;
 
             polylinePropertyBlock.Clear();
             polylinePropertyBlock.SetInt("_SpineCount", totalPoints);
@@ -1370,8 +1560,19 @@ namespace VolumetricContrails
             polylinePropertyBlock.SetFloat("_DepthBiasDistance", ActiveDepthBiasDistance);
             polylinePropertyBlock.SetFloat("_DepthBiasFraction", ActiveDepthBiasFraction);
             SmokeTuning.Apply(polylinePropertyBlock);
+            // After Apply, so it overrides the shared value. Thinning is per-VOLUME (it
+            // follows the vessel's ambient pressure), which SmokeTuning cannot express.
+            polylinePropertyBlock.SetFloat("_Density", SmokeTuning.Density * densityScale);
+            // PER VOLUME, not global. Each volume anchors its noise on its own first puff,
+            // and a global is written once per volume per frame - so with two engine
+            // clusters the last one to tick wins and the other samples the noise field at
+            // someone else's anchor. Two volumes side by side then look like different
+            // materials, which is the "two different renderings" report.
+            polylinePropertyBlock.SetVector("_SmokeNoiseOffset",
+                new Vector4(lastNoiseShift.x, lastNoiseShift.y, lastNoiseShift.z, 0f));
             ApplyMarchLOD(polylinePropertyBlock, boxCenter, boxExtents, avgRadius);
             polylineRenderer.SetPropertyBlock(polylinePropertyBlock);
+            SmokeRenderRegistry.Register(polylineRenderer, polylinePropertyBlock);
 
             if (Time.time - lastActiveDebugLogTime > 1f)
             {
@@ -1388,11 +1589,13 @@ namespace VolumetricContrails
                 double endAlt = body.GetAltitude(spineEnd);
 
                 Debug.Log(string.Format(
-                    "[HairyBlob] polyline: alt={0:F0} spineCount={1} (rawPoints={2}) "
-                    + "endToEnd={3:F0}m startAlt={4:F0} endAlt={5:F0} boxExtents={6} axis={7}",
-                    tipAltitude, totalPoints, activeOrderedPos.Count,
+                    "[PlumeTrails] polyline: vol#{0} alt={1:F0} spineCount={2} (rawPoints={3}) "
+                    + "endToEnd={4:F0}m startAlt={5:F0} endAlt={6:F0} boxExtents={7} axis={8} "
+                    + "| radiusRatio={9:F3} marchSteps={10} noiseShift={11}",
+                    instanceId, tipAltitude, totalPoints, activeOrderedPos.Count,
                     endToEnd, startAlt, endAlt, boxExtents.ToString("F0"),
-                    padAxisValid ? padOutflowAxis.ToString("F2") : "none"));
+                    padAxisValid ? padOutflowAxis.ToString("F2") : "none",
+                    lastRadiusRatio, lastMarchSteps, lastNoiseShift.ToString("F1")));
             }
         }
 
@@ -1452,7 +1655,7 @@ namespace VolumetricContrails
             if (gapCount > 0)
             {
                 Debug.Log(string.Format(
-                    "[HairyBlob] overlap: {0}/{1} neighbor pairs have a REAL gap - worst={2:F1}m at index={3} " +
+                    "[PlumeTrails] overlap: {0}/{1} neighbor pairs have a REAL gap - worst={2:F1}m at index={3} " +
                     "(posA={4} rA={5:F1} posB={6} rB={7:F1})",
                     gapCount, totalPoints - 1, worstGap, worstIndex,
                     worstIndex >= 0 ? activeOrderedPos[worstIndex] : Vector3.zero,
@@ -1463,14 +1666,14 @@ namespace VolumetricContrails
             else if (totalPoints > 1)
             {
                 Debug.Log(string.Format(
-                    "[HairyBlob] overlap: all {0} neighbor pairs overlap - no real gaps in the puff data itself",
+                    "[PlumeTrails] overlap: all {0} neighbor pairs overlap - no real gaps in the puff data itself",
                     totalPoints - 1));
             }
 
             if (worstDensityIndex >= 0)
             {
                 Debug.Log(string.Format(
-                    "[HairyBlob] density: worst midpoint density={0:F3} at index={1}/{2} " +
+                    "[PlumeTrails] density: worst midpoint density={0:F3} at index={1}/{2} " +
                     "(rA={3:F1} rB={4:F1} spacing={5:F1})",
                     worstMidDensity, worstDensityIndex, totalPoints - 1,
                     activeOrderedRadius[worstDensityIndex], activeOrderedRadius[worstDensityIndex + 1],
@@ -1522,7 +1725,7 @@ namespace VolumetricContrails
             if (logThisPass)
             {
                 Debug.Log(string.Format(
-                    "[HairyBlob] tile: tile={0} range=[{1},{2}) count={3} boxMin={4} boxMax={5}",
+                    "[PlumeTrails] tile: tile={0} range=[{1},{2}) count={3} boxMin={4} boxMax={5}",
                     tileIndex, rangeStart, rangeEnd, count, boxMin, boxMax));
             }
 
@@ -1705,6 +1908,7 @@ namespace VolumetricContrails
             // shifts with them, and that is the flicker. Coarse increments change rarely
             // and visibly once instead of dithering every frame.
             marchSteps = Mathf.Max(8, (marchSteps / 8) * 8);
+            lastMarchSteps = marchSteps;
             lightMarchSteps = Mathf.Max(2, (lightMarchSteps / 2) * 2);
             propertyBlock.SetInt("_MarchSteps", marchSteps);
             propertyBlock.SetInt("_LightMarchSteps", lightMarchSteps);

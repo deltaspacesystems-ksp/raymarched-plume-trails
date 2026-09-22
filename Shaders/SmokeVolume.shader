@@ -71,6 +71,21 @@ Shader "VolumetricContrails/SmokeVolume"
         _MultiScatterIntensity ("Multi-Scatter Intensity", Float) = 1.2
         // Beer's-law "powder" term - see its use in the march loop.
         _PowderStrength ("Powder (dark lit edges)", Range(0,1)) = 0.5
+        // How much ambient the smoke keeps once the planet's own shadow has cut the sun.
+        // Not zero: night smoke is dim, not black.
+        _NightAmbient ("Night Ambient Floor", Range(0,1)) = 0.18
+        // Metres over which the terminator softens.
+        _TerminatorSoftness ("Terminator Softness (m)", Float) = 4000
+        // Shadow the cloud casts onto the scene - see the second Pass.
+        _ShadowCastStrength ("Cast Shadow Strength", Range(0,1)) = 0.85
+        _ShadowCastDistance ("Cast Shadow Reach (m)", Float) = 2500
+        _ShadowCastSteps ("Cast Shadow Steps", Int) = 16
+
+        // Regime shaping. A thinned section is not just fainter - it is a different
+        // material, and these two say how different.
+        _ThinEdgeSoftness ("Thin Edge Softness", Range(0.15,1)) = 0.45
+        _ThinDetailFade ("Thin Detail Fade", Range(0,1)) = 0.25
+        _ShadowCastDebug ("Cast Shadow Debug", Float) = 0
         // Fraction of the real extinction the SHADOW ray sees. At full strength exp() is
         // effectively binary over a multi-metre step, so every boundary becomes a hard
         // edge. Reducing it is the standard cheap stand-in for multiple scattering, and
@@ -114,20 +129,10 @@ Shader "VolumetricContrails/SmokeVolume"
         // into a transparent target darkens toward black instead of accumulating colour.
         Blend One OneMinusSrcAlpha
 
-        Pass
-        {
-            // Unity only binds _WorldSpaceLightPos0 for a pass tagged like this. Without
-            // it the sun direction is whatever the last shader left in global state.
-            // whole thing back to the old flat look if it still misbehaves.
-            Tags { "LightMode"="ForwardBase" }
-
-            CGPROGRAM
-            #pragma target 3.5
-            #pragma vertex vert
-            #pragma fragment frag
-            // default variant samples _DensityTex (settled cloud), polyline variant
-            // computes density analytically along a capsule chain (unused currently)
-            #pragma multi_compile _ SMOKE_VOLUME_POLYLINE
+        // Shared body. It lives at SubShader scope so the shadow-casting pass
+        // below can reuse the spine and density functions rather than carrying a
+        // second copy of them that would silently drift out of step.
+        CGINCLUDE
             #include "UnityCG.cginc"
 
             struct appdata { float4 vertex : POSITION; };
@@ -173,6 +178,16 @@ Shader "VolumetricContrails/SmokeVolume"
             float _MultiScatterG;
             float _MultiScatterIntensity;
             float _PowderStrength;
+            float _NightAmbient;
+            float _TerminatorSoftness;
+            float _ThinEdgeSoftness;
+            float _ThinDetailFade;
+            float _ShadowCastStrength;
+            float _ShadowCastDistance;
+            int _ShadowCastSteps;
+            float _ShadowCastDebug;
+            // xyz = body centre in world space, w = body radius
+            float4 _SmokeBodyCentre;
             // set from C# every frame - see HalfResSmokeRenderer.UpdateSunDirection
             float4 _SmokeSunDir;
             // planet-up at the smoke's position, published by HalfResSmokeRenderer
@@ -223,7 +238,11 @@ Shader "VolumetricContrails/SmokeVolume"
 #if defined(SMOKE_VOLUME_POLYLINE)
             #define MAX_SPINE_POINTS 200
             int _SpineCount;
-            float4 _SpinePoints[MAX_SPINE_POINTS]; // world space, oldest to newest
+            // xyz = world space, oldest to newest. w = that point's density multiplier,
+            // which is how a bloomed high-altitude section gets to be thin while the same
+            // trail is still solid down at the pad. It rides in w because the array was
+            // already float4 and a second SetFloatArray per frame is not free.
+            float4 _SpinePoints[MAX_SPINE_POINTS];
             float _SpineRadii[MAX_SPINE_POINTS];
 
             // Two-level culling. The spine is a chain, so a run of consecutive segments
@@ -488,9 +507,49 @@ Shader "VolumetricContrails/SmokeVolume"
             // stride > 1 spans one longer capsule instead of the intermediate points. On
             // a smoothed spine the chord barely differs from the polyline - invisible in a
             // shadow lookup, and this loop is O(_SpineCount) per density sample.
-            float SpineCoverageStrided(float3 pSample, int stride, float blendK)
+            // Per-point density, with a fallback.
+            //
+            // A plugin older than this shader leaves w at 0, and multiplying by that
+            // renders the entire trail invisible while every number in the log still
+            // looks healthy - which is exactly how it failed once, after a deploy put the
+            // new bundle in place while the game still held the old DLL. Treating a
+            // non-positive value as "no thinning" lets the two halves be deployed
+            // independently instead of silently cancelling each other out.
+            // Maps a point's density multiplier onto a 0..1 "solidity".
+            //
+            // The fourth root is deliberate. Optical depth falls as the square of the
+            // bloom, so a plume only twice as wide already carries a sixteenth of the
+            // density; on a linear scale everything above the first few kilometres would
+            // read as identical wisp. A gentle curve keeps launch smoke, mist and the high
+            // bloom visibly apart across the whole climb.
+            float SolidityOf(float density)
+            {
+                return saturate(pow(saturate(density), 0.25));
+            }
+
+            // Guarded, because this value divides the blend radius and the cast-shadow
+            // pass fills its own property block. A block that forgets it would leave 0
+            // here, and an infinite blend radius makes every sample sit inside the plume.
+            float ThinSoftnessSafe()
+            {
+                return max(_ThinEdgeSoftness, 0.05);
+            }
+
+            float SpinePointDensity(int i)
+            {
+                float d = _SpinePoints[i].w;
+                return d > 0.0 ? d : 1.0;
+            }
+
+            float SpineCoverageStrided(float3 pSample, int stride, float blendK, out float densityMul)
             {
                 float coverage = 0.0;
+                // Density is taken from the segment that contributes most, not averaged
+                // in. Coverage is a smooth union, so a blend would let a distant fat
+                // section bleed its density into a thin one.
+                float densityAcc = 0.0;
+                float densityWeight = 0.0;
+                densityMul = 1.0;
                 int last = _SpineCount - 1;
 
                 for (int i = 0; i < last; i += stride)
@@ -504,7 +563,7 @@ Shader "VolumetricContrails/SmokeVolume"
 
                     float3 mid = (a + b) * 0.5;
                     float halfLen = length(b - a) * 0.5;
-                    float maxR = max(ra, rb) * 1.4;
+                    float maxR = max(ra, rb) * 1.4 / ThinSoftnessSafe();
                     float cullRadius = halfLen + maxR;
                     if (dot(pSample - mid, pSample - mid) > cullRadius * cullRadius) continue;
 
@@ -514,17 +573,29 @@ Shader "VolumetricContrails/SmokeVolume"
                     float3 closest = a + ab * t;
                     float r = lerp(ra, rb, t);
 
-                    float blendRadius = r * 1.4;
+                    float segDensity = lerp(SpinePointDensity(i), SpinePointDensity(j), t);
+                    // A rarefied plume has no sharp boundary - it fades out over a distance
+                    // comparable to its own size. Widening the falloff for thin sections is
+                    // what turns the same capsule chain into mist instead of a solid slab
+                    // with a cut edge.
+                    float blendRadius = r * 1.4 / lerp(ThinSoftnessSafe(), 1.0, SolidityOf(segDensity));
                     float dSq = dot(pSample - closest, pSample - closest);
                     if (dSq >= blendRadius * blendRadius) continue;
                     float d = sqrt(dSq);
 
                     float tt = saturate(1.0 - d / blendRadius);
-                    coverage = SmoothMax(coverage, tt * tt * (3.0 - 2.0 * tt), blendK);
+                    float shape = tt * tt * (3.0 - 2.0 * tt);
+                    // Shape-WEIGHTED, not winner-takes-all. Taking the single strongest
+                    // segment made density jump the moment the winner changed, drawing hard
+                    // bright/grey bands wherever two segments contributed equally.
+                    densityAcc += shape * segDensity;
+                    densityWeight += shape;
+                    coverage = SmoothMax(coverage, shape, blendK);
                 }
 
                 // SmoothMax can overshoot by up to k/4 where two capsules contribute
                 // equally, which is the bulge that fills the joint in the first place
+                if (densityWeight > 0.0) densityMul = densityAcc / densityWeight;
                 return saturate(coverage);
             }
 
@@ -542,10 +613,13 @@ Shader "VolumetricContrails/SmokeVolume"
                 return _SpineBlend * saturate(radiusRatio);
             }
 
-            float SpineCoverage(float3 pSample, float radiusRatio)
+            float SpineCoverage(float3 pSample, float radiusRatio, out float densityMul)
             {
                 float blendK = SpineBlendFor(radiusRatio);
                 float coverage = 0.0;
+                float densityAcc = 0.0;
+                float densityWeight = 0.0;
+                densityMul = 1.0;
                 int last = _SpineCount - 1;
 
                 [loop]
@@ -572,16 +646,21 @@ Shader "VolumetricContrails/SmokeVolume"
                         float3 closest = a + ab * t;
                         float r = lerp(ra, rb, t);
 
-                        float blendRadius = r * 1.4;
+                        float segDensity = lerp(SpinePointDensity(i), SpinePointDensity(i + 1), t);
+                        float blendRadius = r * 1.4 / lerp(ThinSoftnessSafe(), 1.0, SolidityOf(segDensity));
                         float dSq = dot(pSample - closest, pSample - closest);
                         if (dSq >= blendRadius * blendRadius) continue;
                         float d = sqrt(dSq);
 
                         float tt = saturate(1.0 - d / blendRadius);
-                        coverage = SmoothMax(coverage, tt * tt * (3.0 - 2.0 * tt), blendK);
+                        float shape = tt * tt * (3.0 - 2.0 * tt);
+                        densityAcc += shape * segDensity;
+                        densityWeight += shape;
+                        coverage = SmoothMax(coverage, shape, blendK);
                     }
                 }
 
+                if (densityWeight > 0.0) densityMul = densityAcc / densityWeight;
                 return saturate(coverage);
             }
 
@@ -665,7 +744,14 @@ Shader "VolumetricContrails/SmokeVolume"
                 // sized for a small one, so it renders as a smooth ball with speckle.
                 // radiusRatio stays clamped because it scales strengths, which must not
                 // run away on a large puff.
-                float sizeRatio = clamp(EstimateLocalRadius(p) / _ReferenceRadius, 0.05, 4.0);
+                // Ceiling raised to 200. It used to sit at 4, and the log showed it
+                // pinned there for the whole climb: the shader was told "you are 4x the
+                // reference" while the plume had actually bloomed past 100x. Every scale
+                // derived from it - warp amplitude, edge softness, feature size - was then
+                // computed for an 18m puff on a plume hundreds of metres across, so the
+                // detail vanished against the shape and only the bare capsule silhouette
+                // was left. That is what read as a white slab with cut edges.
+                float sizeRatio = clamp(EstimateLocalRadius(p) / _ReferenceRadius, 0.05, 200.0);
                 float radiusRatio = min(sizeRatio, 1.0);
                 outRadiusRatio = radiusRatio;
 
@@ -699,16 +785,47 @@ Shader "VolumetricContrails/SmokeVolume"
                 // An absolute strength in metres is only safe while it stays small next to
                 // the thinnest section being rendered.
                 float localRadius = sizeRatio * _ReferenceRadius;
+                // Two caps, and the second one is the important one.
+                //
+                // Amplitude is allowed to grow with the puff, but the warp's WAVELENGTH is
+                // fixed in world space (that is what stops the pattern swimming as puffs
+                // grow). Scaling only one half of that pair breaks the shape: a bloomed
+                // puff gets tens of metres of displacement at a ~100m wavelength, and a
+                // silhouette displaced by a third of its own wavelength does not read as
+                // cauliflower - it reads as the whole column snaking from side to side.
+                //
+                // Bounding amplitude by a fraction of the wavelength keeps the surface
+                // slope finite whatever the puff size, so big and small sections look like
+                // the same material. The noise repeats every _NoisePeriod (8) lattice
+                // cells, so the world wavelength is 8 / scale.
+                float warpWavelength = 8.0 / max(_SilhouetteWarpScale / freqRatio, 1e-4);
                 float warpAmplitude = min(_SilhouetteWarpStrength * silhouetteWarpScale,
-                                          localRadius * 0.5);
+                                          min(localRadius * 0.5, warpWavelength * 0.18));
                 float3 silhouetteOffset = DomainWarp(p, _SilhouetteWarpScale / freqRatio, warpAmplitude, 0.012);
                 float3 pWarped = p + vortexOffset + silhouetteOffset;
 
-                float coverage = SpineCoverage(pWarped, radiusRatio);
+                float spineDensity;
+                float coverage = SpineCoverage(pWarped, radiusRatio, spineDensity);
                 coverage *= lerp(0.6, 1.15, saturate(radiusRatio * 1.5));
                 coverage *= MacroVariation(p);
 
-                return ApplyDetailBuildup(coverage, p, pWarped, radiusRatio, sizeRatio, bumpFactor);
+                float built = ApplyDetailBuildup(coverage, p, pWarped, radiusRatio, sizeRatio, bumpFactor);
+
+                // Cauliflower belongs to launch smoke, not to the high bloom.
+                //
+                // Those lumps come from convection in dense, buoyant exhaust. Kilometres up
+                // there is nothing left to drive them: the plume is a rarefied cloud that
+                // spreads and blurs. Keeping full detail there gave a huge shape with a
+                // hard curdled surface - the opposite of what thin air does. Fading the
+                // detail back toward plain coverage lets the same chain read as launch
+                // smoke low down and as soft haze high up, with no threshold between them.
+                float detailKeep = lerp(_ThinDetailFade, 1.0, SolidityOf(spineDensity));
+                built = lerp(coverage, built, detailKeep);
+
+                // Density multiplies AFTER the buildup, never the coverage. Detail is
+                // add-only, so thinning the coverage first would leave the added term
+                // standing on its own and scatter loose noise where the plume is faint.
+                return built * spineDensity;
             }
 
             // Cheap density for LightMarch - skips the warp and detail noise entirely.
@@ -716,11 +833,12 @@ Shader "VolumetricContrails/SmokeVolume"
             {
                 // cap the shadow lookup at ~32 capsules however long the trail gets
                 int stride = max(1, _SpineCount >> 5);
-                float coverage = SpineCoverageStrided(p, stride, SpineBlendFor(radiusRatio));
+                float spineDensity;
+                float coverage = SpineCoverageStrided(p, stride, SpineBlendFor(radiusRatio), spineDensity);
                 coverage *= lerp(0.6, 1.15, saturate(radiusRatio * 1.5));
                 // detail buildup is mean-preserving but its scroll term averages ~0.92,
                 // so match that here to keep shadow strength consistent with the full path.
-                return coverage * 0.92 * MacroVariation(p);
+                return coverage * 0.92 * MacroVariation(p) * spineDensity;
             }
 #else
             // density from the texture baked by the compute shader
@@ -753,8 +871,22 @@ Shader "VolumetricContrails/SmokeVolume"
                 // An absolute strength in metres is only safe while it stays small next to
                 // the thinnest section being rendered.
                 float localRadius = sizeRatio * _ReferenceRadius;
+                // Two caps, and the second one is the important one.
+                //
+                // Amplitude is allowed to grow with the puff, but the warp's WAVELENGTH is
+                // fixed in world space (that is what stops the pattern swimming as puffs
+                // grow). Scaling only one half of that pair breaks the shape: a bloomed
+                // puff gets tens of metres of displacement at a ~100m wavelength, and a
+                // silhouette displaced by a third of its own wavelength does not read as
+                // cauliflower - it reads as the whole column snaking from side to side.
+                //
+                // Bounding amplitude by a fraction of the wavelength keeps the surface
+                // slope finite whatever the puff size, so big and small sections look like
+                // the same material. The noise repeats every _NoisePeriod (8) lattice
+                // cells, so the world wavelength is 8 / scale.
+                float warpWavelength = 8.0 / max(_SilhouetteWarpScale / freqRatio, 1e-4);
                 float warpAmplitude = min(_SilhouetteWarpStrength * silhouetteWarpScale,
-                                          localRadius * 0.5);
+                                          min(localRadius * 0.5, warpWavelength * 0.18));
                 float3 silhouetteOffset = DomainWarp(p, _SilhouetteWarpScale / freqRatio, warpAmplitude, 0.012);
                 float3 pWarped = p + vortexOffset + silhouetteOffset;
 
@@ -799,6 +931,30 @@ Shader "VolumetricContrails/SmokeVolume"
             // distances, so where the boundary crosses one of those fixed shells the shadow
             // steps across a visible seam - the terraced look in the shading. Only the
             // START is offset: full per-step jitter on a 4-sample march reads as noise.
+            // Does the sun actually reach this point, given the planet?
+            //
+            // Nothing in the density field represents the planet, so the light march has
+            // nothing to occlude against and happily reports every sample as fully lit -
+            // at night the sun direction still points at the smoke, there is simply
+            // nothing in the way. That is why night launches came out lit like noon.
+            //
+            // A cylinder shadow is enough: behind the body along the sun direction, and
+            // within its radius of that axis. Softening the edge also gives the effect
+            // for free that high smoke stays sunlit after the ground has gone dark, which
+            // is the twilight plume.
+            float PlanetSunlight(float3 p, float3 sunDir)
+            {
+                if (_SmokeBodyCentre.w <= 1.0) return 1.0;   // no body published
+
+                float3 d = p - _SmokeBodyCentre.xyz;
+                float along = dot(d, sunDir);
+                if (along > 0.0) return 1.0;                 // sun-facing hemisphere
+
+                float perp = length(d - sunDir * along);
+                return smoothstep(_SmokeBodyCentre.w - _TerminatorSoftness,
+                                  _SmokeBodyCentre.w + _TerminatorSoftness, perp);
+            }
+
             float LightMarch(float3 p, float3 sunDir, float radiusRatio, float jitter)
             {
                 float stepLen = (_LightMarchDistance * lerp(0.25, 1.0, radiusRatio)) / _LightMarchSteps;
@@ -841,6 +997,22 @@ Shader "VolumetricContrails/SmokeVolume"
                 return (1.0 - g2) / (4.0 * 3.14159265 * pow(max(denom, 0.0001), 1.5));
             }
 
+        ENDCG
+
+        Pass
+        {
+            // Unity only binds _WorldSpaceLightPos0 for a pass tagged like this. Without
+            // it the sun direction is whatever the last shader left in global state.
+            // whole thing back to the old flat look if it still misbehaves.
+            Tags { "LightMode"="ForwardBase" }
+
+            CGPROGRAM
+            #pragma target 3.5
+            #pragma vertex vert
+            #pragma fragment frag
+            // default variant samples _DensityTex (settled cloud), polyline variant
+            // computes density analytically along a capsule chain (unused currently)
+            #pragma multi_compile _ SMOKE_VOLUME_POLYLINE
             fixed4 frag (v2f i) : SV_Target
             {
                 float3 ro = _WorldSpaceCameraPos;
@@ -901,6 +1073,7 @@ Shader "VolumetricContrails/SmokeVolume"
                 // to fully lit.
                 float shadowAccum = 0.0;
                 float skyAccum = 0.0;
+                float sunAccum = 0.0;
 
                 // Dither in two parts. The start offset shifts where each pixel's ray
                 // begins, which breaks up screen-space banding but not banding that repeats
@@ -947,7 +1120,31 @@ Shader "VolumetricContrails/SmokeVolume"
                 // continuously and every sample position shifts frame to frame - constant
                 // flicker against high-frequency grain. Snapping means the step changes
                 // only when the box roughly doubles.
-                float rawFloor = max(marchDist / (float)budget, 0.5);
+                // CAPPED against the feature size. The floor exists so a long ray cannot
+                // run out of budget before crossing the box - but marchDist tracks the
+                // BOX, and once the spawn ceiling went to 120km the box became tens of
+                // kilometres while the trail stayed tens of metres thick. The floor then
+                // worked out coarser than the trail is wide, so a ray got one sample
+                // through it, the dither scattered that sample's depth per pixel, and the
+                // result is a stipple mesh instead of smoke - which is exactly the
+                // difference between our trail and the real cloud sitting next to it.
+                //
+                // Sphere tracing already crosses empty space in large jumps, so the budget
+                // is mostly spent inside smoke and the floor no longer has to carry that
+                // job alone. Capping it at roughly half a puff radius guarantees several
+                // samples across the trail whatever the box grew to.
+                // The ratio is CLAMPED here, and only here.
+                //
+                // _TileRadiusRatio is allowed to run to 200 so the noise, warp and edge
+                // softness know how big the plume really is. This cap must not follow it.
+                // Its job is to stop the step growing coarser than the detail, so it has to
+                // track the SMALLEST feature the march must resolve, not the largest shape.
+                // Letting it ride the bloom put the cap at ~1600m, which rounds up to a
+                // 2048m step - one or two samples across a puff. That is what turned the
+                // trail into separate spheres with concentric rings inside them.
+                float stepRatio = min(max(_TileRadiusRatio, 0.05), 4.0);
+                float featureCap = max(_ReferenceRadius * stepRatio * 0.6, 2.0);
+                float rawFloor = clamp(marchDist / (float)budget, 0.5, featureCap);
                 stepSize = max(stepSize, exp2(ceil(log2(rawFloor))));
                 // Persists across iterations - deep samples reuse the last shadow.
                 float lightTransmittance = 1.0;
@@ -994,10 +1191,22 @@ Shader "VolumetricContrails/SmokeVolume"
                     {
                         // Reuse the primary dither, offset so the shadow ray is not phase
                         // locked to it - that would put both seams in the same place.
-                        lightTransmittance = LightMarch(densityPos, sunDir, sampleRadiusRatio,
-                            frac(ditherHash + 0.5));
+                        //
+                        // TRIED AND REJECTED (2026-09-07): advancing this phase per primary
+                        // step, frac(hash + 0.5 + s * 0.618), to let the light march average
+                        // itself out and kill the salt-and-pepper. Offscreen A/B at equal
+                        // settings showed it is worse: with sphere tracing, neighbouring
+                        // pixels reach a given depth after a similar number of steps, so the
+                        // phase stops depending on the pixel and starts depending on DEPTH.
+                        // The quantisation error then becomes spatially coherent and the
+                        // grain turns into flat grey terraces across the column. Grain from
+                        // an incoherent error reads as texture; the same error made coherent
+                        // reads as a defect.
+                        float lightPhase = frac(ditherHash + 0.5);
+                        float skyPhase = frac(ditherHash + 0.25);
+                        lightTransmittance = LightMarch(densityPos, sunDir, sampleRadiusRatio, lightPhase);
                         skyVisibility = SkyVisibility(densityPos, _SmokeUpDir.xyz,
-                            sampleRadiusRatio, frac(ditherHash + 0.25));
+                            sampleRadiusRatio, skyPhase);
                     }
 
                     float stepTransmittance = exp(-density * _Absorption * stepSize);
@@ -1010,7 +1219,9 @@ Shader "VolumetricContrails/SmokeVolume"
                     // This is what gives a lobe its rounded look instead of a flat disc.
                     float powder = 1.0 - exp(-density * 2.0);
                     float powderTerm = lerp(1.0, powder, _PowderStrength);
-                    scatteredLight += contribution * phase * lightTransmittance * powderTerm;
+                    float sunlit = PlanetSunlight(densityPos, sunDir);
+                    sunAccum += contribution * sunlit;
+                    scatteredLight += contribution * phase * lightTransmittance * powderTerm * sunlit;
                     shadowAccum += contribution * lightTransmittance;
                     skyAccum += contribution * skyVisibility;
                     bumpAccum += contribution * bump;
@@ -1044,7 +1255,13 @@ Shader "VolumetricContrails/SmokeVolume"
                 float skyFacing = saturate(0.5 + 0.5 * dot(-rd, _SmokeUpDir.xyz));
                 fixed3 ambient = lerp(_AmbientGroundColor.rgb, _AmbientSkyColor.rgb, skyFacing);
                 float avgSky = alpha > 0.0001 ? saturate(skyAccum / alpha) : 1.0;
+                // Ambient has to follow the terminator too. The sky above night-side smoke
+                // is dark, so leaving ambient at its daylight value paints the cloud a
+                // bright blue-white that no amount of shadow tuning can explain.
+                float avgSunlit = alpha > 0.0001 ? saturate(sunAccum / alpha) : 1.0;
+                float nightFade = lerp(_NightAmbient, 1.0, avgSunlit);
                 ambient *= lerp(1.0, avgSky, _SkyOcclusionStrength);
+                ambient *= nightFade;
                 fixed3 shaded = lerp(shadowColor, ambient, _SkyTintStrength);
 
                 // avgScatter drives the ramp. Driving it from the pure shadow term is
@@ -1095,6 +1312,183 @@ Shader "VolumetricContrails/SmokeVolume"
                 // premultiply on the way out - see the Blend note on the SubShader
                 col.rgb *= col.a;
                 return col;
+            }
+            ENDCG
+        }
+
+        // ------------------------------------------------------------------
+        // Shadow the cloud casts ONTO THE SCENE.
+        //
+        // The light march inside the volume can only find occluders that exist in the
+        // density field, and the terrain and the rocket are not in it - so the smoke
+        // shades itself perfectly and leaves the ground beneath it fully lit. Getting the
+        // cloud into Unity's shadow map is not an option either: it has no geometry to
+        // rasterise, and KSP's terrain shaders are not ours to modify.
+        //
+        // So this goes the other way round. It runs after the opaque scene is drawn,
+        // reconstructs each pixel's world position from the depth buffer, and marches
+        // from there toward the sun through the same spine the volume itself uses. The
+        // result multiplies the framebuffer, so anything standing under the plume gets
+        // darkened - terrain, buildings and the vessel alike, with no per-object work.
+        //
+        // Cost is kept down by sphere tracing: a pixel nowhere near the plume resolves in
+        // one or two iterations, because EmptyDistance hands back a large guaranteed-empty
+        // jump straight away.
+        Pass
+        {
+            Name "SmokeShadowCast"
+            Blend DstColor Zero
+            ZWrite Off
+            ZTest Always
+            Cull Off
+
+            CGPROGRAM
+            #pragma target 3.5
+            #pragma vertex vertShadowCast
+            #pragma fragment fragShadowCast
+            #pragma multi_compile _ SMOKE_VOLUME_POLYLINE
+
+            struct v2fCast
+            {
+                float4 pos : SV_POSITION;
+                float4 scr : TEXCOORD0;
+                float3 ray : TEXCOORD1;
+            };
+
+            v2fCast vertShadowCast (appdata v)
+            {
+                v2fCast o;
+                // The quad arrives already in clip space; this pass covers the screen and
+                // has no transform of its own.
+                o.pos = float4(v.vertex.xy, UNITY_NEAR_CLIP_VALUE, 1.0);
+
+                // Screen coordinates for the depth lookup come from ComputeScreenPos, NOT
+                // from the vertex position directly. Deriving them by hand reads the depth
+                // texture upside down on D3D, and the give-away is not a blank screen but a
+                // shadow that lands mirrored about the middle of the frame: every pixel
+                // shades itself using the depth of the pixel opposite it, so the ground
+                // stays lit and the plume's shadow appears floating in the sky above it.
+                o.scr = ComputeScreenPos(o.pos);
+
+                // View ray for this corner, carried from the vertex so it interpolates
+                // linearly across the quad. It comes off the real clip position, which
+                // keeps it in step with the flipped lookup above.
+                float4 rayH = mul(unity_CameraInvProjection, float4(v.vertex.xy, 1.0, 1.0));
+                o.ray = rayH.xyz / rayH.w;
+                return o;
+            }
+
+            fixed4 fragShadowCast (v2fCast i) : SV_Target
+            {
+                float2 uv = i.scr.xy / i.scr.w;
+                float raw = SAMPLE_DEPTH_TEXTURE(_CameraDepthTexture, uv);
+                float depth01 = Linear01Depth(raw);
+
+                // Diagnostic ladder. Each rung answers one question, in the order the pass
+                // actually executes, so a single flight can walk it and stop at the first
+                // rung that fails instead of costing a build per guess.
+                //
+                //   1 GREEN everywhere   - the pass runs at all
+                //   2 CYAN on non-sky    - the depth texture is readable here
+                //   3 BLUE               - the spine arrays reached this pass
+                //                          (RED = _SpineCount is 0, the block is not
+                //                           carrying the geometry and the march has
+                //                           nothing to hit)
+                //   4 YELLOW             - PlanetSunlight lets this pixel through
+                //                          (RED = the planet-shadow test is rejecting the
+                //                           ground before the march even starts)
+                //   5 MAGENTA            - the march accumulated optical depth here,
+                //                          i.e. the sun ray actually crossed the plume
+                //                          (RED = it marched and found nothing)
+                //
+                // Rung 5 is the one that matters; 3 and 4 exist because both would fail
+                // silently and look identical from outside.
+                if (_ShadowCastDebug > 0.5 && _ShadowCastDebug < 1.5) return fixed4(0.3, 1, 0.3, 1);
+                if (_ShadowCastDebug > 1.5 && _ShadowCastDebug < 2.5) return fixed4(depth01 > 0.999 ? 1.0 : 0.3, 1, 1, 1);
+                if (_ShadowCastDebug > 2.5 && _ShadowCastDebug < 3.5)
+                {
+                    if (depth01 > 0.999) return fixed4(1, 1, 1, 1);
+                    // _SpineCount only exists in the polyline variant; this pass compiles
+                    // for both, so it has to be asked behind the keyword.
+                    #ifdef SMOKE_VOLUME_POLYLINE
+                        return _SpineCount > 1 ? fixed4(0.3, 0.3, 1, 1) : fixed4(1, 0.2, 0.2, 1);
+                    #else
+                        return fixed4(0.6, 0.6, 0.6, 1);
+                    #endif
+                }
+
+                // Sky. There is no surface here to shadow, and reconstructing a position
+                // from the far plane would put it effectively at infinity.
+                if (depth01 > 0.999) return fixed4(1, 1, 1, 1);
+
+                // Reconstruct the world position this pixel actually shows.
+                //
+                // Built from the INVERSE VIEW matrix rather than unity_CameraToWorld. The
+                // latter is not simply the inverse of the view matrix in Unity - its third
+                // row is negated - so using it here silently puts the reconstructed point
+                // in the wrong place, and a march that starts in the wrong place finds
+                // nothing while every other part of the pass looks healthy.
+                float eye = LinearEyeDepth(raw);
+                // normalise so z = -1, which makes scaling by eye depth land on the surface
+                float3 viewDir = i.ray / max(-i.ray.z, 1e-6);
+                float3 worldDir = mul((float3x3)UNITY_MATRIX_I_V, viewDir);
+                float3 worldPos = _WorldSpaceCameraPos + worldDir * eye;
+
+                float3 sunDir = dot(_SmokeSunDir.xyz, _SmokeSunDir.xyz) > 0.0001
+                    ? normalize(_SmokeSunDir.xyz)
+                    : normalize(_WorldSpaceLightPos0.xyz);
+
+                // A surface already on the night side casts nothing - and marching there
+                // would only find the plume lit from the wrong side.
+                float groundSun = PlanetSunlight(worldPos, sunDir);
+                if (_ShadowCastDebug > 3.5 && _ShadowCastDebug < 4.5)
+                    return groundSun > 0.001 ? fixed4(1, 1, 0.3, 1) : fixed4(1, 0.2, 0.2, 1);
+                if (groundSun <= 0.001) return fixed4(1, 1, 1, 1);
+
+                float stepLen = _ShadowCastDistance / max((float)_ShadowCastSteps, 1.0);
+                float opticalDepth = 0.0;
+                // start clear of the surface so a pixel does not shadow itself
+                float t = stepLen * 0.5;
+
+                [loop]
+                for (int s = 0; s < _ShadowCastSteps; s++)
+                {
+                    float3 sp = worldPos + sunDir * t;
+                    float empty = EmptyDistance(sp);
+                    if (empty > 0.0)
+                    {
+                        // Advance by the EMPTY distance, not by max(empty, stepLen).
+                        //
+                        // max() defeated the whole point of sphere tracing here. stepLen is
+                        // the reach divided by the step budget - 156m at the defaults - so a
+                        // ray that had correctly measured 5m of empty space in front of a
+                        // 40m-wide plume was still pushed 156m and stepped clean over it.
+                        // The shadow then only appeared where the geometry happened to line
+                        // up with the fixed stride, which is why it came out as a row of
+                        // separate dark ovals instead of one continuous streak.
+                        //
+                        // The small floor is only there to guarantee progress so the loop
+                        // cannot stall against a surface it is sitting exactly on.
+                        t += max(empty, 1.0);
+                    }
+                    else
+                    {
+                        opticalDepth += DensityCheapAt(sp, 1.0) * _Density * stepLen;
+                        t += stepLen;
+                    }
+                    if (t > _ShadowCastDistance) break;
+                }
+
+                // 3 = did this ray meet ANY smoke? Separates "the march is wrong" from
+                // "the march is right but the shading maths cancels out".
+                if (_ShadowCastDebug > 2.5) return fixed4(opticalDepth > 0.0001 ? 0.2 : 1.0, 1, 1, 1);
+
+                if (_ShadowCastDebug > 4.5)
+                    return opticalDepth > 0.0001 ? fixed4(1, 0.3, 1, 1) : fixed4(1, 0.2, 0.2, 1);
+
+                float transmittance = exp(-opticalDepth * _Absorption * _ShadowExtinction);
+                float shade = lerp(1.0, transmittance, _ShadowCastStrength);
+                return fixed4(shade, shade, shade, 1.0);
             }
             ENDCG
         }
