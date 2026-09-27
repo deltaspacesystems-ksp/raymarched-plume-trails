@@ -13,7 +13,7 @@ Volumetric exhaust plume smoke for rockets, uses Henyey-Greenstein phase scatter
  - Optional temporal upscaling on lower quality presets (experimental(very!))
 # Windows only(linux and mac shaders coming soon)
 
-# Our Discord Server
+# Discord Server
 https://discord.gg/2CwBFzyqa
 
 <sub> h </sub>
