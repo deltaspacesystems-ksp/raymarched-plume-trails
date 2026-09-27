@@ -1,6 +1,5 @@
 # Volumetric Plume Trails mod for KSP!
-[![Latest release](https://img.shields.io/github/v/release/deltaspacesystems-ksp/raymarched-plume-trails/?display_name=tag)](https://github.com/deltaspacesystems-ksp/raymarched-plume-trails/releases/latest)
-[![SpaceDock](https://img.shields.io/badge/SpaceDock-download-2f6f9f)](https://spacedock.info/mod/comingsoonhhhh)
+[![SpaceDock](https://img.shields.io/badge/SpaceDock-download-2f6f9f)](https://spacedock.info/mod/4618)
 [![KSP 1.12.5](https://img.shields.io/badge/KSP-1.12.5-2f6f9f)](https://www.kerbalspaceprogram.com/)
 
 Volumetric exhaust plume smoke for rockets, uses Henyey-Greenstein phase scattering for realistic shadowed look, it's fully raymarched too
