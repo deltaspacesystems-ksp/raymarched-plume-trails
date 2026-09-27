@@ -1,5 +1,12 @@
 # Volumetric Plume Trails mod for KSP!
-need to fill thjis with info
+Volumetric exhaust plume smoke for rockets, uses Henyey-Greenstein phase scattering for realistic shadowed look
+# Features 
+ - Smoke expansion based on the height, velocity and pressure of the rocket
+ - Simple SRB "configs" with a simple fade out when the engine shuts off (more fuel types coming soon)
+ - It's raymarched(not particles!)
+ - In game config editor
+ - Quality selector in the mods ui with auto adjusting
+ - Optional temporal upscaling on lower quality presets (experimental(very!))
 # Our Discord Server
 https://discord.gg/2CwBFzyqa
 
@@ -14,11 +21,10 @@ https://discord.gg/2CwBFzyqa
 
 </details>
 
+KSA inspired me to make this mod
+# Credits
 
-# Credits❤️
-Thanks to Blackrack and KSA for inspiring me to do this mod
-
-Credits to Kyle Kerman (discord:chez_tasty_26158) for making a veeeeeery peak icon for this mod❤️
+Credits to Kyle Kerman (discord:chez_tasty_26158) for making a veeeeeery peak icon for this mod
 
 # Licence
 
