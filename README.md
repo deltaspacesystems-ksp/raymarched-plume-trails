@@ -12,11 +12,12 @@ Volumetric exhaust plume smoke for rockets, uses Henyey-Greenstein phase scatter
  - Quality selector in the mods ui with auto adjusting
  - Optional temporal upscaling on lower quality presets (experimental(very!))
 # Windows only(linux and mac shaders coming soon)
+# Installation
+Download the zip and extract it. Open your KSP install folder. Copy the GameData folder from the extracted zip into your KSP GameData folder, so you end up with GameData/RaymarchedPlumeTrails inside your existing GameData. If you already have an older VolumetricContrails folder from a previous version, delete that one first, don't just drop the new one next to it. Requires ModuleManager to be installed (get it from CKAN or SpaceDock, not bundled). Recommended but optional: Waterfall and Avalanche for the flame/ignition effects, SmokeScreen since Avalanche depends on it. Windows only for now. Launch KSP, the smoke trail settings are in the in-game mod UI, toolbar icon should show up in flight.
 
 # Discord Server
 https://discord.gg/2CwBFzyqa
 
-<sub> h </sub>
 
 <details>
 <summary>Images, Click here to expand</summary>
