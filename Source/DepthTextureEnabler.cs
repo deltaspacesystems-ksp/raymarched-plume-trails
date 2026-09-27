@@ -1,6 +1,6 @@
 using UnityEngine;
 
-namespace VolumetricContrails
+namespace RaymarchedPlumeTrails
 {
     // The smoke clips its raymarch against _CameraDepthTexture instead of depth-testing
     // its box (see the occlusion block in SmokeVolume.shader). Unity only fills that

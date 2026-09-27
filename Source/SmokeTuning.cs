@@ -1,6 +1,6 @@
 using UnityEngine;
 
-namespace VolumetricContrails
+namespace RaymarchedPlumeTrails
 {
     // Live-tunable parameters, driven from the in-flight slider window.
     //
@@ -42,7 +42,10 @@ namespace VolumetricContrails
         // Ambient, washout and shadow darkness all set the same thing - lit-to-shaded
         // contrast - so they have to be moved together. Pushing ambient and washout up at
         // once clips the whole volume to white, which reads as flat AND glaring.
-        public static float AmbientFloor = 0.20f;        // lower = deeper shadows
+        // Lowered from 0.20 alongside MultiScatterIntensity (27 IX, same "za plaski"
+        // report): the two together were the flattening culprit, not shadow strength
+        // itself (already at 1.0, the ceiling).
+        public static float AmbientFloor = 0.15f;        // lower = deeper shadows
         // Fraction of the real extinction the shadow ray sees. Lower = softer gradient.
         // 0.12 was near the top of the range and that is the binary regime: exp() over a
         // multi-metre step is then effectively lit-or-black, so every density boundary
@@ -52,9 +55,6 @@ namespace VolumetricContrails
         // final shading, than by making the exponential harsh again.
         public static float ShadowExtinction = 0.06f;
 
-        // Samples per shadow ray. 4 is cheap and quantises visibly; 8 is noticeably
-        // smoother and costs real frames, because this march runs per primary sample.
-        public static float LightMarchSteps = 4f;
         // How far the shadow ray reaches. Must be comparable to the cloud's own thickness,
         // or a ray dies inside the lobe it started in and lobes never shadow each other.
         public static float LightReach = 65f;
@@ -95,7 +95,13 @@ namespace VolumetricContrails
         // Multiple scattering, faked with a second wide lobe. It's what makes a cloud glow
         // from within instead of looking like a shell.
         public static float MultiScatterG = 0.27f;
-        public static float MultiScatterIntensity = 4.0f;
+        // Cut from 4.0 (27 IX): this fakes multi-scatter as a second wide, nearly
+        // omnidirectional lobe, and at 4x it was strong enough to wash the shadowed side
+        // up close to the lit side regardless of ShadowStrength/ShadowDarkness - the
+        // "za plaski" report. Lower value leaves it doing its job (glow from within
+        // instead of a hard shell) without erasing the lit/shadowed contrast that reads
+        // as a round volume rather than a flat card.
+        public static float MultiScatterIntensity = 2.5f;
         // Darkens the sun-facing side of a billow, which stops it reading as a flat disc.
         public static float PowderStrength = 0.5f;
         public static float SkyTintStrength = 0.5f;
@@ -126,7 +132,21 @@ namespace VolumetricContrails
         // 1 = it keeps the same cauliflower as smoke at the pad.
         public static float ThinDetailFade = 0.25f;
 
-        public static float ShadowCastStrength = 0.55f;
+        // OFF by default (2026-09-27). Two independent, confirmed problems on the same
+        // day: (1) the shadow reads as a row of separate dark dots on the ground instead
+        // of one continuous streak - the "row of ovals" bug from 7 IX evidently was not
+        // fully fixed, or regressed since. (2) worse, at least once the WHOLE screen went
+        // black - terrain, sky and ship all gone, only our own smoke and the UI left
+        // visible - which is consistent with this pass (Blend DstColor Zero, multiplying
+        // the framebuffer) writing near-black across a much larger area than it should,
+        // rather than just under the plume. Confirmed independent of the quality governor
+        // and of temporal upscaling (both ruled out by testing), so the march itself -
+        // EmptyDistance/SpineDistance's group culling, most likely under a large MERGED
+        // spine - is the remaining suspect. Not something to chase blind without a GPU
+        // frame debugger on a release day. The pass is a total no-op below 0.001 (see the
+        // early-out in HalfResSmokeRenderer.BuildShadowCast), so this fully disables it
+        // rather than just fading it. Re-enable once the march bug is actually found.
+        public static float ShadowCastStrength = 0f;
         public static float ShadowCastDistance = 2500f;
         public static float ShadowCastSteps = 16f;
         // 0 off, 1 = tint everything the pass reaches, 2 = tint only non-sky pixels.
@@ -144,8 +164,69 @@ namespace VolumetricContrails
 
         // Exponent on how a spreading solid-motor trail thins. 2 is mass conservation along
         // a line (density ~ 1/r^2, optical depth ~ 1/r); 0 turns thinning off and the old
-        // column stays as dense as the new.
-        public static float SrbThinningPower = 2f;
+        // column stays as dense as the new. Eased to 1.5 (27 IX): full mass-conservation
+        // thinning combined with the altitude bloom made the trail read as vanishing too
+        // quickly right behind the vehicle instead of thinning gradually - real launch
+        // smoke stays visibly opaque for longer than pure 1/r^2 predicts, because it is
+        // not actually a 1-D line source once it billows this wide.
+        public static float SrbThinningPower = 1.5f;
+
+        // --- solid-motor plume shape ---------------------------------------------------
+
+        // Seconds over which the spawn point follows a change in nozzle direction or in
+        // flight path. Short = it whips with every attitude change; long = it lags a turn
+        // and the base of the plume stops lining up with the nozzle.
+        public static float SrbTurnSmoothing = 0.30f;
+
+        // How hard the relative wind bends the plume when the rocket turns. 0 = the smoke
+        // always leaves straight down the nozzle axis; 1 = physical-ish; higher exaggerates
+        // it, so the plume leaves along the flame and is then swept sideways as if nothing
+        // were pushing it out of the nozzle.
+        public static float SrbCrossflowBend = 2.0f;
+
+        // Draw the plume from the nozzle itself, on a curve through the flame, instead of
+        // starting it a jet-length behind the engine.
+        public static bool SrbRootEnabled = true;
+        // Radius of the plume at the nozzle, as a fraction of the emission radius.
+        public static float SrbRootRadius = 0.5f;
+
+        // Multiplier on how fast the trail spreads, and the length of the slow near-field
+        // phase before turbulent spreading takes over (seconds).
+        public static float SrbSpreadRate = 1.0f;
+        // Cut from 0.6 (27 IX): at high altitude/speed the jet phase still covered a
+        // long enough physical stretch (velocity * t0) to look like the trail snaps from
+        // thin to full width instead of tapering. Shortening the near-straight phase
+        // hands more of the visible taper to the t^2/(t+t0) curve's own gradual middle
+        // section instead of a short jet-phase segment followed by a sharp knee.
+        public static float SrbJetPhaseTime = 0.35f;
+
+        // How long a motor keeps shedding thin, decaying smoke after it goes quiet, in
+        // seconds. 0 disables the tail and reproduces the old instant cutoff.
+        public static float SrbTailTime = 4f;
+
+        // --- quality / performance ------------------------------------------------------
+        // 0 Low, 1 Medium, 2 High, 3 Ultra. High is what shipped before presets existed.
+        public static int QualityPreset = 2;
+        // Let the frame-time governor trade resolution and sample counts down on demand.
+        public static bool AutoQuality = true;
+        // Frame time the governor defends, in milliseconds (22 = ~45 fps).
+        public static float TargetFrameMs = 22f;
+
+        // Accumulate detail across frames when the smoke renders below screen resolution
+        // (Low, Medium, or after the governor has stepped down). It never runs at full
+        // resolution, so High and Ultra look exactly as they did without it.
+        // OFF by default (2026-09-27). The governor can legitimately drop resolution
+        // below 100% even on High under load (exactly what happened: a background OSMRoads
+        // tile build stalled a frame, the governor stepped down for a few seconds), and
+        // that is enough to arm this path - which then blanked the whole screen to black
+        // for as long as it stayed armed, recovering on its own the moment the governor
+        // stepped back up. Real, reproducible, and not something to debug blind without a
+        // GPU frame debugger on a release day. Left in the code, opt-in only, until it can
+        // be diagnosed properly.
+        public static bool TemporalUpscale = false;
+        // How much of the previous frame is kept, 0..1. Higher = smoother and sharper at
+        // rest but slower to react; lower = more shimmer, less ghosting.
+        public static float TemporalFeedback = 0.88f;
 
         public static float ShadowCastDebug = 0f;
 
@@ -174,7 +255,11 @@ namespace VolumetricContrails
         // small numbers travel a long way over a 150s life - see the note in Tick.
         public static float WindSpeed = 0f;
 
-        public static float MaxPuffSize = 18f;
+        // Reference: Space Shuttle's twin SRBs - the plume billows out to many times the
+        // booster's own diameter within the first couple of seconds off the nozzle, not
+        // over a slow multi-second ramp. 18 was tuned for a slimmer trail; this is closer
+        // to that reference. See also SrbJetPhaseTime and clusterStartSize below.
+        public static float MaxPuffSize = 34f;
         public static float SpawnOffset = 15f;
 
         // OFF by default. Retropropulsion is a liquid-engine manoeuvre, and in SRB-only
@@ -225,7 +310,18 @@ namespace VolumetricContrails
         // a guess that overshot by a factor of thirty and produced the balloons and giant
         // spheres. A solid motor also burns out around 40-50km, well before the regime
         // where anything like a jellyfish bloom would form.
-        public static float JellyfishSizeBoost = 5.0f;
+                // Multiplier on the EXCESS over the physical sqrt(pressure ratio) curve - see
+        // PlumeBloomWidth in LaunchSmokeController. 1 = the honest physical relation with
+        // no exaggeration; raise it if that still reads too subtle next to a reference
+        // photo once actually seen in-game.
+        public static float JellyfishSizeBoost = 1.0f;
+
+        // Ambient pressure (kPa) below which the bloom stops growing further. Real physics
+        // has no such floor - an underexpanded jet keeps widening all the way to vacuum -
+        // this exists purely so the box, sample count and puff density stay in a sane
+        // range once the air is functionally gone. 0.05 kPa is close to where a real-scale
+        // SRB burns out anyway, so it is rarely the limiting factor in practice.
+        public static float PlumeBloomPressureFloor = 0.05f;
         // Thin air means a thin plume, but not an absent one - the jellyfish is faint and
         // translucent, so alpha fades toward this floor rather than to zero.
         public static float JellyfishAlphaFloor = 0.22f;
@@ -276,7 +372,6 @@ namespace VolumetricContrails
             block.SetFloat("_MultiScatterG", MultiScatterG);
             block.SetFloat("_MultiScatterIntensity", MultiScatterIntensity);
             block.SetFloat("_PowderStrength", PowderStrength);
-            block.SetInt("_LightMarchSteps", Mathf.RoundToInt(LightMarchSteps));
             block.SetFloat("_ThinEdgeSoftness", ThinEdgeSoftness);
             block.SetFloat("_ThinDetailFade", ThinDetailFade);
             block.SetFloat("_ShadowCastDebug", ShadowCastDebug);

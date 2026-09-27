@@ -1,7 +1,7 @@
 using System.Collections.Generic;
 using UnityEngine;
 
-namespace VolumetricContrails
+namespace RaymarchedPlumeTrails
 {
     // launch smoke as a raymarched volume, tiled 3d textures for the active tail
     public class SmokeVolumeGroup : MonoBehaviour
@@ -212,6 +212,8 @@ namespace VolumetricContrails
         private Vector3 lastNoiseShift;
 
         private int committedTrailStride = 1;
+        // Same ratchet, for the SECOND thinning stage - see BuildMergedSpine.
+        private int committedSpineStride = 1;
 
         // Set by LaunchSmokeController each tick: 1 at sea level, falling as the plume
         // blooms, so an expanding plume also gets thinner instead of just fatter.
@@ -240,12 +242,20 @@ namespace VolumetricContrails
         // renderer; cheap to call every frame.
         public void HideAll()
         {
+            hiddenByToggle = true;
             if (polylineRenderer != null) SmokeRenderRegistry.SetActive(polylineRenderer, false);
             for (int i = 0; i < activeTiles.Count; i++) SmokeRenderRegistry.SetActive(activeTiles[i].renderer, false);
         }
 
         private static int activeInstanceCount;
         public static bool AnyActive => activeInstanceCount > 0;
+
+        // Every live group, so nearby trails can be drawn as ONE volume. See RenderAll.
+        private static readonly List<SmokeVolumeGroup> all = new List<SmokeVolumeGroup>();
+        private float lastTickTime;
+        private bool hiddenByToggle;
+        private int lastLeaderId;
+        public int MergedCount { get; private set; }
 
         private static bool IsFinite(Vector3 v)
         {
@@ -340,6 +350,8 @@ namespace VolumetricContrails
             this.fadeEndAltitude = fadeEndAltitude;
 
             activeInstanceCount++;
+            all.Add(this);
+            MergedCount = 1;
 
             GameObject polylineObj = GameObject.CreatePrimitive(PrimitiveType.Cube);
             polylineObj.name = "PolylineActiveTrail";
@@ -410,11 +422,103 @@ namespace VolumetricContrails
             liveTipPos = worldPos;
             liveTipRadius = radius;
             hasLiveTip = true;
+            lastLiveTipRefresh = Time.time;
         }
 
         public void ClearLiveTip()
         {
             hasLiveTip = false;
+            liveRootCount = 0;
+        }
+
+        // The plume's root: a short curve from the nozzle to the live tip, so the smoke
+        // starts AT the engine and visibly leaves along the flame before bending away.
+        //
+        // Without it the chain began a jet-length behind the nozzle, leaving a gap between
+        // the engine and the first smoke that the flame had to hide - and any change in
+        // where that first point sat, whether from a turn or from speed, read as smoke
+        // appearing out of nowhere beside the exhaust rather than being pushed out of it.
+        //
+        // A quadratic Bezier whose control point lies on the nozzle axis: the curve leaves
+        // tangent to the axis and arrives wherever the wind has carried the tip to, which
+        // is exactly the shape of a jet turning into a crossflow.
+        private const int LiveRootPoints = 4;
+        private readonly Vector3[] liveRootPos = new Vector3[LiveRootPoints];
+        private readonly float[] liveRootRadius = new float[LiveRootPoints];
+        private int liveRootCount;
+        private float liveRootDensity = 1f;
+
+        public bool HasLiveTip => hasLiveTip;
+
+        // Turn the live tip and root into ordinary puffs at the moment emission stops.
+        //
+        // They exist only while an engine feeds them, so cutting the engine deleted the
+        // last jet-length of plume plus its root in a single frame. The trail then seemed
+        // to jump BACK toward the vessel and ended bluntly on the last full puff - the
+        // "pulls back and flattens" when a motor shuts down. Freezing them into puffs
+        // keeps exactly what was on screen and lets it age and spread like the rest.
+        //
+        // Ordered tip first, then toward the nozzle, which is the spine's own order.
+        public void CommitLiveTip()
+        {
+            if (!hasLiveTip)
+            {
+                liveRootCount = 0;
+                return;
+            }
+
+            // Same burn as the puffs before it, or the chain would be broken between them.
+            // The last puff in the list may be a ground-cloud one (burn 0), so look back.
+            int burn = 0;
+            for (int i = puffs.Count - 1; i >= 0; i--)
+            {
+                if (!puffs[i].isGround) { burn = puffs[i].burnId; break; }
+            }
+
+            AddFrozenPuff(liveTipPos, liveTipRadius, burn);
+            for (int i = 0; i < liveRootCount; i++)
+                AddFrozenPuff(liveRootPos[i], liveRootRadius[i], burn);
+
+            hasLiveTip = false;
+            liveRootCount = 0;
+        }
+
+        private void AddFrozenPuff(Vector3 worldPos, float radius, int burnId)
+        {
+            puffs.Add(new Puff
+            {
+                localPos = WorldToLocal(worldPos),
+                velocity = Vector3.zero,
+                age = 0f,
+                // SizeForPuff returns startSize * sizeMultiplier at age 0, so this puts the
+                // frozen puff at exactly the radius the live tip had.
+                sizeMultiplier = radius / Mathf.Max(startSize, 0.01f),
+                expansion = 1f,
+                emitDensity = liveRootDensity,
+                burnId = burnId,
+                spawnIndex = nextSpawnIndex++
+            });
+        }
+
+        public void SetLiveRoot(Vector3 nozzle, Vector3 axis, float nozzleRadius, float density)
+        {
+            liveRootCount = 0;
+            liveRootDensity = density;
+            if (!hasLiveTip || nozzleRadius <= 0f) return;
+            float len = Vector3.Distance(nozzle, liveTipPos);
+            if (len < 1.5f) return;
+
+            Vector3 control = nozzle + axis * (len * 0.55f);
+            // tip -> nozzle, matching the spine's oldest-to-newest order
+            for (int i = 0; i < LiveRootPoints; i++)
+            {
+                float t = 1f - (i + 1) / (float)LiveRootPoints;   // 0.75, 0.5, 0.25, 0
+                float u = 1f - t;
+                liveRootPos[i] = u * u * nozzle + 2f * u * t * control + t * t * liveTipPos;
+                float grow = t * t * (3f - 2f * t);               // smoothstep: no needle at the nozzle
+                liveRootRadius[i] = Mathf.Lerp(nozzleRadius, liveTipRadius, grow);
+            }
+            liveRootCount = LiveRootPoints;
         }
 
         // Ground cloud, emitted where the exhaust lands rather than produced by puffs
@@ -478,6 +582,12 @@ namespace VolumetricContrails
         // because the vessel is exactly what has gone away.
         private bool orphaned;
 
+        // Watchdog against a stale live tip - see StaleTipWatchdog below.
+        private float lastLiveTipRefresh;
+        // Generous next to a spawnInterval of ~0.08s: only meant to catch a controller
+        // that stopped calling SetLiveTip altogether, not to react to one slow tick.
+        private const float LiveTipStaleAfter = 0.5f;
+
         public void Orphan()
         {
             orphaned = true;
@@ -492,11 +602,21 @@ namespace VolumetricContrails
             // scene slides out from under a frozen point and the spine stretches a segment
             // from the abandoned trail towards whatever the origin now follows - which
             // reads in game as a dead rocket's trail attaching itself to the one you fly.
-            ClearLiveTip();
+            CommitLiveTip();
         }
 
         private void Update()
         {
+            // Runs for EVERY instance, orphaned or not - a live tip left un-refreshed for
+            // half a second gets frozen regardless of why. Orphan() already does this the
+            // instant the controller is destroyed, but destruction ordering on a vessel
+            // that explodes or crashes is not as reliable as a clean scene unload, and
+            // this is what a missed or delayed call looks like: the point sits still while
+            // the controller that should be re-aiming it every tick has gone quiet. That
+            // is indistinguishable, from here, from "still attached to whatever the world
+            // origin now follows" - the exact failure this exists to rule out.
+            StaleTipWatchdog();
+
             if (!orphaned) return;
             if (puffs.Count == 0)
             {
@@ -505,6 +625,20 @@ namespace VolumetricContrails
                 return;
             }
             Tick(Time.deltaTime);
+        }
+
+        private void StaleTipWatchdog()
+        {
+            if (!hasLiveTip) return;
+            if (Time.time - lastLiveTipRefresh < LiveTipStaleAfter) return;
+
+            Debug.LogWarning(string.Format(
+                "[PlumeTrails] instance {0}: live tip stale for {1:F2}s, freezing it. "
+                + "This should only ever be Orphan() reacting a little late - if it fires "
+                + "on a vessel that is still flying, something upstream stopped calling "
+                + "SetLiveTip without telling this group to stop.",
+                instanceId, Time.time - lastLiveTipRefresh));
+            CommitLiveTip();
         }
 
         public void SetSizes(float newStartSize, float newMaxSize)
@@ -598,9 +732,14 @@ namespace VolumetricContrails
 
 
             BuildActiveOrderedList();
+            hiddenByToggle = false;
+            lastTickTime = Time.time;
+            ComputeSpineBounds();
             if (usePolylineActiveTrail)
             {
-                UpdatePolylineVolume();
+                // The volume is uploaded by RenderAll, once per frame after EVERY group has
+                // ticked, because one volume may now carry several groups' trails and it
+                // cannot be built until all of their lists are fresh.
                 for (int i = 0; i < activeTiles.Count; i++) SmokeRenderRegistry.SetActive(activeTiles[i].renderer, false);
             }
             else
@@ -1098,8 +1237,17 @@ namespace VolumetricContrails
                 // K is chosen so the puff still reaches maxSize at growthTime, so the
                 // existing size knobs keep meaning what they did.
                 float r0 = startSize;
-                float k = Mathf.Max((maxSize * maxSize - r0 * r0) / Mathf.Max(growthTime, 0.1f), 0f);
-                grown = Mathf.Sqrt(r0 * r0 + k * p.age);
+                float T = Mathf.Max(growthTime, 0.1f);
+                float t0 = Mathf.Max(SmokeTuning.SrbJetPhaseTime, 0.05f);
+                // t^2 / (t + t0) rather than plain t. It behaves as t^2/t0 while the smoke
+                // is still inside the jet (a slow, nearly straight start that hides the
+                // join with the nozzle) and as t once turbulence has taken over, so the
+                // plume neither bells open at the engine nor stays a needle. K still lands
+                // the puff on maxSize at growthTime, so the size knobs keep their meaning;
+                // SrbSpreadRate scales how fast it gets there.
+                float k = Mathf.Max((maxSize * maxSize - r0 * r0) * (T + t0) / (T * T), 0f)
+                        * SmokeTuning.SrbSpreadRate;
+                grown = Mathf.Sqrt(r0 * r0 + k * p.age * p.age / (p.age + t0));
                 return grown * p.sizeMultiplier * EasedExpansion(p);
             }
 
@@ -1309,7 +1457,13 @@ namespace VolumetricContrails
             {
                 activeOrderedPos.Add(liveTipPos);
                 activeOrderedRadius.Add(liveTipRadius);
-                activeOrderedDensity.Add(1f);
+                activeOrderedDensity.Add(liveRootDensity);
+                for (int i = 0; i < liveRootCount; i++)
+                {
+                    activeOrderedPos.Add(liveRootPos[i]);
+                    activeOrderedRadius.Add(liveRootRadius[i]);
+                    activeOrderedDensity.Add(liveRootDensity);
+                }
             }
         }
 
@@ -1459,49 +1613,278 @@ namespace VolumetricContrails
             return groupCount;
         }
 
-        private void UpdatePolylineVolume()
+        // ------------------------------------------------------------------------------
+        // Merging trails that grow into each other.
+        //
+        // Each engine group simulates its own puffs, but they no longer each get a volume.
+        // Groups whose trails have grown until they touch are drawn as ONE chain of
+        // capsules in ONE volume, and the shader's smooth union does the rest: where the
+        // trails overlap they fuse into a single body, and where they do not they are just
+        // two shapes, exactly as before. That is why the merge can happen the moment the
+        // bounds touch with no visible change - a union of shapes that do not overlap IS
+        // those shapes - and why each trail keeps its own outline until they meet.
+        //
+        // Separate volumes were composited over one another instead, so two neighbouring
+        // plumes showed a seam where they crossed and a hard edge on whichever was behind.
+        // ------------------------------------------------------------------------------
+        private const int MaxMergedGroups = 6;
+        // Once merged, stay merged until the bounds separate by this much more, so a pair
+        // hovering at the touching distance does not flip between the two modes every frame.
+        private const float MergeHysteresis = 1.3f;
+
+        private Vector3 spineMin, spineMax;
+        private bool hasSpineBounds;
+
+        private void ComputeSpineBounds()
         {
-            int totalPoints = activeOrderedPos.Count;
+            hasSpineBounds = false;
+            int n = activeOrderedPos.Count;
+            if (n < 2) return;
 
-            List<Vector3> pos = activeOrderedPos;
-            List<float> radius = activeOrderedRadius;
-            List<float> density = activeOrderedDensity;
-
-            if (totalPoints > MaxSpinePoints)
+            Vector3 mn = Vector3.positiveInfinity;
+            Vector3 mx = Vector3.negativeInfinity;
+            for (int i = 0; i < n; i++)
             {
-                polylineThinnedPos.Clear();
-                polylineThinnedRadius.Clear();
-                polylineThinnedDensity.Clear();
-                float stride = (float)totalPoints / MaxSpinePoints;
-                for (int i = 0; i < MaxSpinePoints; i++)
-                {
-                    int srcIndex = Mathf.Min(totalPoints - 1, Mathf.FloorToInt(i * stride));
-                    polylineThinnedPos.Add(activeOrderedPos[srcIndex]);
-                    polylineThinnedRadius.Add(activeOrderedRadius[srcIndex]);
-                    polylineThinnedDensity.Add(activeOrderedDensity[srcIndex]);
-                }
-                pos = polylineThinnedPos;
-                radius = polylineThinnedRadius;
-                density = polylineThinnedDensity;
-                totalPoints = MaxSpinePoints;
+                float r = activeOrderedRadius[i];
+                float margin = r * BoxRadiusMarginMultiplier
+                             + BoxWarpMargin * Mathf.Clamp(r / ShaderReferenceRadius, 0.35f, 1f);
+                mn = Vector3.Min(mn, activeOrderedPos[i] - Vector3.one * margin);
+                mx = Vector3.Max(mx, activeOrderedPos[i] + Vector3.one * margin);
             }
+            spineMin = mn;
+            spineMax = mx;
+            hasSpineBounds = true;
+        }
+
+        private static bool BoundsTouch(SmokeVolumeGroup a, SmokeVolumeGroup b, float grow)
+        {
+            Vector3 ca = (a.spineMin + a.spineMax) * 0.5f, cb = (b.spineMin + b.spineMax) * 0.5f;
+            Vector3 ea = (a.spineMax - a.spineMin) * 0.5f * grow, eb = (b.spineMax - b.spineMin) * 0.5f * grow;
+            return Mathf.Abs(ca.x - cb.x) <= ea.x + eb.x
+                && Mathf.Abs(ca.y - cb.y) <= ea.y + eb.y
+                && Mathf.Abs(ca.z - cb.z) <= ea.z + eb.z;
+        }
+
+        private static readonly List<SmokeVolumeGroup> freshGroups = new List<SmokeVolumeGroup>();
+        private static readonly List<List<SmokeVolumeGroup>> clusterPool = new List<List<SmokeVolumeGroup>>();
+        private static int[] clusterParent = new int[16];
+        private static int[] clusterSize = new int[16];
+
+        private static int FindRoot(int i)
+        {
+            while (clusterParent[i] != i)
+            {
+                clusterParent[i] = clusterParent[clusterParent[i]];
+                i = clusterParent[i];
+            }
+            return i;
+        }
+
+        // Called once a frame, after every group has had its FixedUpdate tick.
+        public static void RenderAll()
+        {
+            freshGroups.Clear();
+            float now = Time.time;
+            for (int i = all.Count - 1; i >= 0; i--)
+            {
+                if (all[i] == null) all.RemoveAt(i);
+            }
+            for (int i = 0; i < all.Count; i++)
+            {
+                SmokeVolumeGroup g = all[i];
+                if (!g.usePolylineActiveTrail || g.hiddenByToggle) continue;
+                // A vessel that is not being simulated (unloaded, on rails) stops ticking.
+                // Leave its volume exactly as it was rather than re-uploading stale lists.
+                if (now - g.lastTickTime > 1f) continue;
+                if (g.body == null) continue;
+                freshGroups.Add(g);
+            }
+
+            int n = freshGroups.Count;
+            if (n == 0) return;
+            if (clusterParent.Length < n)
+            {
+                clusterParent = new int[n * 2];
+                clusterSize = new int[n * 2];
+            }
+            for (int i = 0; i < n; i++) { clusterParent[i] = i; clusterSize[i] = 1; }
+
+            for (int i = 0; i < n; i++)
+            {
+                SmokeVolumeGroup a = freshGroups[i];
+                if (!a.hasSpineBounds) continue;
+                for (int j = i + 1; j < n; j++)
+                {
+                    SmokeVolumeGroup b = freshGroups[j];
+                    if (!b.hasSpineBounds || a.body != b.body) continue;
+
+                    int ra = FindRoot(i), rb = FindRoot(j);
+                    if (ra == rb) continue;
+                    if (clusterSize[ra] + clusterSize[rb] > MaxMergedGroups) continue;
+
+                    bool wereMerged = a.lastLeaderId != 0 && a.lastLeaderId == b.lastLeaderId;
+                    if (!BoundsTouch(a, b, wereMerged ? MergeHysteresis : 1f)) continue;
+
+                    clusterParent[rb] = ra;
+                    clusterSize[ra] += clusterSize[rb];
+                }
+            }
+
+            // one member list per root, leader (lowest instance id, so the first) first
+            int lists = 0;
+            for (int i = 0; i < n; i++)
+            {
+                if (FindRoot(i) != i) continue;
+                if (lists >= clusterPool.Count) clusterPool.Add(new List<SmokeVolumeGroup>());
+                List<SmokeVolumeGroup> members = clusterPool[lists++];
+                members.Clear();
+                for (int j = 0; j < n; j++)
+                {
+                    if (FindRoot(j) == i) members.Add(freshGroups[j]);
+                }
+
+                SmokeVolumeGroup leader = members[0];
+                for (int m = 0; m < members.Count; m++)
+                {
+                    members[m].lastLeaderId = leader.instanceId;
+                    members[m].MergedCount = members.Count;
+                    if (m > 0) SmokeRenderRegistry.SetActive(members[m].polylineRenderer, false);
+                }
+                leader.UploadCluster(members);
+            }
+        }
+
+        // The merged chain, each member smoothed on its own and joined by zero-radius
+        // separators.
+        //
+        // Smoothing has to happen per member: the 1-2-1 pass averages each point with its
+        // neighbours, and across a chain boundary the neighbour is a point on a DIFFERENT
+        // trail that may be hundreds of metres away, which would drag both ends toward
+        // each other. The separators are exact copies of the two end points, so the
+        // capsule between them has no radius and draws nothing.
+        private readonly Vector3[] mergeSpine = new Vector3[MaxSpinePoints];
+        private readonly float[] mergeRadii = new float[MaxSpinePoints];
+        private readonly float[] mergeDensity = new float[MaxSpinePoints];
+
+        private int BuildMergedSpine(List<SmokeVolumeGroup> members)
+        {
+            int rawTotal = 0, chains = 0;
+            for (int k = 0; k < members.Count; k++)
+            {
+                int n = members[k].activeOrderedPos.Count;
+                if (n >= 2) { rawTotal += n; chains++; }
+            }
+            if (chains == 0) return 0;
+
+            // The buffer is shared, so each chain gets a slice in proportion to its length,
+            // after setting aside the two separator points between chains. With one chain
+            // this reduces to the old "thin to the buffer size" behaviour.
+            int budget = MaxSpinePoints - 2 * (chains - 1);
+            int total = 0;
+
+            for (int k = 0; k < members.Count; k++)
+            {
+                SmokeVolumeGroup m = members[k];
+                int n = m.activeOrderedPos.Count;
+                if (n < 2) continue;
+
+                // Equal split by CHAIN COUNT, not by live point ratio.
+                //
+                // Proportional-to-length sounds better - a longer trail gets more of the
+                // budget - but "length" here is activeOrderedPos.Count, which shifts by a
+                // handful of points most ticks as puffs age out one end and spawn the
+                // other. Recomputing everyone's share from that ratio every frame meant
+                // EVERY merged chain's budget wobbled continuously, even when nothing about
+                // the smoke itself had changed. chains only changes on an actual merge or
+                // split, which is rare, so this is stable by construction instead of by luck.
+                int perChainBudget = Mathf.Max(4, budget / chains);
+                int room = MaxSpinePoints - total - (total > 0 ? 2 : 0);
+                if (room < 4) break;
+                perChainBudget = Mathf.Min(perChainBudget, room);
+
+                // RATCHETED integer stride, same idea as committedTrailStride above and for
+                // the same reason: a stride recomputed fresh each frame (here as a FLOAT,
+                // so it barely has to move at all) reselects a different subset of puffs
+                // out of n every time n changes by even one - and since puff size varies
+                // randomly +/-10% per puff (see AddPuff) plus ColumnWander, a different
+                // subset means a different sequence of thick and thin points, which is
+                // what read as "sometimes thin, sometimes thick chunks" with no visible
+                // cause. An INTEGER stride that only ever grows keeps picking indices
+                // 0, stride, 2*stride, ... - survivors stay exactly where they were, so the
+                // apparent width only changes when the smoke's own radius actually does.
+                int neededStride = n > 0 ? Mathf.Max(1, Mathf.CeilToInt(n / (float)perChainBudget)) : 1;
+                if (neededStride <= 1) m.committedSpineStride = 1;
+                else if (neededStride > m.committedSpineStride) m.committedSpineStride = neededStride;
+                int intStride = m.committedSpineStride;
+                int take = Mathf.Min(n, room, Mathf.CeilToInt(n / (float)intStride));
+
+                List<Vector3> pos = m.activeOrderedPos;
+                List<float> rad = m.activeOrderedRadius;
+                List<float> den = m.activeOrderedDensity;
+                if (intStride > 1 || take < n)
+                {
+                    m.polylineThinnedPos.Clear();
+                    m.polylineThinnedRadius.Clear();
+                    m.polylineThinnedDensity.Clear();
+                    for (int i = 0; i < take; i++)
+                    {
+                        int src = Mathf.Min(n - 1, i * intStride);
+                        m.polylineThinnedPos.Add(m.activeOrderedPos[src]);
+                        m.polylineThinnedRadius.Add(m.activeOrderedRadius[src]);
+                        m.polylineThinnedDensity.Add(m.activeOrderedDensity[src]);
+                    }
+                    pos = m.polylineThinnedPos;
+                    rad = m.polylineThinnedRadius;
+                    den = m.polylineThinnedDensity;
+                    n = take;
+                }
+
+                // The chain joins spine points with exact straight capsules - no blur pass
+                // like the old baked system - so spawn jitter and residual gimbal wobble
+                // show up directly as a sawtooth.
+                //
+                // Decimation spacing scales with puff RADIUS, so anything that speeds growth
+                // up also makes the spine sparser, and averaging over neighbours that are
+                // now metres apart stops hiding the jitter - the sawtooth comes back after
+                // a change that never touched positions. Extra passes are free at <=200
+                // points.
+                m.SmoothSpine(pos, n, SpineSmoothPasses);
+                m.SmoothRadii(rad, n, SpineSmoothPasses);
+
+                if (total > 0)
+                {
+                    mergeSpine[total] = mergeSpine[total - 1];
+                    mergeRadii[total] = 0f;
+                    mergeDensity[total] = 1f;
+                    total++;
+                    mergeSpine[total] = m.smoothedSpine[0];
+                    mergeRadii[total] = 0f;
+                    mergeDensity[total] = 1f;
+                    total++;
+                }
+                for (int i = 0; i < take; i++)
+                {
+                    mergeSpine[total] = m.smoothedSpine[i];
+                    mergeRadii[total] = m.smoothedRadii[i];
+                    mergeDensity[total] = den[i];
+                    total++;
+                }
+            }
+
+            System.Array.Copy(mergeSpine, smoothedSpine, total);
+            System.Array.Copy(mergeRadii, smoothedRadii, total);
+            return total;
+        }
+
+        private void UploadCluster(List<SmokeVolumeGroup> members)
+        {
+            int totalPoints = BuildMergedSpine(members);
 
             if (totalPoints == 0)
             {
                 SmokeRenderRegistry.SetActive(polylineRenderer, false);
                 return;
             }
-
-            // The chain joins spine points with exact straight capsules - no blur pass
-            // like the old baked system - so spawn jitter and residual gimbal wobble show
-            // up directly as a sawtooth.
-            //
-            // Decimation spacing scales with puff RADIUS, so anything that speeds growth up
-            // also makes the spine sparser, and averaging over neighbours that are now
-            // metres apart stops hiding the jitter - the sawtooth comes back after a change
-            // that never touched positions. Extra passes are free at <=200 points.
-            SmoothSpine(pos, totalPoints, SpineSmoothPasses);
-            SmoothRadii(radius, totalPoints, SpineSmoothPasses);
 
             Vector3 boxMin = Vector3.positiveInfinity;
             Vector3 boxMax = Vector3.negativeInfinity;
@@ -1511,7 +1894,7 @@ namespace VolumetricContrails
             {
                 float r = smoothedRadii[i];
                 Vector3 p = smoothedSpine[i];
-                spinePointsBuffer[i] = new Vector4(p.x, p.y, p.z, density[i]);
+                spinePointsBuffer[i] = new Vector4(p.x, p.y, p.z, mergeDensity[i]);
                 spineRadiiBuffer[i] = r;
                 radiusSum += r;
 
@@ -1589,13 +1972,13 @@ namespace VolumetricContrails
                 double endAlt = body.GetAltitude(spineEnd);
 
                 Debug.Log(string.Format(
-                    "[PlumeTrails] polyline: vol#{0} alt={1:F0} spineCount={2} (rawPoints={3}) "
+                    "[PlumeTrails] polyline: vol#{0} merged={12} alt={1:F0} spineCount={2} (rawPoints={3}) "
                     + "endToEnd={4:F0}m startAlt={5:F0} endAlt={6:F0} boxExtents={7} axis={8} "
                     + "| radiusRatio={9:F3} marchSteps={10} noiseShift={11}",
                     instanceId, tipAltitude, totalPoints, activeOrderedPos.Count,
                     endToEnd, startAlt, endAlt, boxExtents.ToString("F0"),
                     padAxisValid ? padOutflowAxis.ToString("F2") : "none",
-                    lastRadiusRatio, lastMarchSteps, lastNoiseShift.ToString("F1")));
+                    lastRadiusRatio, lastMarchSteps, lastNoiseShift.ToString("F1"), members.Count));
             }
         }
 
@@ -1849,6 +2232,11 @@ namespace VolumetricContrails
             float dist = camLocal.magnitude;
             float distToSurface = dist - boxExtents.magnitude;
 
+            SmokeQuality.Profile q = SmokeQuality.Current;
+            int lodFullMarch = Mathf.Max(8, Mathf.RoundToInt(LODFullMarchSteps * q.marchScale));
+            int lodMinMarch = Mathf.Max(8, Mathf.RoundToInt(LODMinMarchSteps * q.marchScale));
+            int nearMarch = Mathf.Max(8, Mathf.RoundToInt(56 * q.marchScale));
+            int maxAdaptive = Mathf.Max(16, Mathf.RoundToInt(MaxAdaptiveMarchSteps * q.marchScale));
             int marchSteps;
             int lightMarchSteps;
 
@@ -1860,22 +2248,22 @@ namespace VolumetricContrails
                 // far-distance floor. The shader hides under-sampling by dithering the
                 // march offset, and that dither scales with stepSize - too few steps here
                 // reads as grain exactly where the volume fills the most screen.
-                marchSteps = 56;
-                lightMarchSteps = 3;
+                marchSteps = nearMarch;
+                lightMarchSteps = q.lightNear;
             }
             else
             {
                 float t = Mathf.InverseLerp(LODFullQualityDistance, LODMinQualityDistance, dist);
-                marchSteps = Mathf.RoundToInt(Mathf.Lerp(LODFullMarchSteps, LODMinMarchSteps, t));
-                lightMarchSteps = Mathf.RoundToInt(Mathf.Lerp(LODFullLightMarchSteps, LODMinLightMarchSteps, t));
+                marchSteps = Mathf.RoundToInt(Mathf.Lerp(lodFullMarch, lodMinMarch, t));
+                lightMarchSteps = Mathf.RoundToInt(Mathf.Lerp(q.lightFull, q.lightMin, t));
             }
 
             if (hasLiveTip)
             {
                 float tipDist = Vector3.Distance(boxCenter, liveTipPos);
                 float tt = Mathf.InverseLerp(TipLODFullDistance, TipLODMinDistance, tipDist);
-                int tipMarchSteps = Mathf.RoundToInt(Mathf.Lerp(LODFullMarchSteps, LODMinMarchSteps, tt));
-                int tipLightMarchSteps = Mathf.RoundToInt(Mathf.Lerp(LODFullLightMarchSteps, LODMinLightMarchSteps, tt));
+                int tipMarchSteps = Mathf.RoundToInt(Mathf.Lerp(lodFullMarch, lodMinMarch, tt));
+                int tipLightMarchSteps = Mathf.RoundToInt(Mathf.Lerp(q.lightFull, q.lightMin, tt));
                 marchSteps = Mathf.Min(marchSteps, tipMarchSteps);
                 lightMarchSteps = Mathf.Min(lightMarchSteps, tipLightMarchSteps);
             }
@@ -1889,7 +2277,7 @@ namespace VolumetricContrails
                 float boxDiagonal = boxExtents.magnitude * 2f;
                 float targetStepSize = Mathf.Max(avgRadius / TargetStepsPerAvgRadius, 0.5f);
                 int sizeAdaptiveSteps = Mathf.CeilToInt(boxDiagonal / targetStepSize);
-                marchSteps = Mathf.Min(Mathf.Max(marchSteps, sizeAdaptiveSteps), MaxAdaptiveMarchSteps);
+                marchSteps = Mathf.Min(Mathf.Max(marchSteps, sizeAdaptiveSteps), maxAdaptive);
             }
 
             // Detail LOD. Noise frequency is fixed in world space, so as the volume
@@ -1920,6 +2308,7 @@ namespace VolumetricContrails
             for (int i = 0; i < activeTiles.Count; i++) SmokeRenderRegistry.Remove(activeTiles[i].renderer);
 
             activeInstanceCount--;
+            all.Remove(this);
 
 
             foreach (ActiveTile tile in activeTiles)

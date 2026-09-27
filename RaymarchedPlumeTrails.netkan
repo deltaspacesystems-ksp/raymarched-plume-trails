@@ -1,0 +1,17 @@
+{
+    "spec_version": "v1.4",
+    "identifier": "RaymarchedPlumeTrails",
+    "license": "CC-BY-NC-SA-4.0",
+    "$kref": "#/ckan/spacedock/REPLACE_WITH_SPACEDOCK_MOD_ID",
+    "resources": {
+        "homepage": "https://github.com/deltaspacesystems-ksp/raymarched-plume-trails",
+        "repository": "https://github.com/deltaspacesystems-ksp/raymarched-plume-trails",
+        "x_screenshot": "https://raw.githubusercontent.com/deltaspacesystems-ksp/raymarched-plume-trails/main/README_screenshot.png"
+    },
+    "recommends": [
+        { "name": "ModuleManager" },
+        { "name": "Waterfall" },
+        { "name": "Avalanche" },
+        { "name": "SmokeScreen" }
+    ]
+}

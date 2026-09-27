@@ -2,7 +2,7 @@ using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
 
-namespace VolumetricContrails
+namespace RaymarchedPlumeTrails
 {
     // Which smoke volumes want drawing this frame. The renderers are never enabled in the
     // normal sense - they are drawn explicitly by the command buffer below - so this list
@@ -52,7 +52,7 @@ namespace VolumetricContrails
     {
         // after transparents, so the smoke sits where its Transparent-queue draw used to
         private const CameraEvent Stage = CameraEvent.AfterForwardAlpha;
-        private static readonly int HalfResId = Shader.PropertyToID("_VolumetricContrailsHalfRes");
+        private static readonly int HalfResId = Shader.PropertyToID("_RaymarchedPlumeTrailsHalfRes");
 
         private readonly Dictionary<Camera, CommandBuffer> buffers = new Dictionary<Camera, CommandBuffer>();
         // Second buffer, at a different stage: the cast shadow has to land on the scene
@@ -69,6 +69,110 @@ namespace VolumetricContrails
         private bool shadowDiagLogged;
         private readonly List<Renderer> sortedVolumes = new List<Renderer>();
         private Material compositeMaterial;
+
+        // ---- temporal upscaling ----------------------------------------------------------
+        private static readonly int AuxId = Shader.PropertyToID("_RaymarchedPlumeTrailsAux");
+        private static readonly int DepthTmpId = Shader.PropertyToID("_RaymarchedPlumeTrailsDepth");
+
+        private class TemporalState
+        {
+            public readonly RenderTexture[] hist = new RenderTexture[2];
+            public int write;                 // which history this frame's resolve writes to
+            public int width, height;
+            public Matrix4x4 prevW2C, prevBodyL2W;
+            public CelestialBody prevBody;
+            public float prevFov, prevAspect;
+            public float lastTime = -999f;
+            public bool haveHistory;
+            public bool armed;                // a temporal buffer was recorded for this frame
+            public int frame;
+        }
+        private readonly Dictionary<Camera, TemporalState> temporal = new Dictionary<Camera, TemporalState>();
+        private bool temporalLogged;
+
+        private static float Halton(int index, int b)
+        {
+            float f = 1f, r = 0f;
+            while (index > 0) { f /= b; r += f * (index % b); index /= b; }
+            return r;
+        }
+
+        // Full resolution on purpose: the history is where the accumulated detail lives,
+        // which is what makes this an upscale rather than a blur of the small frame.
+        private TemporalState GetTemporal(Camera cam)
+        {
+            TemporalState st;
+            if (!temporal.TryGetValue(cam, out st))
+            {
+                st = new TemporalState();
+                temporal[cam] = st;
+            }
+
+            int fw = cam.pixelWidth, fh = cam.pixelHeight;
+            if (st.hist[0] == null || st.width != fw || st.height != fh)
+            {
+                for (int k = 0; k < 2; k++)
+                {
+                    if (st.hist[k] != null) { st.hist[k].Release(); Destroy(st.hist[k]); }
+                    RenderTexture rt = new RenderTexture(fw, fh, 0, RenderTextureFormat.ARGBHalf)
+                    {
+                        name = "PlumeHistory" + k,
+                        filterMode = FilterMode.Bilinear,
+                        wrapMode = TextureWrapMode.Clamp,
+                        useMipMap = false
+                    };
+                    rt.Create();
+                    st.hist[k] = rt;
+                }
+                st.width = fw;
+                st.height = fh;
+                st.haveHistory = false;
+            }
+            return st;
+        }
+
+        // Runs just before the camera renders, when its matrices are final. Reading them
+        // from LateUpdate was a frame stale whenever the flight camera moved after us.
+        private void OnCameraPreRender(Camera cam)
+        {
+            TemporalState st;
+            if (!temporal.TryGetValue(cam, out st) || !st.armed) return;
+            st.armed = false;
+
+            CelestialBody body = FlightGlobals.ActiveVessel != null ? FlightGlobals.ActiveVessel.mainBody : null;
+            Matrix4x4 bodyL2W = body != null && body.bodyTransform != null
+                ? body.bodyTransform.localToWorldMatrix : Matrix4x4.identity;
+
+            bool valid = st.haveHistory
+                && st.prevBody == body
+                && Time.unscaledTime - st.lastTime < 0.25f
+                && Mathf.Abs(cam.fieldOfView - st.prevFov) < 0.01f
+                && Mathf.Abs(cam.aspect - st.prevAspect) < 0.001f;
+
+            // Where a point that is at rest relative to the BODY was, in last frame's view
+            // space: back out of the current view, through the body's own motion since
+            // then (rotation, floating-origin shifts and Krakensbane all show up here),
+            // into the previous view. Smoke sits still in the air, and the air sits still
+            // in the body frame, so this is exact for it.
+            Matrix4x4 reproj = st.prevW2C * (st.prevBodyL2W * bodyL2W.inverse) * cam.cameraToWorldMatrix;
+            Shader.SetGlobalMatrix("_PlumeReprojView", reproj);
+            Shader.SetGlobalFloat("_PlumeHistoryValid", valid ? 1f : 0f);
+            Shader.SetGlobalFloat("_PlumeFeedback", Mathf.Clamp(SmokeTuning.TemporalFeedback, 0f, 0.98f));
+
+            int idx = st.frame % 8 + 1;
+            Shader.SetGlobalVector("_PlumeJitter", new Vector4(
+                Halton(idx, 2) - 0.5f, Halton(idx, 3) - 0.5f,
+                (st.frame * 13.37f) % 256f, (st.frame * 7.11f) % 256f));
+            st.frame++;
+
+            st.prevW2C = cam.worldToCameraMatrix;
+            st.prevBodyL2W = bodyL2W;
+            st.prevBody = body;
+            st.prevFov = cam.fieldOfView;
+            st.prevAspect = cam.aspect;
+            st.lastTime = Time.unscaledTime;
+            st.haveHistory = true;
+        }
         private Light sunLight;
         private float sunSearchTimer;
 
@@ -82,13 +186,14 @@ namespace VolumetricContrails
                 return;
             }
             compositeMaterial = new Material(ShaderCache.SmokeCompositeShader);
+            Camera.onPreRender += OnCameraPreRender;
 
             scratchBlock = new MaterialPropertyBlock();
             // Clip-space quad. The cast pass writes its vertices straight out, so no
             // transform is involved and one mesh serves every camera.
             fullscreenQuad = new Mesh
             {
-                name = "VolumetricContrails fullscreen",
+                name = "RaymarchedPlumeTrails fullscreen",
                 vertices = new[]
                 {
                     new Vector3(-1f, -1f, 0f), new Vector3(-1f, 1f, 0f),
@@ -103,6 +208,15 @@ namespace VolumetricContrails
 
         private void OnDestroy()
         {
+            Camera.onPreRender -= OnCameraPreRender;
+            foreach (KeyValuePair<Camera, TemporalState> pair in temporal)
+            {
+                for (int k = 0; k < 2; k++)
+                {
+                    if (pair.Value.hist[k] != null) { pair.Value.hist[k].Release(); Destroy(pair.Value.hist[k]); }
+                }
+            }
+            temporal.Clear();
             foreach (KeyValuePair<Camera, CommandBuffer> pair in buffers)
             {
                 if (pair.Key != null) pair.Key.RemoveCommandBuffer(Stage, pair.Value);
@@ -128,6 +242,56 @@ namespace VolumetricContrails
         // meaningless here no matter what the pass is tagged, and the light march would
         // walk off in an arbitrary direction. Publishing the direction ourselves makes
         // self-shadowing independent of how the geometry gets submitted.
+        private static Vector3 toSunWorld = Vector3.up;
+
+        // Where on screen the cast shadow can possibly land, as an NDC rectangle.
+        //
+        // The pass used to shade a full-screen quad, so every pixel of the frame paid for
+        // a sun-ray march whether or not the plume could reach it. A ground point can only
+        // be shadowed if the sun ray from it enters the plume within the cast reach, which
+        // means it lies inside the volume's bounds swept AWAY from the sun by that reach.
+        // That is a convex hull, so projecting its corners bounds it exactly.
+        //
+        // Returns false when the region is entirely off screen or behind the camera, and
+        // the pass is skipped. If the hull straddles the camera plane it cannot be bounded
+        // by projection, so the full screen is used - always correct, only slower.
+        private static bool TryCastRect(Camera cam, Bounds b, out Vector4 rect)
+        {
+            rect = new Vector4(-1f, -1f, 1f, 1f);
+            Vector3 shift = -toSunWorld.normalized * SmokeTuning.ShadowCastDistance;
+            float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+            int behind = 0;
+            const int corners = 16;
+
+            for (int i = 0; i < corners; i++)
+            {
+                Vector3 c = b.center + new Vector3(
+                    (i & 1) != 0 ? b.extents.x : -b.extents.x,
+                    (i & 2) != 0 ? b.extents.y : -b.extents.y,
+                    (i & 4) != 0 ? b.extents.z : -b.extents.z);
+                if ((i & 8) != 0) c += shift;
+
+                Vector3 v = cam.WorldToViewportPoint(c);
+                if (v.z <= 0.01f) { behind++; continue; }
+                if (v.x < minX) minX = v.x;
+                if (v.y < minY) minY = v.y;
+                if (v.x > maxX) maxX = v.x;
+                if (v.y > maxY) maxY = v.y;
+            }
+
+            if (behind == corners) return false;
+            if (behind > 0) return true;
+
+            const float margin = 0.03f;
+            minX -= margin; minY -= margin; maxX += margin; maxY += margin;
+            if (maxX < 0f || minX > 1f || maxY < 0f || minY > 1f) return false;
+
+            rect = new Vector4(
+                Mathf.Clamp01(minX) * 2f - 1f, Mathf.Clamp01(minY) * 2f - 1f,
+                Mathf.Clamp01(maxX) * 2f - 1f, Mathf.Clamp01(maxY) * 2f - 1f);
+            return true;
+        }
+
         private void UpdateSunDirection()
         {
             sunSearchTimer -= Time.deltaTime;
@@ -153,6 +317,7 @@ namespace VolumetricContrails
             {
                 // direction TO the light, matching _WorldSpaceLightPos0's convention
                 Vector3 toSun = -sunLight.transform.forward;
+                toSunWorld = toSun;
                 Shader.SetGlobalVector("_SmokeSunDir", new Vector4(toSun.x, toSun.y, toSun.z, 0f));
             }
 
@@ -207,7 +372,7 @@ namespace VolumetricContrails
             CommandBuffer cb;
             if (!shadowBuffers.TryGetValue(cam, out cb))
             {
-                cb = new CommandBuffer { name = "VolumetricContrails cast shadow" };
+                cb = new CommandBuffer { name = "RaymarchedPlumeTrails cast shadow" };
                 cam.AddCommandBuffer(ShadowStage, cb);
                 shadowBuffers[cam] = cb;
             }
@@ -232,7 +397,14 @@ namespace VolumetricContrails
                 block.SetFloat("_ThinDetailFade", SmokeTuning.ThinDetailFade);
                 block.SetFloat("_ShadowCastStrength", SmokeTuning.ShadowCastStrength);
                 block.SetFloat("_ShadowCastDistance", SmokeTuning.ShadowCastDistance);
-                block.SetInt("_ShadowCastSteps", Mathf.RoundToInt(SmokeTuning.ShadowCastSteps));
+                // The slider is the High-quality value; the preset and the governor scale it.
+                int castSteps = Mathf.Max(4, Mathf.RoundToInt(
+                    SmokeTuning.ShadowCastSteps * SmokeQuality.Current.shadowSteps / 16f));
+                block.SetInt("_ShadowCastSteps", castSteps);
+
+                Vector4 castRect;
+                if (!TryCastRect(cam, r.bounds, out castRect)) continue;
+                block.SetVector("_CastRect", castRect);
 
                 cb.DrawMesh(fullscreenQuad, Matrix4x4.identity, r.sharedMaterial, 0,
                             ShadowCastPass, block);
@@ -250,6 +422,10 @@ namespace VolumetricContrails
         private void LateUpdate()
         {
             if (compositeMaterial == null) return;
+            // Volumes are uploaded here, after every group has ticked, so trails that have
+            // grown together can be drawn as one.
+            SmokeVolumeGroup.RenderAll();
+            SmokeQuality.Tick(SmokeRenderRegistry.Active.Count > 0);
             UpdateSunDirection();
 
             Camera cam = Camera.main;
@@ -258,7 +434,7 @@ namespace VolumetricContrails
             CommandBuffer cb;
             if (!buffers.TryGetValue(cam, out cb))
             {
-                cb = new CommandBuffer { name = "VolumetricContrails half-res smoke" };
+                cb = new CommandBuffer { name = "RaymarchedPlumeTrails half-res smoke" };
                 cam.AddCommandBuffer(Stage, cb);
                 buffers[cam] = cb;
             }
@@ -299,21 +475,40 @@ namespace VolumetricContrails
 
             if (SmokeRenderRegistry.Active.Count == 0) return;
 
-            // Full resolution. Rendering the smoke into a half-size buffer and blitting it
-            // back up is what produces the banded stripes across the plume: a half-width
-            // buffer resolves the trail's silhouette at every other pixel and the bilinear
-            // upscale smears that into stairs. The 2026-08-18 build had no intermediate
-            // buffer at all - the volume was drawn straight at screen resolution - so this
-            // divider is 1 to match it. The CommandBuffer path itself is kept because at
-            // 1:1 the composite blit is a pass-through and cannot resample anything.
-            const int ResolutionDivider = 1;
-            int w = Mathf.Max(1, cam.pixelWidth / ResolutionDivider);
-            int h = Mathf.Max(1, cam.pixelHeight / ResolutionDivider);
+            // Resolution follows the quality profile. At 1.0 the buffer is screen-sized and the
+            // composite blit is a pass-through that cannot resample anything - which is why
+            // High and Ultra are free of the banded stripes a fixed half-size buffer gave
+            // (a half-width buffer resolves the silhouette at every other pixel and the
+            // bilinear upscale smears that into stairs). Below 1.0 the composite shader's
+            // edge-aware upsample takes over, and the governor only gets there when the
+            // frame rate says it has to.
+            float renderScale = SmokeQuality.Current.renderScale;
+            int w = Mathf.Max(1, Mathf.RoundToInt(cam.pixelWidth * renderScale));
+            int h = Mathf.Max(1, Mathf.RoundToInt(cam.pixelHeight * renderScale));
 
             // ARGBHalf, not ARGB32: the buffer holds premultiplied colour that gets
             // composited later, and 8 bits per channel bands visibly on smoke gradients
+            bool temporalOn = SmokeTuning.TemporalUpscale && renderScale < 0.999f
+                && SystemInfo.supportedRenderTargetCount >= 2;
+            TemporalState tst = temporalOn ? GetTemporal(cam) : null;
+
             cb.GetTemporaryRT(HalfResId, w, h, 0, FilterMode.Bilinear, RenderTextureFormat.ARGBHalf);
-            cb.SetRenderTarget(HalfResId);
+            if (temporalOn)
+            {
+                // Second target: distance to the smoke, for reprojection. A depth buffer is
+                // bound only because a multiple-render-target set-up requires one; the
+                // volume pass tests depth by hand and never uses it.
+                cb.GetTemporaryRT(AuxId, w, h, 0, FilterMode.Point, RenderTextureFormat.ARGBFloat);
+                cb.GetTemporaryRT(DepthTmpId, w, h, 24, FilterMode.Point, RenderTextureFormat.Depth);
+                cb.SetRenderTarget(new RenderTargetIdentifier[] { HalfResId, AuxId }, DepthTmpId);
+            }
+            else
+            {
+                cb.SetRenderTarget(HalfResId);
+                // no jitter or dither offset when nothing is accumulating them
+                Shader.SetGlobalVector("_PlumeJitter", Vector4.zero);
+                foreach (KeyValuePair<Camera, TemporalState> pair in temporal) pair.Value.haveHistory = false;
+            }
             cb.ClearRenderTarget(false, true, Color.clear);
 
             // BACK TO FRONT. Each volume raymarches itself correctly, but SEPARATE volumes
@@ -346,8 +541,41 @@ namespace VolumetricContrails
                 cb.DrawRenderer(r, r.sharedMaterial, 0, 0);
             }
 
-            cb.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
-            cb.Blit(HalfResId, BuiltinRenderTextureType.CameraTarget, compositeMaterial);
+            if (temporalOn)
+            {
+                int read = 1 - tst.write;
+                cb.SetGlobalTexture("_PlumeAux", AuxId);
+                cb.SetGlobalTexture("_PlumeHistory", tst.hist[read]);
+                // resolve into this frame's history, then lay that over the scene
+                cb.Blit(HalfResId, tst.hist[tst.write], compositeMaterial, 1);
+                cb.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
+                cb.Blit(tst.hist[tst.write], BuiltinRenderTextureType.CameraTarget, compositeMaterial, 0);
+                cb.ReleaseTemporaryRT(AuxId);
+                cb.ReleaseTemporaryRT(DepthTmpId);
+
+                tst.write = read;   // next frame writes the other one and reads this one
+                tst.armed = true;
+                if (!temporalLogged)
+                {
+                    temporalLogged = true;
+                    Debug.Log(string.Format(
+                        "[PlumeTrails] temporal upscaling on: smoke {0}x{1} -> {2}x{3}, feedback {4:F2}",
+                        w, h, cam.pixelWidth, cam.pixelHeight, SmokeTuning.TemporalFeedback));
+                }
+            }
+            else
+            {
+                cb.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
+                // Pass 0 explicitly (27 IX fix): Blit with no pass argument defaults to -1,
+                // which runs every pass in the shader in sequence into the same target.
+                // SmokeComposite has a second pass (temporal reprojection, Blend Off) meant
+                // to write into a history buffer, not the screen - left implicit, it ran
+                // straight after pass 0 and overwrote the whole framebuffer with the raw
+                // smoke sample instead of blending it, which is the full-screen blackout
+                // reported with temporal off. The temporal-on branch above never hit this
+                // because it already targets each pass explicitly.
+                cb.Blit(HalfResId, BuiltinRenderTextureType.CameraTarget, compositeMaterial, 0);
+            }
             cb.ReleaseTemporaryRT(HalfResId);
         }
     }

@@ -1,7 +1,7 @@
 using System.Collections.Generic;
 using UnityEngine;
 
-namespace VolumetricContrails
+namespace RaymarchedPlumeTrails
 {
     public struct EngineSample
     {

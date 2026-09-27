@@ -6,14 +6,14 @@ using System.IO;
 
 public class BuildBundle
 {
-    [MenuItem("Assets/Build VolumetricContrails Bundle")]
+    [MenuItem("Assets/Build RaymarchedPlumeTrails Bundle")]
     static void Build()
     {
         // Assign the bundle name programmatically instead of relying on each asset's
         // .meta. New assets otherwise import without one and get silently left out of the
         // bundle, which shows up much later as a null shader at runtime.
-        const string BundleName = "volumetriccontrails_bundle";
-        foreach (string guid in AssetDatabase.FindAssets("", new[] { "Assets/VolumetricContrails" }))
+        const string BundleName = "raymarchedplumetrails_bundle";
+        foreach (string guid in AssetDatabase.FindAssets("", new[] { "Assets/RaymarchedPlumeTrails" }))
         {
             string path = AssetDatabase.GUIDToAssetPath(guid);
             if (AssetDatabase.IsValidFolder(path)) continue;

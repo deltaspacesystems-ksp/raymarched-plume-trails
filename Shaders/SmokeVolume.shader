@@ -1,4 +1,4 @@
-Shader "VolumetricContrails/SmokeVolume"
+Shader "RaymarchedPlumeTrails/SmokeVolume"
 {
     // density texture is baked by SmokeVolumeSplat.compute, fragment shader just samples it
     Properties
@@ -80,6 +80,8 @@ Shader "VolumetricContrails/SmokeVolume"
         _ShadowCastStrength ("Cast Shadow Strength", Range(0,1)) = 0.85
         _ShadowCastDistance ("Cast Shadow Reach (m)", Float) = 2500
         _ShadowCastSteps ("Cast Shadow Steps", Int) = 16
+        // NDC rectangle the cast-shadow quad is shrunk to (xy = min, zw = max).
+        _CastRect ("Cast Rect", Vector) = (-1,-1,1,1)
 
         // Regime shaping. A thinned section is not just fainter - it is a different
         // material, and these two say how different.
@@ -127,7 +129,10 @@ Shader "VolumetricContrails/SmokeVolume"
         // Premultiplied. The smoke renders into a half-resolution buffer that starts
         // fully transparent and is composited afterwards; with straight alpha, blending
         // into a transparent target darkens toward black instead of accumulating colour.
-        Blend One OneMinusSrcAlpha
+        Blend 0 One OneMinusSrcAlpha
+        // Second target (temporal upscaling): distance to the smoke, accumulated additively
+        // so overlapping volumes weight each other by how much of the pixel they cover.
+        Blend 1 One One
 
         // Shared body. It lives at SubShader scope so the shadow-casting pass
         // below can reuse the spine and density functions rather than carrying a
@@ -183,6 +188,15 @@ Shader "VolumetricContrails/SmokeVolume"
             float _ThinEdgeSoftness;
             float _ThinDetailFade;
             float _ShadowCastStrength;
+            float4 _CastRect;
+
+            // Temporal upscaling. xy = sub-pixel jitter in target pixels, zw = a per-frame
+            // offset into the dither pattern. Both are zero when it is off.
+            float4 _PlumeJitter;
+            // Written by the fragment body, read by the MRT wrapper. HLSL allows a static
+            // global to be assigned from a function, which avoids threading an out-parameter
+            // through every return path.
+            static float4 gPlumeAux;
             float _ShadowCastDistance;
             int _ShadowCastSteps;
             float _ShadowCastDebug;
@@ -298,14 +312,14 @@ Shader "VolumetricContrails/SmokeVolume"
             // Baked at load by BakeNoise and bound globally by AssetLoader. RGB is the
             // vector field DomainWarp needs, A is perlin-worley for detail and erosion.
             // Sampling wraps, because the bake is periodic.
-            sampler3D _VolumetricContrailsNoise;
+            sampler3D _RaymarchedPlumeTrailsNoise;
             float _NoiseTilePeriod;
 
             // p is in the same "lattice cell" space the old procedural fbm3D took, so
             // every existing scale constant keeps its meaning
             float4 SampleNoise(float3 p)
             {
-                return tex3Dlod(_VolumetricContrailsNoise, float4(p / _NoiseTilePeriod, 0.0));
+                return tex3Dlod(_RaymarchedPlumeTrailsNoise, float4(p / _NoiseTilePeriod, 0.0));
             }
 
             // Interleaved gradient noise (Jimenez). Built as a dither hash: across any
@@ -1013,10 +1027,18 @@ Shader "VolumetricContrails/SmokeVolume"
             // default variant samples _DensityTex (settled cloud), polyline variant
             // computes density analytically along a capsule chain (unused currently)
             #pragma multi_compile _ SMOKE_VOLUME_POLYLINE
-            fixed4 frag (v2f i) : SV_Target
+            fixed4 fragBody (v2f i)
             {
                 float3 ro = _WorldSpaceCameraPos;
-                float3 rd = normalize(i.worldPos - ro);
+                // Sub-pixel jitter: shift the pixel's world position by a fraction of its own
+                // screen-space footprint. Successive frames then sample different points
+                // inside each pixel, and the temporal resolve accumulates them into detail a
+                // single low-resolution frame could not hold. Derivatives are taken before
+                // any discard so the whole quad is still active.
+                float3 jitteredWorld = i.worldPos
+                    + ddx(i.worldPos) * _PlumeJitter.x
+                    + ddy(i.worldPos) * _PlumeJitter.y;
+                float3 rd = normalize(jitteredWorld - ro);
 
                 float tNear, tFar;
                 if (!IntersectBox(ro, rd, _BoxCenter, _BoxExtents, tNear, tFar)) discard;
@@ -1066,6 +1088,8 @@ Shader "VolumetricContrails/SmokeVolume"
                 float localRadius = max(_ReferenceRadius * clamp(_TileRadiusRatio, 0.05, 1.0), 1.0);
                 float stepSize = min(uniformStep, localRadius * 0.5);
                 float transmittance = 1.0;
+                float distAcc = 0.0;
+                float distW = 0.0;
                 float3 scatteredLight = 0;
                 float bumpAccum = 0.0;
                 // Self-shadowing without the phase gain. avgScatter cannot drive shading
@@ -1083,7 +1107,7 @@ Shader "VolumetricContrails/SmokeVolume"
                 //
                 // Both run at full amplitude, which IGN tolerates and a white-noise hash
                 // did not.
-                float ditherHash = InterleavedGradientNoise(i.pos.xy);
+                float ditherHash = InterleavedGradientNoise(i.pos.xy + _PlumeJitter.zw);
                 float ditherOffset = (ditherHash - 0.5) * stepSize;
 
                 // _WorldSpaceLightPos0 is not bound on this path: the smoke is submitted
@@ -1173,7 +1197,7 @@ Shader "VolumetricContrails/SmokeVolume"
                     // The offset is zero-mean, so the march integrates the same optical
                     // depth on average. The step index enters the hash so consecutive
                     // samples differ, which is what breaks banding along the ray.
-                    float stepJitter = InterleavedGradientNoise(i.pos.xy + float2(s * 5.588238, s * 3.141593)) - 0.5;
+                    float stepJitter = InterleavedGradientNoise(i.pos.xy + _PlumeJitter.zw + float2(s * 5.588238, s * 3.141593)) - 0.5;
                     float3 densityPos = samplePos + rd * (stepJitter * stepSize);
 
                     float bump, sampleRadiusRatio;
@@ -1211,6 +1235,12 @@ Shader "VolumetricContrails/SmokeVolume"
 
                     float stepTransmittance = exp(-density * _Absorption * stepSize);
                     float contribution = transmittance * (1.0 - stepTransmittance);
+                    // Where along the ray the smoke actually is, weighted by how much of the
+                    // pixel each step contributes. The temporal resolve needs a real position
+                    // to reproject: reprojecting as if the smoke were at infinity ignores
+                    // camera translation, which is most of the motion here.
+                    distAcc += contribution * t;
+                    distW += contribution;
                     // POWDER. Beer-Lambert makes the sun-facing side of a billow its
                     // brightest point, since that is where the shadow ray is shortest.
                     // Photographs show the opposite: those edges go slightly dark and the
@@ -1310,8 +1340,24 @@ Shader "VolumetricContrails/SmokeVolume"
                 }
 
                 // premultiply on the way out - see the Blend note on the SubShader
+                gPlumeAux = float4(distAcc, distW, 0.0, 0.0);
                 col.rgb *= col.a;
                 return col;
+            }
+
+            struct FragOut
+            {
+                fixed4 col : SV_Target0;
+                float4 aux : SV_Target1;
+            };
+
+            FragOut frag (v2f i)
+            {
+                gPlumeAux = float4(0.0, 0.0, 0.0, 0.0);
+                FragOut o;
+                o.col = fragBody(i);
+                o.aux = gPlumeAux;
+                return o;
             }
             ENDCG
         }
@@ -1360,7 +1406,12 @@ Shader "VolumetricContrails/SmokeVolume"
                 v2fCast o;
                 // The quad arrives already in clip space; this pass covers the screen and
                 // has no transform of its own.
-                o.pos = float4(v.vertex.xy, UNITY_NEAR_CLIP_VALUE, 1.0);
+                // The quad is shrunk to the rectangle the shadow can actually land in, so the
+                // rest of the screen is never shaded. Everything below - screen position AND
+                // view ray - is derived from the shrunk position, which is what keeps the
+                // reconstruction correct on a sub-rectangle.
+                float2 ndc = lerp(_CastRect.xy, _CastRect.zw, v.vertex.xy * 0.5 + 0.5);
+                o.pos = float4(ndc, UNITY_NEAR_CLIP_VALUE, 1.0);
 
                 // Screen coordinates for the depth lookup come from ComputeScreenPos, NOT
                 // from the vertex position directly. Deriving them by hand reads the depth
@@ -1373,7 +1424,7 @@ Shader "VolumetricContrails/SmokeVolume"
                 // View ray for this corner, carried from the vertex so it interpolates
                 // linearly across the quad. It comes off the real clip position, which
                 // keeps it in step with the flipped lookup above.
-                float4 rayH = mul(unity_CameraInvProjection, float4(v.vertex.xy, 1.0, 1.0));
+                float4 rayH = mul(unity_CameraInvProjection, float4(ndc, 1.0, 1.0));
                 o.ray = rayH.xyz / rayH.w;
                 return o;
             }

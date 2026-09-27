@@ -1,7 +1,7 @@
 using System.IO;
 using UnityEngine;
 
-namespace VolumetricContrails
+namespace RaymarchedPlumeTrails
 {
     // static shader cache, read by SmokeVolumeGroup since Shader.Find won't find a
     // custom shader until the asset bundle loads
@@ -17,12 +17,12 @@ namespace VolumetricContrails
     [KSPAddon(KSPAddon.Startup.MainMenu, true)]
     public class AssetLoader : MonoBehaviour
     {
-        private const string BundleFileName = "volumetriccontrails_bundle";
+        private const string BundleFileName = "raymarchedplumetrails_bundle";
         // Legacy fallback only. A hardcoded folder name silently breaks for anyone who
         // RENAMES the mod folder: KSP loads the assembly regardless, so the DLL runs and
         // the UI appears while the bundle lookup goes nowhere - "installed, UI works,
         // nothing renders". ResolveBundlePath derives the folder from the assembly.
-        private const string BundleRelativePath = "VolumetricContrails/Bundles/" + BundleFileName;
+        private const string BundleRelativePath = "RaymarchedPlumeTrails/Bundles/" + BundleFileName;
         private const string SmokeVolumeMaterialAssetName = "SmokeVolumeMat";
         private const string SmokeVolumeSplatComputeAssetName = "SmokeVolumeSplat";
         private const string SmokeCompositeShaderAssetName = "SmokeComposite";
@@ -39,7 +39,7 @@ namespace VolumetricContrails
         //   <pluginDir>/../Bundles/<file>   - the normal layout (Plugins and Bundles as
         //                                     siblings inside the mod folder)
         //   <pluginDir>/<file>              - bundle dropped in beside the DLL
-        //   GameData/VolumetricContrails/Bundles/<file> - legacy absolute path
+        //   GameData/RaymarchedPlumeTrails/Bundles/<file> - legacy absolute path
         // Returns null if none exist.
         private static string ResolveBundlePath()
         {
@@ -197,7 +197,7 @@ namespace VolumetricContrails
             compute.Dispatch(kernel, groups, groups, groups);
 
             ShaderCache.NoiseTexture = tex;
-            Shader.SetGlobalTexture("_VolumetricContrailsNoise", tex);
+            Shader.SetGlobalTexture("_RaymarchedPlumeTrailsNoise", tex);
             Shader.SetGlobalFloat("_NoiseTilePeriod", NoisePeriod);
 
             Debug.Log(string.Format(

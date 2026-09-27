@@ -2,7 +2,7 @@ using System.IO;
 using UnityEngine;
 using KSP.UI.Screens;
 
-namespace VolumetricContrails
+namespace RaymarchedPlumeTrails
 {
     // global on/off switch, read by LaunchSmokeController every FixedUpdate
     public static class ModSettings
@@ -246,6 +246,18 @@ namespace VolumetricContrails
             }
 
             GUILayout.Space(4);
+            GUILayout.Label("Quality");
+            SmokeTuning.QualityPreset = GUILayout.SelectionGrid(
+                SmokeTuning.QualityPreset, SmokeQuality.PresetNames, SmokeQuality.PresetNames.Length);
+            SmokeTuning.AutoQuality = GUILayout.Toggle(SmokeTuning.AutoQuality, " Auto (adapt to frame rate)");
+            SmokeTuning.TemporalUpscale = GUILayout.Toggle(SmokeTuning.TemporalUpscale, " Temporal upscaling (below full res)");
+            if (SmokeTuning.AutoQuality && SmokeQuality.AutoStep > 0)
+            {
+                GUILayout.Label(string.Format("   lowered {0} step(s) at {1:F1} ms",
+                    SmokeQuality.AutoStep, SmokeQuality.FrameMs));
+            }
+
+            GUILayout.Space(4);
             if (GUILayout.Button(showDebug ? "Hide debug menu" : "Debug menu / config"))
             {
                 showDebug = !showDebug;
@@ -270,6 +282,18 @@ namespace VolumetricContrails
             // only rebuilt when the vessel's part count changes, e.g. at staging.
             SmokeTuning.SrbOnly = GUILayout.Toggle(SmokeTuning.SrbOnly, " Solid motors only");
             SmokeTuning.SrbThinningPower = Slider("SRB spread thinning", SmokeTuning.SrbThinningPower, 0f, 3f);
+
+            GUILayout.Space(4);
+            GUILayout.Label("<b>Solid motor plume</b>");
+            SmokeTuning.SrbRootEnabled = GUILayout.Toggle(SmokeTuning.SrbRootEnabled, " Root from nozzle");
+            SmokeTuning.SrbTurnSmoothing = Slider("Turn smoothing (s)", SmokeTuning.SrbTurnSmoothing, 0.02f, 1.5f);
+            SmokeTuning.SrbCrossflowBend = Slider("Crossflow bend", SmokeTuning.SrbCrossflowBend, 0f, 6f);
+            SmokeTuning.SrbRootRadius = Slider("Root radius", SmokeTuning.SrbRootRadius, 0.1f, 2f);
+            SmokeTuning.SrbSpreadRate = Slider("Spread rate", SmokeTuning.SrbSpreadRate, 0.2f, 3f);
+            SmokeTuning.SrbJetPhaseTime = Slider("Jet phase (s)", SmokeTuning.SrbJetPhaseTime, 0.1f, 4f);
+            SmokeTuning.SrbTailTime = Slider("Post-burnout tail (s)", SmokeTuning.SrbTailTime, 0f, 12f);
+            SmokeTuning.TargetFrameMs = Slider("Target frame (ms)", SmokeTuning.TargetFrameMs, 10f, 50f);
+            SmokeTuning.TemporalFeedback = Slider("Temporal feedback", SmokeTuning.TemporalFeedback, 0.5f, 0.97f);
             SmokeTuning.ShadowCastDebug = Slider("Cast shadow debug", SmokeTuning.ShadowCastDebug, 0f, 5f);
             if (GUILayout.Button("Print values to log")) PrintValues();
 
@@ -302,7 +326,6 @@ namespace VolumetricContrails
             SmokeTuning.AmbientFloor = Slider("Ambient floor", SmokeTuning.AmbientFloor, 0f, 1f);
             SmokeTuning.ShadowStrength = Slider("Self-shadow", SmokeTuning.ShadowStrength, 0f, 1f);
             SmokeTuning.ShadowExtinction = Slider("Shadow softness", SmokeTuning.ShadowExtinction, 0.002f, 0.15f);
-            SmokeTuning.LightMarchSteps = Slider("Light march steps", SmokeTuning.LightMarchSteps, 2f, 12f);
             SmokeTuning.LightReach = Slider("Light reach (m)", SmokeTuning.LightReach, 20f, 400f);
             SmokeTuning.ShadowDarkness = Slider("Shadow darkness", SmokeTuning.ShadowDarkness, 0f, 1f);
             SmokeTuning.SunlitBrightness = Slider("Lit brightness", SmokeTuning.SunlitBrightness, 0.5f, 1f);

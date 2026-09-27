@@ -1,0 +1,20 @@
+{
+    "NAME": "Raymarched Plume Trails",
+    "URL": "https://raw.githubusercontent.com/deltaspacesystems-ksp/raymarched-plume-trails/main/GameData/RaymarchedPlumeTrails/RaymarchedPlumeTrails.version",
+    "DOWNLOAD": "https://github.com/deltaspacesystems-ksp/raymarched-plume-trails",
+    "GITHUB": {
+        "USERNAME": "deltaspacesystems-ksp",
+        "REPOSITORY": "raymarched-plume-trails"
+    },
+    "VERSION": {
+        "MAJOR": 0,
+        "MINOR": 0,
+        "PATCH": 1,
+        "BUILD": 0
+    },
+    "KSP_VERSION": {
+        "MAJOR": 1,
+        "MINOR": 12,
+        "PATCH": 5
+    }
+}
