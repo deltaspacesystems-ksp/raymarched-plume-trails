@@ -3,7 +3,7 @@
 [![SpaceDock](https://img.shields.io/badge/SpaceDock-download-2f6f9f)](https://spacedock.info/mod/comingsoonhhhh)
 [![KSP 1.12.5](https://img.shields.io/badge/KSP-1.12.5-2f6f9f)](https://www.kerbalspaceprogram.com/)
 
-Volumetric exhaust plume smoke for rockets, uses Henyey-Greenstein phase scattering for realistic shadowed look
+Volumetric exhaust plume smoke for rockets, uses Henyey-Greenstein phase scattering for realistic shadowed look, it's fully raymarched too
 # Features 
  - Smoke expansion based on the height, velocity and pressure of the rocket
  - Simple SRB "configs" with a simple fade out when the engine shuts off (more fuel types coming soon)
