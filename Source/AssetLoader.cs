@@ -9,6 +9,7 @@ namespace RaymarchedPlumeTrails
     {
         public static Shader SmokeVolumeShader;
         public static Shader SmokeCompositeShader;
+        public static Shader HeatHazeShader;
         public static ComputeShader SmokeVolumeSplatCompute;
         public static RenderTexture NoiseTexture;
     }
@@ -67,6 +68,7 @@ namespace RaymarchedPlumeTrails
 
         private void Awake()
         {
+            SmokeTuningConfig.Load();
             // Environment banner. "UI is there, bundle is there, nothing renders" is
             // otherwise undiagnosable from a log - every requirement below can fail
             // silently. Ask for these lines first in any blank-screen report.
@@ -113,6 +115,10 @@ namespace RaymarchedPlumeTrails
                 Debug.LogError("[PlumeTrails] Composite shader '" + SmokeCompositeShaderAssetName +
                     "' missing from the bundle - smoke will not be drawn. Rebuild the AssetBundle.");
             }
+
+ShaderCache.HeatHazeShader = bundle.LoadAsset<Shader>("HeatHaze");
+            if (ShaderCache.HeatHazeShader == null)
+                Debug.LogWarning("[PlumeTrails] heat haze shader missing from the bundle (rebuild it) - no heat haze");
 
             ShaderCache.SmokeVolumeSplatCompute = bundle.LoadAsset<ComputeShader>(SmokeVolumeSplatComputeAssetName);
             if (ShaderCache.SmokeVolumeSplatCompute == null)
@@ -192,6 +198,7 @@ namespace RaymarchedPlumeTrails
             compute.SetTexture(kernel, "_NoiseOut", tex);
             compute.SetInts("_NoiseResolution", NoiseResolution, NoiseResolution, NoiseResolution);
             compute.SetFloat("_NoisePeriod", NoisePeriod);
+            compute.SetFloat("_NoiseGradient", SmokeTuning.GradientNoise ? 1f : 0f);
 
             int groups = NoiseResolution / 4; // kernel is [numthreads(4,4,4)]
             compute.Dispatch(kernel, groups, groups, groups);

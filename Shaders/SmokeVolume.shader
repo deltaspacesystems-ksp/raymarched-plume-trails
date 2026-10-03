@@ -69,8 +69,20 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
         _ScatterIntensity ("Scatter Intensity", Float) = 1.6
         _MultiScatterG ("Multi-Scatter G", Range(0,0.6)) = 0.15
         _MultiScatterIntensity ("Multi-Scatter Intensity", Float) = 1.2
+        // [Jendersie and d'Eon 2023] HG+Draine blend, fit to a tabulated MIE phase
+        // function - see MiePhaseParams. Strictly more accurate than the two-HG-lobe
+        // scheme above for a single number (particle size); kept switchable rather than
+        // deleting the old path so the two can be A/B'd from the debug menu without a
+        // rebuild, the same way other risky rendering changes in this project have been.
+        _UseMiePhase ("Use Mie (HG+Draine) Phase", Range(0,1)) = 1
+        _MieParticleDiameter ("Mie Particle Diameter (um)", Range(3,50)) = 12
+        // Isotropic floor added to the Mie phase, standing in for multiple scattering. A real
+        // Mie lobe is ~0.002 of its forward peak at 90 degrees, so a cloud lit from the side
+        // rendered dark grey; in a real cloud multiple scattering fills that in and it stays
+        // bright. 0 = pure single-scatter Mie.
+        _MieFloor ("Mie multi-scatter floor", Range(0,1)) = 0.25
         // Beer's-law "powder" term - see its use in the march loop.
-        _PowderStrength ("Powder (dark lit edges)", Range(0,1)) = 0.5
+        _PowderStrength ("Powder (dark lit edges)", Range(0,3)) = 0.5
         // How much ambient the smoke keeps once the planet's own shadow has cut the sun.
         // Not zero: night smoke is dim, not black.
         _NightAmbient ("Night Ambient Floor", Range(0,1)) = 0.18
@@ -114,6 +126,83 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
         // uniformly white body. Steps are geometric, so the same count covers more range
         // while keeping resolution close to the sample.
         _LightMarchDistance ("Light March Distance", Float) = 25.0
+        // How much the shadow / sky-occlusion reach grows with the LOCAL puff size. The reach
+        // is a fixed number of metres and radiusRatio is clamped to 1, so a bloomed puff
+        // 100 m across was shadow-marched only 65 m: the ray never left the lobe it started
+        // in and big smoke shaded flat. 0 = old fixed reach, 1 = reach follows puff size.
+        _LightSizeScaling ("Light reach size scaling", Range(0,1)) = 0.6
+        // Short full-detail tap toward the sun. The light march uses the cheap, noise-free
+        // density, so bumps on the surface cast no shade at all and the texture reads flat.
+        // 0 = off.
+        _DetailShadeStrength ("Detail self-shade strength", Range(0,3)) = 1.0
+        // BILLOWS: multi-octave lumps whose size follows the local puff radius, so a big
+        // cloud gets several lobes with sub-lobes instead of one hill/dimple pattern of a
+        // fixed size repeated everywhere. Mix 0 = the old single fixed-size detail.
+        // Largest radius on the spine, set by the plugin. The hierarchical warp displaces by up to
+        // ~0.3 of the LOCAL radius, so empty-space skipping has to be dilated by that, not by the
+        // fixed ~21 m the old single warp needed - otherwise a big plume is sliced at its edge.
+        _MaxSpineRadius ("Max spine radius (set by plugin)", Float) = 0
+        // Borrowed from EVE (LGhassen), which shades each cloud puff as a sphere: diffuse from the
+        // surface normal, plus a glow on thin translucent edges. Facing = how strongly a bump
+        // facing the sun is brightened and one facing away darkened (normal from the density
+        // falling toward the sun, so it costs nothing extra). Glow = thin edges brightening, most
+        // when looking toward the light.
+        _FacingShade ("Facing shade (normal diffuse)", Range(0,1)) = 0.3
+        _EdgeGlow ("Edge glow (thin translucent rim)", Range(0,1)) = 0.5
+        // Warp amplitude as a fraction of the local radius. 0.28 gave ragged, odd shapes in flight.
+        _BillowAmp ("Billow amplitude (x radius)", Range(0.02,0.6)) = 0.16
+        // SPHERE LOBES (EVE-style round puffs, inside the density): a field of spheres, one per
+        // Worley cell, sized from the local radius. Where a sphere reaches the surface it bulges
+        // out, between spheres the surface dimples in, so the silhouette is made of round lobes
+        // instead of a smooth tube with noise on it. 0 = off.
+        _LobeMix ("Sphere lobes mix", Range(0,1)) = 0.8
+        _LobeCell ("Sphere lobe cell (x radius)", Range(0.2,2)) = 0.7
+        // THRESHOLD EROSION (Horizon Zero Dawn style, as in the KSA trail shader). The capsule radial
+        // profile (1 on the axis, 0 at the edge, LINEAR) is compared against noise: density exists
+        // where profile > 1 - (noise * depth + 1 - depth). The visible surface is displaced by the
+        // noise itself, up to `depth` of the radius, while the core stays solid.
+        _ErodeMix ("Threshold erosion mix", Range(0,1)) = 1.0
+        _ErodeDepth ("Erosion max depth", Range(0.05,1)) = 0.45
+        _ErodeSharp ("Erosion edge sharpness", Range(0,0.95)) = 0.5
+        // Scales the profile before thresholding. The linear profile reaches 0 at 1.4 R, so at 1 the
+        // eroded body comes out smaller than the smoothstep coverage it replaces.
+        _ErodeBoost ("Erosion profile boost", Range(0.8,2.5)) = 1.3
+        // EDGE PROTRUSION: lobes may stand OUT past the capsule (KSA-style), reaching up to this fraction of
+        // the radius further than the old 1.4 R limit. The inner shape is unchanged. 0 = off.
+        _Protrude ("Edge protrusion (x radius)", Range(0,1)) = 0
+        // Bright translucent rim (additive silver lining on the edge band, strongest toward the sun).
+        _RimLight ("Rim light", Range(0,3)) = 0
+        // The protruding edge is made of WISPS: ridged noise stretched along the column (_WispStretch = how many
+        // times longer than wide) and twisted around its axis (_Swirl = turns per radius of length), so the
+        // rim throws off curled, torn streaks like a real turbulent plume, not round blobs.
+        _WispStretch ("Wisp stretch (along axis)", Range(0.05,1)) = 0.2
+        _Swirl ("Wisp swirl", Range(0,4)) = 1.0
+        _SteamBright ("Steam brightness floor", Range(0,1)) = 0.9
+        _SteamWhite ("Steam whiteness", Range(0,1)) = 0.7
+        _FineDetail ("Fine detail octave", Range(0,1)) = 0.5
+        // 1 = the protruding edge is made of round lobes (the first version) instead of wisps.
+        _RoundLobes ("Protrusion: round lobes", Range(0,1)) = 0
+        // MULTIPLE SCATTERING (Wrenninge 2013 / Nubis 2023): indirect light = BeerMS(density to the
+        // sun) times a dark-edge factor that is small at the rim and 1 deep inside. 0 = old floor.
+        _MSMix ("Multi-scatter mix", Range(0,1)) = 1.0
+        _DarkEdge ("Dark edge minimum", Range(0,1)) = 0.3
+        // Sky ambient occlusion from the profile, BeerMS(profile*3), instead of a 3-sample march.
+        _ProfileAO ("Profile ambient occlusion", Range(0,1)) = 1.0
+        _BillowMix ("Billow mix", Range(0,1)) = 1.0
+        // size of the largest lobe cell relative to the local radius
+        _BillowCell ("Billow cell (x radius)", Range(0.2,3)) = 0.9
+        // Amplitude of the two dithers. Both were at full strength, which is what puts a
+        // fine stipple over the whole surface: neighbouring pixels sample the light and the
+        // density at different offsets, so each lands on a different shade. Lower = less
+        // grain, more risk of banding; 1 = the old behaviour.
+        // Carving with the billow noise: the shell is eroded so lobes at the rim separate
+        // into detached clumps and wisps, the way a cumulus has bits floating off it. 0 = none.
+        _BillowErode ("Billow erosion (detached clumps)", Range(0,1)) = 0.5
+        // Softens the rim: values >1 make the outer density fall off faster to nothing, a
+        // feathered translucent edge instead of a firm surface. 1 = unchanged.
+        _EdgeFeather ("Edge feather", Range(1,3)) = 1.0
+        _LightJitter ("Light-march jitter", Range(0,1)) = 1
+        _MarchJitter ("Primary-march jitter", Range(0,1)) = 1
 
         // experimental scatterer atmospheric extinction integration, 0 = off
         _ScattererIntegrationStrength ("Scatterer Integration Strength", Range(0,1)) = 1.0
@@ -178,6 +267,9 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
             fixed4 _AmbientGroundColor;
             float _Washout;
             float _WashoutDesaturate;
+            float _UseMiePhase;
+            float _MieParticleDiameter;
+            float _MieFloor;
             float _ForwardScatterG;
             float _ScatterIntensity;
             float _MultiScatterG;
@@ -197,11 +289,37 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
             // global to be assigned from a function, which avoids threading an out-parameter
             // through every return path.
             static float4 gPlumeAux;
+            // unclamped local size ratio of the last DensityAt sample, read by LightMarch
+            static float gSizeRatio = 1.0;
+            // linear radial profile of the last SpineCoverage sample: 1 on the axis, 0 at the edge
+            static float gProfile = 1.0;
+            static float gProfileExt = 1.0;
+            // outward direction (away from the dominant capsule's axis) of the last SpineCoverage
+            // sample: the column's own surface normal, used for the sun-side / shade-side term
+            static float3 gNormal = float3(0.0, 1.0, 0.0);
+            static float3 gAxis = float3(0.0, 1.0, 0.0);
+            // water-vapour share (0..1) of the last SpineCoverage sample
+            static float gSteam = 0.0;
+            // fireball heat (0..1) of the last SpineCoverage sample
+            static float gHeat = 0.0;
             float _ShadowCastDistance;
             int _ShadowCastSteps;
             float _ShadowCastDebug;
             // xyz = body centre in world space, w = body radius
             float4 _SmokeBodyCentre;
+            // Sea-level radius of the body when it has an ocean, else 0. Smoke below it is cut off:
+            // nothing pushes puffs up out of the water, and the sea does not occlude it from below.
+            float _SmokeSeaClip;
+            // Soft ceiling on the phase function. The normalised Mie forward lobe peaks ~100x above its
+            // isotropic level, which at the sun-facing angle paints a blown-out mirror-like hotspot.
+            float _PhaseMax;
+            float _DebugBox;
+            // engine flame as a point light: xyz = nozzle (world), w = strength; _FlameColor.w = half-range (m)
+            float4 _FlameLight;
+            float _FireEmission;   // explosion fireball glow (set by the plugin; 0 = none)
+            float4 _FlameColor;
+            // strength of the directional N.L term from the column geometry (0 = off)
+            float _NormalShade;
             // set from C# every frame - see HalfResSmokeRenderer.UpdateSunDirection
             float4 _SmokeSunDir;
             // planet-up at the smoke's position, published by HalfResSmokeRenderer
@@ -233,6 +351,39 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
             float _ShadowStrength;
             int _LightMarchSteps;
             float _LightMarchDistance;
+            float _LightSizeScaling;
+            float _DetailShadeStrength;
+            float _MaxSpineRadius;
+            float _FacingShade;
+            float _EdgeGlow;
+            float _BillowAmp;
+            float _LobeMix;
+            float _LobeCell;
+            float _ErodeMix;
+            float _ErodeDepth;
+            float _ErodeSharp;
+            float _ErodeBoost;
+            float _Protrude;
+            float _WispStretch;
+            float _Swirl;
+            float _SteamBright;
+            float _SteamWhite;
+            float _FineDetail;
+            float _SmokeAerialK;
+            float _ShadowCastDensity;
+            float _ShadowCastFloor;
+            float _AerialStrength;
+            float _RoundLobes;
+            float _RimLight;
+            float _MSMix;
+            float _DarkEdge;
+            float _ProfileAO;
+            float _BillowMix;
+            float _BillowCell;
+            float _BillowErode;
+            float _EdgeFeather;
+            float _LightJitter;
+            float _MarchJitter;
 
             // experimental
             float _ScattererIntegrationStrength;
@@ -250,7 +401,7 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
             float _GlobalZTestMode; // legacy, kept so existing SetGlobalInt calls still bind
 
 #if defined(SMOKE_VOLUME_POLYLINE)
-            #define MAX_SPINE_POINTS 200
+            #define MAX_SPINE_POINTS 320
             int _SpineCount;
             // xyz = world space, oldest to newest. w = that point's density multiplier,
             // which is how a bloomed high-altitude section gets to be thin while the same
@@ -267,7 +418,7 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
             // Bounds come from SmokeVolumeGroup and are strict over-estimates, so culling
             // can never remove real coverage. Getting that wrong punches holes.
             #define SPINE_GROUP_SIZE 16
-            #define MAX_SPINE_GROUPS 13
+            #define MAX_SPINE_GROUPS 20
             int _SpineGroupCount;
             float4 _SpineGroupBounds[MAX_SPINE_GROUPS]; // xyz = centre, w = radius
 #else
@@ -359,6 +510,93 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                 return (warp - 0.5) * 2.0 * strength;
             }
 
+            // Noise whose feature size follows a target cell size WITHOUT distorting the field.
+            //
+            // Sampling noise at p / cell(p) - with cell depending on the LOCAL radius - makes the
+            // coordinate a non-linear function of position: wherever the radius changes quickly
+            // (along a trail, the radius grows fast from the tip) the noise phase races ahead and
+            // the field folds into rings perpendicular to the trail, and it moves every frame as
+            // the radii grow. That was the concentric banding, the "eye" around the tip and the
+            // flicker. Here the field itself is fixed in world space at power-of-two cell sizes,
+            // and only the CROSSFADE between the two nearest sizes follows the radius, which is
+            // smooth and phase-preserving.
+            // pn is in metres (already through NoiseSpace), cell in metres.
+            // ANTI-TILING. The baked volume repeats every _NoisePeriod cells along its axes, and the two layers
+            // below used to share those axes (and an exact 2x scale), so the combined field repeated exactly.
+            // Each layer is now sampled through its OWN fixed rotation (about different, irrational axes), so the
+            // lattices of the layers point in different directions and the sum has no common period. On top, an
+            // optional third decorrelated sample (rotation C, scale 2^(k+0.5), random offset) is mixed in with
+            // weight _AntiTile * 0.5, which also breaks the repeat where one layer dominates (f near 0 or 1).
+            // All blends keep the variance (the deviation is stretched back), so contrast does not drop.
+            static const float3x3 kRotA = float3x3(0.92618, -0.30193, 0.22589, 0.32464, 0.94322, -0.07036, -0.19182, 0.13850, 0.97161);
+            static const float3x3 kRotB = float3x3(0.79407, -0.60047, -0.09430, 0.43572, 0.67051, -0.60047, 0.42380, 0.43572, 0.79407);
+            static const float3x3 kRotC = float3x3(0.47194, -0.82876, 0.30070, 0.30070, 0.47194, 0.82876, -0.82876, -0.30070, 0.47194);
+            float _AntiTile;
+
+            float4 SampleNoiseLOD(float3 pn, float cell)
+            {
+                float lg = log2(max(cell, 0.25));
+                float k = floor(lg);
+                float f = smoothstep(0.0, 1.0, lg - k);
+                float4 a = SampleNoise(mul(kRotA, pn) / exp2(k));
+                float4 b = SampleNoise(mul(kRotB, pn) / exp2(k + 1.0) + float3(7.31, 3.17, 5.53));
+                // Blending two independent fields shrinks the variance to (1-f)^2 + f^2 of one
+                // (half, at f = 0.5), which would leave the smoke smoothest exactly where the
+                // scale switches. Stretching the deviation back restores the contrast.
+                float norm = rsqrt((1.0 - f) * (1.0 - f) + f * f);
+                float4 ab = 0.5 + (lerp(a, b, f) - 0.5) * norm;
+                if (_AntiTile > 0.001)
+                {
+                    float4 c = SampleNoise(mul(kRotC, pn) / exp2(k + 0.5) + float3(13.7, 29.3, 41.1));
+                    float w = saturate(_AntiTile) * 0.5;
+                    ab = 0.5 + ((1.0 - w) * (ab - 0.5) + w * (c - 0.5)) * rsqrt((1.0 - w) * (1.0 - w) + w * w);
+                }
+                return ab;
+            }
+
+            float3 LobeHash(float3 p)
+            {
+                p = frac(p * float3(0.1031, 0.1030, 0.0973));
+                p += dot(p, p.yxz + 33.33);
+                return frac((p.xxy + p.yxx) * p.zyx);
+            }
+
+            // Distance (in cell units) to the nearest sphere centre. Only the 2x2x2 cells toward
+            // the sample's nearer corner are searched: with centres kept inside [0.2, 0.8] of
+            // their cell that is exact enough for a smooth lobe, at a quarter of the 27-cell cost.
+            float LobeDist(float3 pn, float cell)
+            {
+                float3 q = pn / cell;
+                float3 ic = floor(q);
+                float3 dirn = (frac(q) > 0.5) ? float3(1, 1, 1) : float3(-1, -1, -1);
+                float dmin = 4.0;
+                [unroll]
+                for (int x = 0; x < 2; x++)
+                [unroll]
+                for (int y = 0; y < 2; y++)
+                [unroll]
+                for (int z = 0; z < 2; z++)
+                {
+                    float3 c = ic + float3(x, y, z) * dirn;
+                    float3 pt = c + 0.2 + 0.6 * LobeHash(c);
+                    dmin = min(dmin, length(q - pt));
+                }
+                return dmin;
+            }
+
+            // 1 at a sphere centre, 0 at ~0.6 cell. Crossfaded between two power-of-two cell
+            // sizes for the same reason as SampleNoiseLOD (no ring artefacts from a smoothly
+            // varying coordinate).
+            float LobeField(float3 pn, float cell)
+            {
+                float lg = log2(max(cell, 1.0));
+                float k = floor(lg);
+                float f = smoothstep(0.0, 1.0, lg - k);
+                float a = 1.0 - smoothstep(0.0, 0.78, LobeDist(pn, exp2(k)));
+                float b = 1.0 - smoothstep(0.0, 0.78, LobeDist(pn + float3(13.7, 5.3, 9.1), exp2(k + 1.0)));
+                return lerp(a, b, f);
+            }
+
             // ---- ray-box intersection ----
 
             bool IntersectBox(float3 ro, float3 rd, float3 boxCenter, float3 boxExtents, out float tNear, out float tFar)
@@ -433,7 +671,119 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                 // able to reach as far as it used to. Doubling the one-sided branch puts
                 // the usable range back where it was, so "1.0" means strong again.
                 float detailTerm = lerp(signedDetail, max(signedDetail, 0.0) * 2.0, _DetailBias);
+
+                // BILLOWS. One sample of a fixed-size noise gives one hill/dimple pattern of
+                // one size repeated identically everywhere - the flat "same texture across
+                // all the smoke" look. Real cumulus is hierarchical: big lobes carry smaller
+                // lobes carry smaller ones, and it is not uniform - some stretches are
+                // cauliflower, some smooth. So: three octaves whose LATTICE follows the local
+                // puff radius (a big puff gets big lobes, a small one small), each octave
+                // weaker than the last, and a slow field that raises or lowers the whole
+                // amplitude from place to place.
+                float billowNoise = 0.5;
+                if (_BillowMix > 0.001)
+                {
+                    float localR = max(sizeRatio * _ReferenceRadius, 3.0);
+                    float3 bpn = NoiseSpace(pWarped);
+                    float bcell = localR * max(_BillowCell, 0.05);
+                    float b1 = SampleNoiseLOD(bpn, bcell).a;
+                    float b2 = SampleNoiseLOD(bpn + float3(171.0, 37.0, 93.0), max(bcell * 0.42, 0.6)).a;
+                    float b3 = SampleNoiseLOD(bpn + float3(49.0, 213.0, 127.0), max(bcell * 0.196, 0.4)).a;
+                    float region = SampleNoiseLOD(bpn + float3(317.0, 81.0, 29.0), bcell * 3.2).g;
+                    float regionAmp = lerp(0.35, 1.3, saturate((region - 0.3) * 2.5));
+                    float billow = (max((b1 - 0.5) * 2.0, 0.0)
+                                    + 0.6 * max((b2 - 0.5) * 2.0, 0.0)
+                                    + 0.35 * max((b3 - 0.5) * 2.0, 0.0)) * 2.0 * regionAmp / 1.6;
+                    float fineNoise = 0.5;
+                    if (_FineDetail > 0.001)
+                    {
+                        // a finer, fixed-ish scale: big puffs (50-100 m) otherwise had nothing smaller than ~9 m
+                        // and read as smooth plastic from close up
+                        fineNoise = SampleNoiseLOD(bpn + float3(233.0, 59.0, 11.0), max(bcell * 0.07, 0.5)).a;
+                        billow += _FineDetail * 0.5 * max((fineNoise - 0.5) * 2.0, 0.0);
+                    }
+                    billowNoise = saturate((b1 + 0.6 * b2 + 0.35 * b3 + _FineDetail * fineNoise) / (1.95 + _FineDetail));
+                    detailTerm = lerp(detailTerm, billow, _BillowMix);
+                    bumpFactor = lerp(bumpFactor, saturate(0.25 + 0.5 * (b1 + 0.6 * b2 + 0.35 * b3)), _BillowMix);
+                }
                 float built = saturate(coverage + detailTerm * buildStrength);
+
+                // THRESHOLD EROSION. Uses the same multi-octave noise as the billows, stretched (a sum
+                // of octaves clusters near 0.5) so it reaches the full 0..1 range the threshold needs.
+                // Blended over the additive result, so 0 keeps the old look for A/B.
+                if (_ErodeMix > 0.001)
+                {
+                    // The profile reaches 0 at 1.4 R * (1 + P). Rescale it so that the part inside the old
+                    // 1.4 R limit is exactly what it was; the shell beyond is the negative range, which only the
+                    // high peaks of the noise can fill (the lobes that stand out).
+                    float profOld = 1.0 - (1.0 - gProfileExt) * (1.0 + _Protrude);
+                    float prof = _Protrude > 0.001 ? min(profOld * _ErodeBoost, 1.0) : saturate(gProfile * _ErodeBoost);
+                    float en = saturate(0.5 + (billowNoise - 0.5) * 2.4);
+                    // WISPS (only outside the old limit does this matter): a ridged field, i.e. thin curved
+                    // SHEETS where the noise crosses 0.5, sampled in a frame that is stretched along the column
+                    // and twisted around it. The twist grows with the distance along the axis and with the
+                    // radius, and is wobbled by a second noise, so the sheets curl like torn vortex filaments.
+                    float wisp = 0.0;
+                    if (_Protrude > 0.001 && _RoundLobes > 0.5)
+                        wisp = smoothstep(0.55, 1.0, en);
+                    else if (_Protrude > 0.001)
+                    {
+                        float3 ax = gAxis;
+                        float3 refV = abs(ax.y) < 0.9 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+                        float3 t1 = normalize(cross(ax, refV));
+                        float3 t2 = cross(ax, t1);
+                        float wR = max(sizeRatio * _ReferenceRadius, 3.0);
+                        float3 wn0 = NoiseSpace(pWarped);
+                        float along = dot(wn0, ax);
+                        float cu = dot(wn0, t1);
+                        float cv = dot(wn0, t2);
+                        float wob = SampleNoiseLOD(wn0 * 0.5 + float3(91.0, 17.0, 63.0), wR * 1.6).g - 0.5;
+                        float ang = 6.2831853 * _Swirl * (along / (wR * 6.0) + (1.0 - gProfileExt) * 0.35) + wob * 3.0;
+                        float sa, ca;
+                        sincos(ang, sa, ca);
+                        float3 q = float3(ca * cu - sa * cv, sa * cu + ca * cv, along);
+                        // stretch: features are 1/_WispStretch times longer along the axis than across it
+                        q.z *= _WispStretch;
+                        float wnv = SampleNoiseLOD(q, wR * 0.55).a;
+                        float wnv2 = SampleNoiseLOD(q * 2.1 + float3(5.0, 71.0, 33.0), wR * 0.25).a;
+                        float ridge = 1.0 - abs(2.0 * (0.7 * wnv + 0.3 * wnv2) - 1.0);
+                        wisp = smoothstep(0.72, 0.96, ridge);
+                    }
+                    float highDetail = en * _ErodeDepth + (1.0 - _ErodeDepth);
+                    float eroded = highDetail - (1.0 - prof) + _Protrude * _ErodeBoost * wisp;
+                    float erodedDensity = saturate(eroded / max(1.0 - _ErodeSharp, 0.05));
+                    built = lerp(built, erodedDensity, _ErodeMix);
+                }
+
+                // Sphere lobes: bulge where a sphere reaches the rim, dimple between spheres.
+                // Applied only around the surface (coverage neither ~0 nor saturated), so the core
+                // stays solid and empty space stays empty.
+                if (_LobeMix > 0.001)
+                {
+                    float lobeCell = max(sizeRatio * _ReferenceRadius, 3.0) * _LobeCell;
+                    float lobe = LobeField(NoiseSpace(pWarped), lobeCell);
+                    // Starts well inside the falloff (0.12-0.45), not at its very foot: adding density where
+                    // coverage is ~0 makes spheres that float free of the body, which read as flat
+                    // detached flakes on a hollow shell from the side and from close up.
+                    float lrim = smoothstep(0.03, 0.18, coverage) * (1.0 - smoothstep(0.75, 0.99, coverage));
+                    float lobeDelta = lobe - 0.30;
+                    lobeDelta = lobeDelta > 0.0 ? lobeDelta : lobeDelta * 0.12;
+                    built = saturate(built + _LobeMix * lobeDelta * lrim * 1.8);
+                }
+
+                // EROSION by the billow noise. Adding lumps only ever grows the shape outward;
+                // a cloud with bits floating off it needs material REMOVED. Subtracting the
+                // (inverted) noise before renormalising leaves the saturated core untouched
+                // (1 - c)/(1 - c) = 1 but pulls the shell apart wherever the noise is low, so
+                // the rim breaks into separate clumps and wisps.
+                // Rim only: coverage falls from 1 at the centre to 0 at the edge, so eroding
+                // everywhere thinned the whole body to a grey translucent shell. Fading the
+                // carve out as `built` rises keeps the core white and solid and breaks only the rim.
+                float rimMask = 1.0 - smoothstep(0.35, 0.85, built);
+                float carve = _BillowErode * _BillowMix * (1.0 - billowNoise) * rimMask;
+                built = saturate((built - carve) / max(1.0 - carve, 0.2));
+                // Feathered rim: a power >1 lets thin density taper off instead of ending firmly.
+                built = pow(built, max(_EdgeFeather, 1.0));
 
                 // Wispy boundary. The capsule chain gives a smooth analytic silhouette,
                 // which reads as obviously geometric next to a real cloud's ragged edge.
@@ -549,10 +899,27 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                 return max(_ThinEdgeSoftness, 0.05);
             }
 
+            // w carries TWO things: the density multiplier d (0..1.4) and a "steam" level q = 0..7 (water vapour
+            // from liquid engines), packed as w = d + 2q.
+            // A third field, the HEAT of an explosion fireball (0..7 levels), sits above them: w = d + 2q + 16h.
             float SpinePointDensity(int i)
             {
-                float d = _SpinePoints[i].w;
+                float w = _SpinePoints[i].w;
+                w -= 16.0 * floor(w * (1.0 / 16.0));
+                float d = w - 2.0 * floor(w * 0.5);
                 return d > 0.0 ? d : 1.0;
+            }
+
+            float SpinePointSteam(int i)
+            {
+                float w = _SpinePoints[i].w;
+                w -= 16.0 * floor(w * (1.0 / 16.0));
+                return floor(w * 0.5) * (1.0 / 7.0);
+            }
+
+            float SpinePointHeat(int i)
+            {
+                return floor(_SpinePoints[i].w * (1.0 / 16.0)) * (1.0 / 7.0);
             }
 
             float SpineCoverageStrided(float3 pSample, int stride, float blendK, out float densityMul)
@@ -577,7 +944,7 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
 
                     float3 mid = (a + b) * 0.5;
                     float halfLen = length(b - a) * 0.5;
-                    float maxR = max(ra, rb) * 1.4 / ThinSoftnessSafe();
+                    float maxR = max(ra, rb) * 1.4 * (1.0 + _Protrude) / ThinSoftnessSafe();
                     float cullRadius = halfLen + maxR;
                     if (dot(pSample - mid, pSample - mid) > cullRadius * cullRadius) continue;
 
@@ -592,7 +959,7 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                     // comparable to its own size. Widening the falloff for thin sections is
                     // what turns the same capsule chain into mist instead of a solid slab
                     // with a cut edge.
-                    float blendRadius = r * 1.4 / lerp(ThinSoftnessSafe(), 1.0, SolidityOf(segDensity));
+                    float blendRadius = r * 1.4 * (1.0 + _Protrude) / lerp(ThinSoftnessSafe(), 1.0, SolidityOf(segDensity));
                     float dSq = dot(pSample - closest, pSample - closest);
                     if (dSq >= blendRadius * blendRadius) continue;
                     float d = sqrt(dSq);
@@ -631,6 +998,13 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
             {
                 float blendK = SpineBlendFor(radiusRatio);
                 float coverage = 0.0;
+                float profile = 0.0;
+                float bestTT = 0.0;
+                float3 bestOff = float3(0.0, 1.0, 0.0);
+                float3 bestAx = float3(0.0, 1.0, 0.0);
+                float steamAcc = 0.0;
+                float heatAcc = 0.0;
+                float heatW = 0.0;
                 float densityAcc = 0.0;
                 float densityWeight = 0.0;
                 densityMul = 1.0;
@@ -661,7 +1035,7 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                         float r = lerp(ra, rb, t);
 
                         float segDensity = lerp(SpinePointDensity(i), SpinePointDensity(i + 1), t);
-                        float blendRadius = r * 1.4 / lerp(ThinSoftnessSafe(), 1.0, SolidityOf(segDensity));
+                        float blendRadius = r * 1.4 * (1.0 + _Protrude) / lerp(ThinSoftnessSafe(), 1.0, SolidityOf(segDensity));
                         float dSq = dot(pSample - closest, pSample - closest);
                         if (dSq >= blendRadius * blendRadius) continue;
                         float d = sqrt(dSq);
@@ -669,11 +1043,24 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                         float tt = saturate(1.0 - d / blendRadius);
                         float shape = tt * tt * (3.0 - 2.0 * tt);
                         densityAcc += shape * segDensity;
+                        steamAcc += shape * lerp(SpinePointSteam(i), SpinePointSteam(i + 1), t);
+                        // heat is averaged by DENSITY, so a faint smoke lobe overlapping the fireball cannot dilute it
+                        float hw = shape * segDensity;
+                        heatAcc += hw * lerp(SpinePointHeat(i), SpinePointHeat(i + 1), t);
+                        heatW += hw;
                         densityWeight += shape;
                         coverage = SmoothMax(coverage, shape, blendK);
+                        profile = SmoothMax(profile, tt, blendK);
+                        if (tt > bestTT) { bestTT = tt; bestOff = pSample - closest; bestAx = abLenSq > 0.0001 ? ab * rsqrt(abLenSq) : bestAx; }
                     }
                 }
 
+                gAxis = bestAx;
+                gSteam = densityWeight > 0.0 ? saturate(steamAcc / densityWeight) : 0.0;
+                gHeat = heatW > 0.0 ? saturate(heatAcc / heatW) : 0.0;
+                gProfileExt = saturate(profile);
+                gProfile = saturate(1.0 - (1.0 - gProfileExt) * (1.0 + _Protrude));
+                gNormal = bestOff * rsqrt(max(dot(bestOff, bestOff), 1e-6));
                 if (densityWeight > 0.0) densityMul = densityAcc / densityWeight;
                 return saturate(coverage);
             }
@@ -735,7 +1122,7 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                         float abLenSq = dot(ab, ab);
                         float t = abLenSq > 0.0001 ? saturate(dot(pSample - a, ab) / abLenSq) : 0.0;
                         float3 closest = a + ab * t;
-                        float r = lerp(ra, rb, t) * 1.4 + extra;
+                        float r = lerp(ra, rb, t) * 1.4 * (1.0 + _Protrude) + extra;
 
                         best = min(best, distance(pSample, closest) - r);
                         if (best <= 0.0) return best; // already inside, no point refining
@@ -748,7 +1135,10 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
             // dilating by it keeps this a strict over-estimate.
             float EmptyDistance(float3 p)
             {
-                return SpineDistance(p, _VortexStrength + _SilhouetteWarpStrength);
+                float legacyWarp = (_VortexStrength + _SilhouetteWarpStrength) * 1.1;
+                float hierWarp = _BillowMix > 0.001
+                    ? 1.3 * _BillowAmp * _MaxSpineRadius * saturate(_SilhouetteWarpStrength / 20.0) : 0.0;
+                return SpineDistance(p, max(legacyWarp, hierWarp));
             }
 
             float DensityAt(float3 p, out float bumpFactor, out float outRadiusRatio)
@@ -767,6 +1157,7 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                 // was left. That is what read as a white slab with cut edges.
                 float sizeRatio = clamp(EstimateLocalRadius(p) / _ReferenceRadius, 0.05, 200.0);
                 float radiusRatio = min(sizeRatio, 1.0);
+                gSizeRatio = sizeRatio;
                 outRadiusRatio = radiusRatio;
 
                 // No empty-space test here: the march loop already ran EmptyDistance to
@@ -815,7 +1206,38 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                 float warpWavelength = 8.0 / max(_SilhouetteWarpScale / freqRatio, 1e-4);
                 float warpAmplitude = min(_SilhouetteWarpStrength * silhouetteWarpScale,
                                           min(localRadius * 0.5, warpWavelength * 0.18));
-                float3 silhouetteOffset = DomainWarp(p, _SilhouetteWarpScale / freqRatio, warpAmplitude, 0.012);
+                float3 silhouetteOffset;
+                if (_BillowMix > 0.001)
+                {
+                    // HIERARCHICAL WARP. The silhouette is made by this displacement, not by
+                    // the additive detail: the dense core saturates to opaque, so only where
+                    // the warp moves the surface does the outline change. One fixed-wavelength
+                    // warp (~114 m) gave one hill/dimple pattern of one size everywhere.
+                    // Instead three octaves whose wavelength follows the LOCAL RADIUS - big
+                    // lobes, lobes on the lobes, lobes on those - splitting the same amplitude
+                    // budget the single warp had (so EmptyDistance's dilation still covers it),
+                    // and a slow field that makes some stretches more cauliflower than others.
+                    float bR = max(localRadius, 3.0);
+                    float cell1 = max(_BillowCell * 0.6 * bR, 2.5);
+                    float3 pnw = NoiseSpace(p);
+                    // Amplitude is a fraction of the LOCAL RADIUS, like the cell size. It used to
+                    // reuse warpAmplitude, which is capped at ~20 m by the old fixed 114 m wavelength:
+                    // fine for a 65 m puff, and a smooth cone for the several-hundred-metre plume in
+                    // flight. The wavelength cap no longer applies - the cells are size-relative.
+                    float hAmp = _BillowAmp * bR * saturate(_SilhouetteWarpStrength / 20.0);
+                    float3 hw = (SampleNoiseLOD(pnw, cell1).rgb - 0.5) * 2.0 * (0.55 * hAmp)
+                              + (SampleNoiseLOD(pnw + float3(37.0, 11.0, 53.0), max(cell1 * 0.43, 1.2)).rgb - 0.5) * 2.0 * (0.32 * hAmp)
+                              + (SampleNoiseLOD(pnw + float3(-19.0, 71.0, 7.0), max(cell1 * 0.19, 0.8)).rgb - 0.5) * 2.0 * (0.18 * hAmp);
+                    float regionMix = SampleNoiseLOD(pnw + float3(311.0, 83.0, 29.0), 2.6 * bR).g;
+                    hw *= lerp(0.55, 1.25, saturate((regionMix - 0.3) * 2.5));
+                    silhouetteOffset = (_BillowMix > 0.999)
+                        ? hw
+                        : lerp(DomainWarp(p, _SilhouetteWarpScale / freqRatio, warpAmplitude, 0.012), hw, _BillowMix);
+                }
+                else
+                {
+                    silhouetteOffset = DomainWarp(p, _SilhouetteWarpScale / freqRatio, warpAmplitude, 0.012);
+                }
                 float3 pWarped = p + vortexOffset + silhouetteOffset;
 
                 float spineDensity;
@@ -850,10 +1272,98 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                 float spineDensity;
                 float coverage = SpineCoverageStrided(p, stride, SpineBlendFor(radiusRatio), spineDensity);
                 coverage *= lerp(0.6, 1.15, saturate(radiusRatio * 1.5));
+                // The same rim erosion the full density applies (one octave). Without it the
+                // light march saw the UNERODED shape: carved-away rim counted as solid smoke,
+                // so the visible material looked buried under a thick layer and shaded itself
+                // dark grey. gSizeRatio still holds the size of the sample being shaded.
+                if (_BillowErode * _BillowMix > 0.001)
+                {
+                    float cheapR = max(gSizeRatio * _ReferenceRadius, 3.0);
+                    float cbn = SampleNoiseLOD(NoiseSpace(p), cheapR * max(_BillowCell, 0.05)).a;
+                    float cRim = 1.0 - smoothstep(0.35, 0.85, coverage);
+                    float cCarve = _BillowErode * _BillowMix * (1.0 - cbn) * cRim;
+                    coverage = saturate((coverage - cCarve) / max(1.0 - cCarve, 0.2));
+                }
                 // detail buildup is mean-preserving but its scroll term averages ~0.92,
                 // so match that here to keep shadow strength consistent with the full path.
                 return coverage * 0.92 * MacroVariation(p) * spineDensity;
             }
+
+            // ANALYTIC shadow depth along a ray through the spine chain: for every segment the ray's chord through that
+            // part of the plume is computed exactly (a cone around the segment, radius interpolated), times the density.
+            // The old cast shadow stepped through the density field in strides far longer than a trail is thick, so a
+            // thin trail was hit or missed per pixel and came out as separate round blobs. This one has no stride, so
+            // the shadow is one continuous shape that follows the smoke.
+            //
+            // Per segment, with the ray (O, D) and the axis (a, u, length L): s0 = where along the axis the two lines are
+            // closest, dist = their distance, theta = the angle between them. A cylinder of radius r is crossed by a chord
+            // 2 sqrt(r^2 - dist^2) / sin(theta); along the axis that chord covers [s0 - h, s0 + h], h = chord cos(theta) / 2,
+            // and only the part inside [0, L] belongs to this segment.
+            float SpineShadowDepth(float3 O, float3 D)
+            {
+                float total = 0.0;
+                int last = _SpineCount - 1;
+
+                [loop]
+                for (int g = 0; g < _SpineGroupCount; g++)
+                {
+                    float4 gb = _SpineGroupBounds[g];
+                    float3 gc = gb.xyz - O;
+                    float tproj = dot(gc, D);
+                    if (tproj < -gb.w) continue;                       // the whole group is behind the surface
+                    if (length(gc - D * tproj) > gb.w) continue;        // the ray misses the group's bounding sphere
+
+                    int start = g * SPINE_GROUP_SIZE;
+                    int end = min(start + SPINE_GROUP_SIZE, last);
+                    for (int i = start; i < end; i++)
+                    {
+                        float ra = _SpineRadii[i];
+                        float rb = _SpineRadii[i + 1];
+                        if (ra <= 0.0 || rb <= 0.0) continue;
+                        float3 a = _SpinePoints[i].xyz;
+                        float3 ab = _SpinePoints[i + 1].xyz - a;
+                        float L = length(ab);
+                        if (L < 1e-3) continue;
+                        float3 u = ab / L;
+                        float3 w0 = O - a;
+                        float bb = dot(D, u);
+                        float d0 = dot(D, w0);
+                        float e0 = dot(u, w0);
+                        float den = 1.0 - bb * bb;
+                        float segDens = 0.5 * (SpinePointDensity(i) + SpinePointDensity(i + 1));
+
+                        if (den > 2e-3)
+                        {
+                            float s0 = (e0 - bb * d0) / den;
+                            float t0 = (bb * e0 - d0) / den;
+                            float sinT = sqrt(den);
+                            float dist = abs(dot(w0, cross(D, u))) / sinT;
+                            float r = lerp(ra, rb, saturate(s0 / L)) * 1.45 * (1.0 + 0.5 * _Protrude);   // the smoke is drawn out to ~1.4 r (+ edge protrusion)
+                            if (dist >= r) continue;
+                            float chord = 2.0 * sqrt(r * r - dist * dist) / sinT;
+                            if (t0 + 0.5 * chord <= 0.0) continue;              // entirely behind the surface
+                            float h = 0.5 * chord * abs(bb);
+                            float overlap = max(min(s0 + h, L) - max(s0 - h, 0.0), 0.0);
+                            float frac = h > 1e-3 ? saturate(overlap / (2.0 * h)) : ((s0 >= 0.0 && s0 <= L) ? 1.0 : 0.0);
+                            // soft rim: the density falls off toward the edge of the radius
+                            float soft = smoothstep(0.0, 0.6, 1.0 - dist / r);
+                            total += chord * frac * segDens * soft;
+                        }
+                        else
+                        {
+                            // ray (anti)parallel to the segment: it runs along it for the part of the axis it overlaps
+                            float perp = length(w0 - u * e0);
+                            float r = max(ra, rb) * 1.45 * (1.0 + 0.5 * _Protrude);
+                            if (perp >= r) continue;
+                            float tA = (0.0 - e0) / bb, tB = (L - e0) / bb;
+                            float lo = max(min(tA, tB), 0.0), hi = max(max(tA, tB), 0.0);
+                            total += (hi - lo) * segDens * smoothstep(0.0, 0.6, 1.0 - perp / r);
+                        }
+                    }
+                }
+                return total;
+            }
+
 #else
             // density from the texture baked by the compute shader
             float DensityAt(float3 p, out float bumpFactor, out float outRadiusRatio)
@@ -925,6 +1435,9 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
             // testing the unwarped one could skip real coverage and punch holes. This
             // path's box is compact and mostly full, so there was little to win.
             float EmptyDistance(float3 p) { return -1.0; }
+
+            float SpineShadowDepth(float3 O, float3 D) { return 0.0; }
+
 #endif
 
             // Short march toward the sun for self-shadowing. Four of every five density
@@ -971,7 +1484,8 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
 
             float LightMarch(float3 p, float3 sunDir, float radiusRatio, float jitter)
             {
-                float stepLen = (_LightMarchDistance * lerp(0.25, 1.0, radiusRatio)) / _LightMarchSteps;
+                float sizeScale = pow(clamp(gSizeRatio, 1.0, 8.0), _LightSizeScaling);
+                float stepLen = (_LightMarchDistance * lerp(0.25, 1.0, radiusRatio) * sizeScale) / _LightMarchSteps;
                 float transmittance = 1.0;
 
                 [unroll(8)]
@@ -991,7 +1505,7 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
             // needs the immediate neighbourhood.
             float SkyVisibility(float3 p, float3 upDir, float radiusRatio, float jitter)
             {
-                float stepLen = _SkyOcclusionDistance / SKY_OCCLUSION_STEPS;
+                float stepLen = _SkyOcclusionDistance * pow(clamp(gSizeRatio, 1.0, 8.0), _LightSizeScaling) / SKY_OCCLUSION_STEPS;
                 float transmittance = 1.0;
 
                 [unroll]
@@ -1009,6 +1523,31 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                 float g2 = g * g;
                 float denom = 1.0 + g2 - 2.0 * g * cosAngle;
                 return (1.0 - g2) / (4.0 * 3.14159265 * pow(max(denom, 0.0001), 1.5));
+            }
+
+            // Draine's phase function, [Jendersie and d'Eon 2023] (SIGGRAPH Talks,
+            // doi 10.1145/3587421.3595409, MIT-licensed reference in draine.hlsl).
+            // alpha = 0 reduces to HG, so it is a strict generalisation of the function above.
+            float EvalDraine(float u, float g, float a)
+            {
+                float denom = 1.0 + g * g - 2.0 * g * u;
+                return ((1.0 - g * g) * (1.0 + a * u * u))
+                    / (4.0 * (1.0 + (a * (1.0 + 2.0 * g * g)) / 3.0) * 3.14159265
+                       * pow(max(denom, 0.0001), 1.5));
+            }
+
+            // Their single-parameter fit (Eq. 4-7): mean droplet diameter in micrometres ->
+            // the four numbers of phi = (1-wD)*HG(gHG) + wD*Draine(gD, alpha). Fitted over
+            // 5-50 um; the gHG term has a pole at d = 1.67, so the diameter is clamped well
+            // clear of it rather than trusting extrapolation below the fitted range.
+            void MiePhaseParams(float diameterUm, out float gHG, out float gD,
+                                out float alpha, out float wD)
+            {
+                float d = clamp(diameterUm, 3.0, 50.0);
+                gHG = exp(-0.0990567 / (d - 1.67154));
+                gD = exp(-2.20679 / (d + 3.91029) - 0.428934);
+                alpha = exp(3.62489 - 8.29288 / (d + 5.52825));
+                wD = exp(-0.599085 / (d - 0.641583) - 0.665888);
             }
 
         ENDCG
@@ -1098,6 +1637,12 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                 float shadowAccum = 0.0;
                 float skyAccum = 0.0;
                 float sunAccum = 0.0;
+                float facingAccum = 0.0;
+                float normAccum = 0.0;
+                float steamAccum = 0.0;
+                float heatAccum = 0.0;
+                float flameAccum = 0.0;
+                float facing = 0.0;
 
                 // Dither in two parts. The start offset shifts where each pixel's ray
                 // begins, which breaks up screen-space banding but not banding that repeats
@@ -1108,7 +1653,7 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                 // Both run at full amplitude, which IGN tolerates and a white-noise hash
                 // did not.
                 float ditherHash = InterleavedGradientNoise(i.pos.xy + _PlumeJitter.zw);
-                float ditherOffset = (ditherHash - 0.5) * stepSize;
+                float ditherOffset = (ditherHash - 0.5) * stepSize * _MarchJitter;
 
                 // _WorldSpaceLightPos0 is not bound on this path: the smoke is submitted
                 // through a CommandBuffer, which skips the forward renderer's light setup.
@@ -1118,8 +1663,22 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                     : normalize(_WorldSpaceLightPos0.xyz);
                 float cosAngle = dot(-rd, sunDir);
                 // forward lobe (sharp glow toward sun) + multi lobe (soft internal glow)
-                float phase = HenyeyGreenstein(cosAngle, _ForwardScatterG) * _ScatterIntensity
-                    + HenyeyGreenstein(cosAngle, _MultiScatterG) * _MultiScatterIntensity;
+                float phase;
+                if (_UseMiePhase > 0.5)
+                {
+                    // Computed once per ray (view and sun are both constant along it), so
+                    // the extra exp() calls in MiePhaseParams cost nothing per march step.
+                    float gHG, gD, mieAlpha, wD;
+                    MiePhaseParams(_MieParticleDiameter, gHG, gD, mieAlpha, wD);
+                    phase = ((1.0 - wD) * HenyeyGreenstein(cosAngle, gHG)
+                             + wD * EvalDraine(cosAngle, gD, mieAlpha)) * _ScatterIntensity + _MieFloor * (1.0 - _MSMix);
+                }
+                else
+                {
+                    phase = HenyeyGreenstein(cosAngle, _ForwardScatterG) * _ScatterIntensity
+                        + HenyeyGreenstein(cosAngle, _MultiScatterG) * _MultiScatterIntensity;
+                }
+                if (_PhaseMax > 0.001) phase = phase / (1.0 + phase / _PhaseMax);
 
                 // Adaptive step size. The AABB is mostly empty space around a thin curved
                 // chain, and a fixed march pays full density on every step of it - cheap at
@@ -1198,10 +1757,16 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                     // depth on average. The step index enters the hash so consecutive
                     // samples differ, which is what breaks banding along the ray.
                     float stepJitter = InterleavedGradientNoise(i.pos.xy + _PlumeJitter.zw + float2(s * 5.588238, s * 3.141593)) - 0.5;
-                    float3 densityPos = samplePos + rd * (stepJitter * stepSize);
+                    float3 densityPos = samplePos + rd * (stepJitter * stepSize * _MarchJitter);
 
                     float bump, sampleRadiusRatio;
                     float density = DensityAt(densityPos, bump, sampleRadiusRatio) * _Density;
+                    float profHere = gProfile;
+                    float3 nHere = gNormal;
+                    float steamHere = gSteam;
+                    float heatHere = gHeat;
+                    if (_SmokeSeaClip > 1.0)
+                        density *= smoothstep(0.0, 1.5, length(densityPos - _SmokeBodyCentre.xyz) - _SmokeSeaClip);
                     if (density <= 0.001) { t += stepSize; continue; }
 
                     // The light march is the most expensive thing in the shader. Once the
@@ -1226,11 +1791,31 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                         // grain turns into flat grey terraces across the column. Grain from
                         // an incoherent error reads as texture; the same error made coherent
                         // reads as a defect.
-                        float lightPhase = frac(ditherHash + 0.5);
-                        float skyPhase = frac(ditherHash + 0.25);
+                        float lightPhase = 0.5 + (frac(ditherHash + 0.5) - 0.5) * _LightJitter;
+                        float skyPhase = 0.5 + (frac(ditherHash + 0.25) - 0.5) * _LightJitter;
                         lightTransmittance = LightMarch(densityPos, sunDir, sampleRadiusRatio, lightPhase);
-                        skyVisibility = SkyVisibility(densityPos, _SmokeUpDir.xyz,
-                            sampleRadiusRatio, skyPhase);
+                        if (_ProfileAO <= 0.5)
+                            skyVisibility = SkyVisibility(densityPos, _SmokeUpDir.xyz,
+                                sampleRadiusRatio, skyPhase);
+
+                        // DETAIL TAP. One FULL-density sample (noise and warp included) a little
+                        // way toward the sun: where a bump rises between this point and the
+                        // light, the point sits in its shade; where the surface falls away it
+                        // does not. The offset follows the local puff size so big and small
+                        // smoke get bumps of the same relative depth. gSizeRatio still holds
+                        // this sample's value - LightMarch and SkyVisibility only use the
+                        // cheap density, which does not touch it.
+                        if (_DetailShadeStrength > 0.001)
+                        {
+                            float tapOff = clamp(gSizeRatio * _ReferenceRadius * 0.25, 2.0, 24.0);
+                            float tapBump, tapRatio;
+                            float dToward = DensityAt(densityPos + sunDir * tapOff, tapBump, tapRatio) * _Density;
+                            float rise = max(dToward - density, 0.0);
+                            lightTransmittance *= exp(-rise * _Absorption * tapOff * _DetailShadeStrength);
+                            // -1..1: density falling toward the sun means the surface faces it
+                            // (N.L > 0); rising means it faces away. This is EVE's diffuse term.
+                            facing = clamp((density - dToward) / max(density + dToward, 0.02), -1.0, 1.0);
+                        }
                     }
 
                     float stepTransmittance = exp(-density * _Absorption * stepSize);
@@ -1248,10 +1833,35 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                     // is not enough material to scatter light back toward the camera.
                     // This is what gives a lobe its rounded look instead of a flat disc.
                     float powder = 1.0 - exp(-density * 2.0);
-                    float powderTerm = lerp(1.0, powder, _PowderStrength);
+                    float powderTerm = max(lerp(1.0, powder, _PowderStrength), 0.0);
                     float sunlit = PlanetSunlight(densityPos, sunDir);
                     sunAccum += contribution * sunlit;
-                    scatteredLight += contribution * phase * lightTransmittance * powderTerm * sunlit;
+                    facingAccum += contribution * facing;
+                    // Column-geometry N.L: sunlit on the side facing the sun, shaded on the far side,
+                    // with a defined terminator. Weighted toward the surface, where a normal means something.
+                    float ndl = smoothstep(-0.3, 0.3, dot(nHere, sunDir)) * 2.0 - 1.0;
+                    if (_FlameLight.w > 0.001)
+                    {
+                        float3 fd3 = densityPos - _FlameLight.xyz;
+                        float fr = max(_FlameColor.w, 1.0);
+                        flameAccum += contribution / (1.0 + dot(fd3, fd3) / (fr * fr));
+                    }
+                    normAccum += contribution * ndl * lerp(1.0, 0.3, saturate(profHere));
+                    steamAccum += contribution * steamHere;
+                    // fireball: hot in the un-eroded core, cool soot at the boundary
+                    heatAccum += contribution * heatHere * saturate(profHere * 3.0 + 0.4);
+                    // Multiple scattering: indirect light is attenuated by the rational BeerMS of the
+                    // optical depth toward the sun (soft, never black) and by a dark-edge factor that is
+                    // small at the rim and 1 deep inside. Replaces the old constant floor.
+                    float dLight = -log(max(lightTransmittance, 0.0001));
+                    float beerMS = 1.0 / (1.0 + 0.35 * dLight + 0.065 * dLight * dLight);
+                    float indirect = _MieFloor * _MSMix * beerMS * lerp(_DarkEdge, 1.0, saturate(profHere));
+                    if (_ProfileAO > 0.5)
+                    {
+                        float ao = profHere * 3.0;
+                        skyVisibility = 1.0 / (1.0 + 0.35 * ao + 0.065 * ao * ao);
+                    }
+                    scatteredLight += contribution * (phase * lightTransmittance + indirect) * powderTerm * sunlit;
                     shadowAccum += contribution * lightTransmittance;
                     skyAccum += contribution * skyVisibility;
                     bumpAccum += contribution * bump;
@@ -1262,6 +1872,14 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                 }
 
                 float alpha = 1.0 - transmittance;
+                // DEBUG overlay: purple = pixel covered by the march box but empty, red = the ray ran out of
+                // iteration budget before crossing the box (undersampled: shows up as sheets / missing trail).
+                bool rayRanOut = (t < tFar) && (transmittance > 0.011);
+                if (_DebugBox > 0.5)
+                {
+                    if (rayRanOut) return fixed4(0.45 * 0.6, 0.0, 0.0, 0.6);
+                    if (alpha <= 0.001) return fixed4(0.30 * 0.25, 0.0, 0.35 * 0.25, 0.25);
+                }
                 if (alpha <= 0.001) discard;
 
                 fixed3 shadowColor = _ShadowColor.rgb;
@@ -1302,7 +1920,25 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                 float shadedLit = lerp(_AmbientFloor, 1.0, avgShadow);
 
                 float litness = lerp(flatLit, shadedLit, _ShadowStrength);
+                // Normal-based diffuse, EVE style: max(dot(N, L), 0) becomes a signed offset so the
+                // sun-facing side of every bump reads brighter and the far side darker.
+                float avgFacing = alpha > 0.0001 ? clamp(facingAccum / alpha, -1.0, 1.0) : 0.0;
+                litness = saturate(litness + _FacingShade * avgFacing * 0.6);
+                float avgNdl = alpha > 0.0001 ? clamp(normAccum / alpha, -1.0, 1.0) : 0.0;
+                // Engine-flame light: warm additive glow on smoke near the nozzle, independent of the sun.
+                float avgFlame = alpha > 0.0001 ? flameAccum / alpha : 0.0;
+                litness = saturate(litness + _NormalShade * avgNdl * 0.5);
+                // WATER VAPOUR (liquid-engine exhaust): condensed droplets scatter almost all the light, so
+                // the steam is brighter, whiter and far less grey in the shade than the sooty SRB smoke.
+                float avgSteam = alpha > 0.0001 ? saturate(steamAccum / alpha) : 0.0;
+                litness = lerp(litness, max(litness, _SteamBright), avgSteam);
+                shaded = lerp(shaded, fixed3(1.0, 1.0, 1.0), avgSteam * _SteamWhite);
+                litColor = lerp(litColor, fixed3(1.0, 1.0, 1.0), avgSteam * _SteamWhite * 0.6);
                 col.rgb = lerp(shaded, litColor, litness);
+                // Soft-saturating add (screen-like): the flame can tint the smoke orange but cannot blow it out past
+                // white, which a plain additive term did next to a big nozzle.
+                float3 flameAdd = _FlameColor.rgb * (avgFlame * _FlameLight.w);
+                col.rgb = 1.0 - (1.0 - saturate(col.rgb)) * exp(-flameAdd * 1.5);
 
                 // Phase acts as a brightness gain rather than the shading ramp - this is
                 // what puts a glow on the sun-facing side.
@@ -1324,11 +1960,37 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
 
                 col.a = alpha;
 
+                // EDGE GLOW, EVE's scatter term: scatter = (min - opacity * alpha) * (1 - N.V) * h,
+                // h = 0.5 + 0.5 * dot(V, L). Thin, translucent parts (low alpha) take forward-
+                // scattered light and glow, most when looking toward the sun - the silver lining
+                // on cumulus, and what the eroded wisps at the rim need.
+                float rimH = 0.5 + 0.5 * saturate(cosAngle);
+                float thin = (1.0 - alpha) * (1.0 - alpha);
+                col.rgb = lerp(col.rgb, litColor, saturate(_EdgeGlow * thin * rimH));
+                // The silver lining proper: the translucent band of the edge (alpha mid-range) takes extra
+                // light, most when the sun is behind the smoke. Additive, so it can exceed the lit colour.
+                float rimBand = alpha * (1.0 - alpha) * 4.0;
+                col.rgb += litColor * (_RimLight * rimBand * rimBand * lerp(0.35, 1.0, saturate(cosAngle)));
+
                 // Bump highlights get a brightness boost, no hue change. The low end must
                 // stay near 1: knocking a third off wherever the basis is dark dims most
                 // of the volume and reads as uniformly dingy.
                 float avgBump = alpha > 0.0001 ? saturate(bumpAccum / alpha) : 0.0;
                 col.rgb *= lerp(0.92, 1.08, avgBump);
+
+                // AERIAL PERSPECTIVE. Distant smoke is seen through a lot of air: it loses contrast, takes on the colour
+                // of the sky (and glows toward the sun, where forward scattering by the haze is strongest) and fades a
+                // little against the horizon. _SmokeAerialK is 1 / (distance at which 63% of the contrast is gone) at
+                // the camera's own air density, so it fades out with altitude; 0 = off.
+                if (_SmokeAerialK > 0.0 && _AerialStrength > 0.001)
+                {
+                    float camDist = distW > 1e-4 ? distAcc / distW : length(i.worldPos - _WorldSpaceCameraPos);
+                    float fog = (1.0 - exp(-camDist * _SmokeAerialK)) * _AerialStrength;
+                    float sunGlow = pow(saturate(cosAngle), 6.0) * 0.45;
+                    fixed3 hazeColor = lerp(ambient * 1.18, litColor, sunGlow);
+                    col.rgb = lerp(col.rgb, hazeColor, saturate(fog));
+                    col.a *= 1.0 - 0.3 * saturate(fog);
+                }
 
                 // experimental aerial perspective toward scatterer's extinction color
                 if (_ScattererIntegrationStrength > 0.0001)
@@ -1337,6 +1999,21 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                     float fogAmount = saturate(camDist * extinctionMultiplier * max(extinctionThickness, 0.0001))
                         * saturate(extinctionGroundFade);
                     col.rgb = lerp(col.rgb, _Extinction_Tint.rgb, fogAmount * _ScattererIntegrationStrength);
+                }
+
+                // EXPLOSION FIREBALL: self-lit by the heat ramp (ember at the boundary, orange, then a pale yellow core),
+                // so it glows regardless of the sun. _FireEmission = 0 turns it off.
+                float avgHeat = alpha > 0.0001 ? saturate(heatAccum / alpha) : 0.0;
+                if (avgHeat > 0.002 && _FireEmission > 0.0)
+                {
+                    float hh = saturate(avgHeat * 1.8);
+                    float3 ember = float3(0.35, 0.03, 0.0);
+                    float3 flameC = float3(1.0, 0.32, 0.04);
+                    float3 coreC = float3(1.0, 0.86, 0.58);
+                    float3 fire = lerp(ember, flameC, smoothstep(0.0, 0.5, hh));
+                    fire = lerp(fire, coreC, smoothstep(0.55, 1.0, hh));
+                    fire *= (0.35 + hh * hh * _FireEmission);
+                    col.rgb = lerp(col.rgb, fire, saturate(hh * 1.3));
                 }
 
                 // premultiply on the way out - see the Blend note on the SubShader
@@ -1424,8 +2101,13 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                 // View ray for this corner, carried from the vertex so it interpolates
                 // linearly across the quad. It comes off the real clip position, which
                 // keeps it in step with the flipped lookup above.
-                float4 rayH = mul(unity_CameraInvProjection, float4(ndc, 1.0, 1.0));
-                o.ray = rayH.xyz / rayH.w;
+                // View-space ray through this corner, built from the projection the GPU is ACTUALLY using
+                // (UNITY_MATRIX_P, which carries the vertical flip when the camera renders into a texture) rather than
+                // unity_CameraInvProjection, which never flips. With the latter the reconstructed world position was
+                // mirrored top-to-bottom whenever the target was flipped (heat haze and cast shadow landed above the
+                // rocket instead of below it).
+                o.ray = float3((ndc.x + UNITY_MATRIX_P._m02) / UNITY_MATRIX_P._m00,
+                               (ndc.y + UNITY_MATRIX_P._m12) / UNITY_MATRIX_P._m11, -1.0);
                 return o;
             }
 
@@ -1498,8 +2180,31 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
 
                 float stepLen = _ShadowCastDistance / max((float)_ShadowCastSteps, 1.0);
                 float opticalDepth = 0.0;
+#ifdef SMOKE_VOLUME_POLYLINE
+                // the analytic chord sum replaces the strided march below (compiled out for this variant)
+                opticalDepth = SpineShadowDepth(worldPos + sunDir * 0.05, sunDir) * _Density * _ShadowCastDensity;
+                if (_ShadowCastDebug > 2.5) return fixed4(opticalDepth > 0.0001 ? 0.2 : 1.0, 1, 1, 1);
+                if (_ShadowCastDebug > 4.5) return opticalDepth > 0.0001 ? fixed4(1, 0.3, 1, 1) : fixed4(1, 0.2, 0.2, 1);
+                float transmittanceA = exp(-opticalDepth * _Absorption * _ShadowExtinction);
+                // a surface in a smoke shadow is still lit by the sky: the shadow never goes below this floor
+                float shadeA = lerp(1.0, max(transmittanceA, _ShadowCastFloor), _ShadowCastStrength);
+                return fixed4(shadeA, shadeA, shadeA, 1.0);
+#endif
+                // Dithered start phase (27 IX fix). Without this every pixel's shadow ray
+                // sampled the OCCUPIED-region branch at the exact same fixed stride phase
+                // (stepLen ~156m at defaults) relative to its own world position - a rigid
+                // grid with no jitter, unlike the main volume march (see InterleavedGradientNoise
+                // use above), which needs exactly this to avoid the same failure mode. A
+                // trail is ~10-30m across, far thinner than one 156m step, so whether a
+                // given ray's fixed sample grid happens to land inside the trail's thin
+                // cross-section or step clean over it varies discontinuously pixel to
+                // pixel - that quantised hit/miss pattern IS the "row of separate dark
+                // ovals" look, distinct from the empty-jump bug fixed below. Dithering the
+                // phase turns that hard aliasing into soft, incoherent grain instead.
+                float shadowDither = InterleavedGradientNoise(i.pos.xy) - 0.5;
                 // start clear of the surface so a pixel does not shadow itself
-                float t = stepLen * 0.5;
+                float t = stepLen * (0.5 + shadowDither);
+                if (t < 0.05) t = 0.05;
 
                 [loop]
                 for (int s = 0; s < _ShadowCastSteps; s++)

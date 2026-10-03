@@ -31,6 +31,8 @@ Shader "RaymarchedPlumeTrails/SmokeComposite"
             sampler2D _MainTex;
             float4 _MainTex_TexelSize; // .xy = 1/width, 1/height of the HALF-res buffer
             sampler2D_float _CameraDepthTexture;
+            // global, set from HalfResSmokeRenderer: overall smoke opacity slider
+            float _PlumeOpacity;
 
             struct v2f
             {
@@ -76,7 +78,8 @@ Shader "RaymarchedPlumeTrails/SmokeComposite"
                 fixed4 smooth = tex2D(_MainTex, i.uv);
                 fixed4 nearest = tex2D(_MainTex, uvs[best]);
                 float edge = saturate(bestDiff * 0.5);
-                return lerp(smooth, nearest, edge);
+                // premultiplied source, so scaling every channel is the correct fade
+                return lerp(smooth, nearest, edge) * _PlumeOpacity;
             }
             ENDCG
         }

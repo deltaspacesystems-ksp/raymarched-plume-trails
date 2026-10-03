@@ -286,9 +286,11 @@ namespace RaymarchedPlumeTrails
             minX -= margin; minY -= margin; maxX += margin; maxY += margin;
             if (maxX < 0f || minX > 1f || maxY < 0f || minY > 1f) return false;
 
+            // viewport rectangle -> clip rectangle, plus its vertical mirror image (see HeatHazeRenderer.ScreenRect)
+            float cy0 = Mathf.Clamp01(minY) * 2f - 1f, cy1 = Mathf.Clamp01(maxY) * 2f - 1f;
             rect = new Vector4(
-                Mathf.Clamp01(minX) * 2f - 1f, Mathf.Clamp01(minY) * 2f - 1f,
-                Mathf.Clamp01(maxX) * 2f - 1f, Mathf.Clamp01(maxY) * 2f - 1f);
+                Mathf.Clamp01(minX) * 2f - 1f, Mathf.Min(cy0, -cy1),
+                Mathf.Clamp01(maxX) * 2f - 1f, Mathf.Max(cy1, -cy0));
             return true;
         }
 
@@ -347,6 +349,14 @@ namespace RaymarchedPlumeTrails
                 centre = new Vector4(c.x, c.y, c.z, (float)b.Radius);
             }
             Shader.SetGlobalVector("_SmokeBodyCentre", centre);
+            float seaClip = 0f;
+            if (FlightGlobals.ActiveVessel != null && FlightGlobals.ActiveVessel.mainBody != null
+                && FlightGlobals.ActiveVessel.mainBody.ocean
+                // Only over open water. At a coastal pad the ground sits within a few metres of sea
+                // level, and cutting at the sea-level sphere there slices the base off the smoke.
+                && (FlightGlobals.ActiveVessel.Splashed || FlightGlobals.ActiveVessel.terrainAltitude < -1.0))
+                seaClip = (float)FlightGlobals.ActiveVessel.mainBody.Radius;
+            Shader.SetGlobalFloat("_SmokeSeaClip", seaClip);
         }
 
         // Same pair DepthTextureEnabler uses; keep the two lists in step.
@@ -397,6 +407,8 @@ namespace RaymarchedPlumeTrails
                 block.SetFloat("_ThinDetailFade", SmokeTuning.ThinDetailFade);
                 block.SetFloat("_ShadowCastStrength", SmokeTuning.ShadowCastStrength);
                 block.SetFloat("_ShadowCastDistance", SmokeTuning.ShadowCastDistance);
+                block.SetFloat("_ShadowCastDensity", SmokeTuning.ShadowCastDensity);
+                block.SetFloat("_ShadowCastFloor", SmokeTuning.ShadowCastFloor);
                 // The slider is the High-quality value; the preset and the governor scale it.
                 int castSteps = Mathf.Max(4, Mathf.RoundToInt(
                     SmokeTuning.ShadowCastSteps * SmokeQuality.Current.shadowSteps / 16f));
@@ -419,12 +431,58 @@ namespace RaymarchedPlumeTrails
         // index of the "SmokeShadowCast" pass in SmokeVolume.shader
         private const int ShadowCastPass = 1;
 
+        private float renderPerfLogTimer;
+        private float lastResLogTime = -999f;
+
         private void LateUpdate()
         {
+            var perfSw = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                LateUpdateBody();
+            }
+            finally
+            {
+                renderPerfLogTimer -= Time.unscaledDeltaTime;
+                if (renderPerfLogTimer <= 0f)
+                {
+                    renderPerfLogTimer = 1f;
+                    double ms = perfSw.Elapsed.TotalMilliseconds;
+                    if (ms >= 0.5)
+                    {
+                        Debug.Log(string.Format(
+                            "[PlumeTrails] render: cpuMs={0:F2} activeVolumes={1} shadowDraws={2}",
+                            ms, SmokeRenderRegistry.Active.Count, lastShadowDraws));
+                    }
+                }
+            }
+        }
+
+        // 1 / the distance at which 63% of the contrast is lost, at the camera's own air density (so the haze thins out
+        // with altitude and is absent in vacuum). 0 when switched off.
+        private float AerialK()
+        {
+            if (SmokeTuning.AerialStrength <= 0.001f) return 0f;
+            Camera cam = Camera.main;
+            CelestialBody body = FlightGlobals.currentMainBody;
+            if (cam == null || body == null || !body.atmosphere) return 0f;
+            double alt = body.GetAltitude(cam.transform.position);
+            double p0 = body.GetPressure(0.0);
+            if (p0 <= 0.0) return 0f;
+            float density = (float)(body.GetPressure(alt) / p0);
+            if (density < 0.005f) return 0f;
+            return 1f / (Mathf.Max(SmokeTuning.AerialDistance, 500f) * Mathf.Max(density, 0.1f));
+        }
+
+        private void LateUpdateBody()
+        {
             if (compositeMaterial == null) return;
+            Shader.SetGlobalFloat("_PlumeOpacity", Mathf.Clamp01(SmokeTuning.Opacity));
+            Shader.SetGlobalFloat("_SmokeAerialK", AerialK());
             // Volumes are uploaded here, after every group has ticked, so trails that have
             // grown together can be drawn as one.
             SmokeVolumeGroup.RenderAll();
+            PlumeExplosions.RenderAll();
             SmokeQuality.Tick(SmokeRenderRegistry.Active.Count > 0);
             UpdateSunDirection();
 
@@ -529,6 +587,30 @@ namespace RaymarchedPlumeTrails
             Vector3 eye = cam.transform.position;
             sortedVolumes.Sort((a, b) =>
                 (b.bounds.center - eye).sqrMagnitude.CompareTo((a.bounds.center - eye).sqrMagnitude));
+
+            // "Laguje mimo ze rakieta jest 4km od dymu" - this pass costs PIXELS, not
+            // vessel-to-camera distance, so the number that actually predicts its cost is
+            // how much of the SCREEN the volumes' boxes cover, not how far away they are.
+            // A trail that is far from the vessel but close to (or behind) the camera, or
+            // one whose box is huge from a bloomed/stretched-geometry bug, fills the
+            // screen just as expensively as a near one - logging both numbers together is
+            // what tells those two apart instead of guessing from "it's far, why is it
+            // slow".
+            if (Time.time - lastResLogTime > 1f && sortedVolumes.Count > 0)
+            {
+                lastResLogTime = Time.time;
+                float nearestDist = float.MaxValue;
+                for (int i = 0; i < sortedVolumes.Count; i++)
+                {
+                    float d = Vector3.Distance(eye, sortedVolumes[i].bounds.center);
+                    if (d < nearestDist) nearestDist = d;
+                }
+                Debug.Log(string.Format(
+                    "[PlumeTrails] renderRes: {0}x{1} (scale {2:F2}) temporal={3} volumes={4} "
+                    + "nearestDist={5:F0}m camPixels={6}x{7}",
+                    w, h, renderScale, temporalOn, sortedVolumes.Count, nearestDist,
+                    cam.pixelWidth, cam.pixelHeight));
+            }
 
             for (int i = 0; i < sortedVolumes.Count; i++)
             {

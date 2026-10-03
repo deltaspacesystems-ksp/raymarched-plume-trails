@@ -88,6 +88,7 @@ void Blur(uint3 id : SV_DispatchThreadID)
 RWTexture3D<float4> _NoiseOut;
 uint3 _NoiseResolution;
 float _NoisePeriod; // lattice cells covered by the full texture
+float _NoiseGradient; // 1 = periodic gradient (Perlin / simplex-like) noise in the fbm channels, 0 = old value noise
 
 float hashTiled(float3 cell, float period)
 {
@@ -131,6 +132,50 @@ float valueNoiseTiled(float3 p, float period)
     return lerp(nxy0, nxy1, f.z);
 }
 
+// Periodic GRADIENT noise (improved Perlin: 12 edge gradients, quintic fade). Value noise interpolates random
+// numbers on the lattice, so its features line up with the lattice axes and it shows blocky, axis-aligned
+// streaks; gradient noise interpolates random slopes instead, which is isotropic and organic - what simplex noise
+// is chosen for in KSA. A true simplex lattice cannot be made to tile on a cube, and a baked texture has to
+// tile, so this is the periodic equivalent. It costs nothing at runtime: it is only used when the texture is baked.
+float3 gradientTiled(float3 cell, float period)
+{
+    static const float3 grads[12] = {
+        float3(1,1,0), float3(-1,1,0), float3(1,-1,0), float3(-1,-1,0),
+        float3(1,0,1), float3(-1,0,1), float3(1,0,-1), float3(-1,0,-1),
+        float3(0,1,1), float3(0,-1,1), float3(0,1,-1), float3(0,-1,-1) };
+    int g = (int)min(floor(hashTiled(cell, period) * 12.0), 11.0);
+    return grads[g];
+}
+
+float gradientNoiseTiled(float3 p, float period)
+{
+    float3 i = floor(p);
+    float3 f = frac(p);
+    float3 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+
+    float n000 = dot(gradientTiled(i + float3(0,0,0), period), f - float3(0,0,0));
+    float n100 = dot(gradientTiled(i + float3(1,0,0), period), f - float3(1,0,0));
+    float n010 = dot(gradientTiled(i + float3(0,1,0), period), f - float3(0,1,0));
+    float n110 = dot(gradientTiled(i + float3(1,1,0), period), f - float3(1,1,0));
+    float n001 = dot(gradientTiled(i + float3(0,0,1), period), f - float3(0,0,1));
+    float n101 = dot(gradientTiled(i + float3(1,0,1), period), f - float3(1,0,1));
+    float n011 = dot(gradientTiled(i + float3(0,1,1), period), f - float3(0,1,1));
+    float n111 = dot(gradientTiled(i + float3(1,1,1), period), f - float3(1,1,1));
+
+    float nx00 = lerp(n000, n100, u.x);
+    float nx10 = lerp(n010, n110, u.x);
+    float nx01 = lerp(n001, n101, u.x);
+    float nx11 = lerp(n011, n111, u.x);
+    float n = lerp(lerp(nx00, nx10, u.y), lerp(nx01, nx11, u.y), u.z);
+    // about [-1, 1]; remapped to 0..1 with the contrast of the value noise it replaces
+    return saturate(0.5 + 0.72 * n);
+}
+
+float baseNoiseTiled(float3 p, float period)
+{
+    return _NoiseGradient > 0.5 ? gradientNoiseTiled(p, period) : valueNoiseTiled(p, period);
+}
+
 // 3 octaves, not 4: at 128^3 over _NoisePeriod = 8 cells a 4th octave would land
 // on ~2 texels, i.e. right at Nyquist, and alias inside the texture itself
 float fbmTiled(float3 p, float period, float3 offset)
@@ -145,7 +190,7 @@ float fbmTiled(float3 p, float period, float3 offset)
     float norm = 0.0;
     for (int i = 0; i < 3; i++)
     {
-        v += amp * valueNoiseTiled(p * freq + offset, period * freq);
+        v += amp * baseNoiseTiled(p * freq + offset, period * freq);
         norm += amp;
         freq *= 2.0;
         amp *= 0.35;

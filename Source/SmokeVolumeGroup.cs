@@ -1,3 +1,4 @@
+// hi code browser
 using System.Collections.Generic;
 using UnityEngine;
 
@@ -24,9 +25,9 @@ namespace RaymarchedPlumeTrails
         // Render the trail as one analytic capsule chain instead of chunked baked tiles:
         // no bake pass, no tile seams, one draw call. False falls back to the old path.
         public bool usePolylineActiveTrail = true;
-        private const int MaxSpinePoints = 200; // must match MAX_SPINE_POINTS in SmokeVolume.shader
+        private const int MaxSpinePoints = 320; // must match MAX_SPINE_POINTS in SmokeVolume.shader
         // Ceiling on the ground cloud's share, leaving the rest for the trail.
-        private const int MaxGroundSpinePoints = 70;
+        private const int MaxGroundSpinePoints = 110;
 
         private struct Puff
         {
@@ -64,6 +65,32 @@ namespace RaymarchedPlumeTrails
             // are picked every frame, which is what made the texture flash.
             public int spawnIndex;
             public bool markedForRemoval;
+            // water-vapour share (liquid-engine exhaust) fixed at birth, 0..1
+            public float steam;
+            // water mass fraction of this puff's exhaust, and the current visibility of its condensate (physical puffs)
+            public float fw, pVis;
+            // radius multiplier (per-engine / liquid scale) and the dilution out to which the exhaust stays visible
+            public float pScale, pVisDil;
+            public float pR0;                 // radius when released (for the growth cap)
+            // cached terrain height under this puff (m above sea level) and when it was sampled
+            public float gAlt, gTime;
+            // Which fixed landing-splash ray this ground puff belongs to, or -1 for the
+            // old omnidirectional pad-deflector ground cloud. See AddGroundPuff and
+            // BuildActiveOrderedList - puffs on the same ray chain together into one
+            // continuous streak instead of the whole splash sorting as one axis, which is
+            // what a "starburst" of independent random directions needs to read as
+            // separate jets rather than a scribble connecting between them.
+            public int groundRayId;
+            // Emission tick this ray puff belongs to (all rays of one tick share it), so
+            // thinning can pick whole ticks with a nested power-of-two rule, stable frame
+            // to frame - see BuildActiveOrderedList.
+            public int groundTick;
+            // Horizontal direction of this ray puff's throw; drives its later creep.
+            public Vector3 rayDir;
+            // REAL PHYSICS puff state (see PuffPhysics). pM = total mass, pMe = exhaust mass, pT = temperature,
+            // pM0 = mass at release, pR = equivalent-sphere radius. velocity above is reused (surface frame).
+            public bool physical;
+            public float pM, pMe, pT, pM0, pR;
         }
 
         private readonly List<Puff> puffs = new List<Puff>();
@@ -116,6 +143,17 @@ namespace RaymarchedPlumeTrails
             {
                 return (SmokeTuning.SilhouetteWarpStrength + SmokeTuning.VortexStrength) * 1.733f;
             }
+        }
+
+        // The hierarchical warp displaces by up to BillowAmp of the LOCAL radius (three octaves
+        // summing to ~1 amplitude, sqrt(3) per-axis worst case), which for a big puff is far more
+        // than the fixed margin above - the box then clips the plume flat at its walls. Seen in
+        // game as a flat "plate" cut at the base of a fat trail.
+        private static float RadiusWarpMargin(float radius)
+        {
+            if (SmokeTuning.BillowMix <= 0.001f) return 0f;
+            return 1.9f * SmokeTuning.BillowAmp * radius
+                 * Mathf.Clamp01(SmokeTuning.SilhouetteWarpStrength / 20f);
         }
 
         // Depth bias is retired. It existed to shove the volume's box in front of the
@@ -232,6 +270,13 @@ namespace RaymarchedPlumeTrails
         // trail reaching from the pad to 24km is thick at the bottom and thin at the top,
         // and one scale for the whole volume made the entire column vanish at altitude.
         private readonly List<float> activeOrderedDensity = new List<float>();
+        private int clusterChains = 1;
+        // This chain's slice of the shared spine buffer, set by BuildMergedSpine (water-filling over the chains'
+        // demands), the spine points this chain would keep with no budget pressure, and the continuous band width
+        // actually in use (see BuildActiveOrderedList).
+        private int shareBudgetPts = 0;
+        private int lastFullDemand = 0;
+        private float bandEff = 0f;
 
         private int splatKernel = -1;
         private int blurKernel = -1;
@@ -417,8 +462,32 @@ namespace RaymarchedPlumeTrails
         private static bool debugBounceLogging = false;
         private float lastBounceLogTime = -999f;
 
+        // How far the live tip may move in one tick before it is logged as a jump. Real
+        // motion is bounded by vessel speed * fixedDeltaTime, which even at orbital speed
+        // over a 0.02s physics step is on the order of tens of metres - a few hundred
+        // catches a genuine discontinuity without false-positiving on a fast, normal tick.
+        private const float TipJumpWarnDistance = 500f;
+
         public void SetLiveTip(Vector3 worldPos, float radius)
         {
+            // Diagnostic for the SetLiveRoot "balloon on a string" bug (28 IX): logs the
+            // jump itself, one tick before SetLiveRoot would otherwise have to guess at
+            // why nozzle and tip went out of sync. hasLiveTip guards against the very
+            // first call, which has nothing to compare against.
+            if (hasLiveTip)
+            {
+                float jump = Vector3.Distance(liveTipPos, worldPos);
+                if (jump > TipJumpWarnDistance)
+                {
+                    Debug.LogWarning(string.Format(
+                        "[PlumeTrails] instance {0}: live tip jumped {1:F0}m in one tick "
+                        + "({2} -> {3}), {4:F2}s since the last SetLiveTip. Likely cause: the "
+                        + "engine-group centroid this tip is spawned from moved (group "
+                        + "membership changed, e.g. via a landing-state RecomputeGroups) "
+                        + "rather than the vessel actually travelling that far.",
+                        instanceId, jump, liveTipPos, worldPos, Time.time - lastLiveTipRefresh));
+                }
+            }
             liveTipPos = worldPos;
             liveTipRadius = radius;
             hasLiveTip = true;
@@ -445,6 +514,7 @@ namespace RaymarchedPlumeTrails
         private const int LiveRootPoints = 4;
         private readonly Vector3[] liveRootPos = new Vector3[LiveRootPoints];
         private readonly float[] liveRootRadius = new float[LiveRootPoints];
+        private readonly float[] liveRootDens = new float[LiveRootPoints];
         private int liveRootCount;
         private float liveRootDensity = 1f;
 
@@ -475,15 +545,15 @@ namespace RaymarchedPlumeTrails
                 if (!puffs[i].isGround) { burn = puffs[i].burnId; break; }
             }
 
-            AddFrozenPuff(liveTipPos, liveTipRadius, burn);
+            AddFrozenPuff(liveTipPos, liveTipRadius, burn, liveRootDensity);
             for (int i = 0; i < liveRootCount; i++)
-                AddFrozenPuff(liveRootPos[i], liveRootRadius[i], burn);
+                AddFrozenPuff(liveRootPos[i], liveRootRadius[i], burn, liveRootDens[i]);
 
             hasLiveTip = false;
             liveRootCount = 0;
         }
 
-        private void AddFrozenPuff(Vector3 worldPos, float radius, int burnId)
+        private void AddFrozenPuff(Vector3 worldPos, float radius, int burnId, float density)
         {
             puffs.Add(new Puff
             {
@@ -494,11 +564,17 @@ namespace RaymarchedPlumeTrails
                 // frozen puff at exactly the radius the live tip had.
                 sizeMultiplier = radius / Mathf.Max(startSize, 0.01f),
                 expansion = 1f,
-                emitDensity = liveRootDensity,
+                emitDensity = density,
                 burnId = burnId,
                 spawnIndex = nextSpawnIndex++
             });
         }
+
+        // Nozzle and the live tip should never be far apart - the tip is spawned within
+        // SpawnOffset (~15m default) of the nozzle every tick. Bound generously above that
+        // so real high-standoff configs (umbrella retro burns, big clusters) are not
+        // clipped, but a runaway gap is caught before it draws anything.
+        private const float MaxSaneRootLen = 200f;
 
         public void SetLiveRoot(Vector3 nozzle, Vector3 axis, float nozzleRadius, float density)
         {
@@ -507,6 +583,24 @@ namespace RaymarchedPlumeTrails
             if (!hasLiveTip || nozzleRadius <= 0f) return;
             float len = Vector3.Distance(nozzle, liveTipPos);
             if (len < 1.5f) return;
+
+            // Sanity guard (28 IX fix). Without it, nozzle and tip going out of sync for
+            // even one frame - the live tip stale while the nozzle position jumps, e.g.
+            // from engine-group membership changing under it - draws a hugely stretched
+            // 4-point Bezier: a near-zero-width needle for almost its whole length, capped
+            // by the tip's full radius at the very end. Reported 28 IX as a "balloon on a
+            // string" / floating sphere disconnected from the trail. Skipping the root for
+            // that one bad frame is far less jarring than drawing it.
+            if (len > MaxSaneRootLen)
+            {
+                Debug.LogWarning(string.Format(
+                    "[PlumeTrails] instance {0}: SetLiveRoot nozzle-to-tip distance {1:F0}m exceeds "
+                    + "the {2:F0}m sane bound - skipping the root this frame. nozzle={3} tip={4} "
+                    + "tipRadius={5:F1}. If this repeats, the nozzle and live tip positions are out "
+                    + "of sync (stale tip vs a jumped engine-group centroid).",
+                    instanceId, len, MaxSaneRootLen, nozzle, liveTipPos, liveTipRadius));
+                return;
+            }
 
             Vector3 control = nozzle + axis * (len * 0.55f);
             // tip -> nozzle, matching the spine's oldest-to-newest order
@@ -517,6 +611,9 @@ namespace RaymarchedPlumeTrails
                 liveRootPos[i] = u * u * nozzle + 2f * u * t * control + t * t * liveTipPos;
                 float grow = t * t * (3f - 2f * t);               // smoothstep: no needle at the nozzle
                 liveRootRadius[i] = Mathf.Lerp(nozzleRadius, liveTipRadius, grow);
+                // Smoke does not start AT the nozzle: it fades in along the root, so the visible smoke begins
+                // roughly where the flame ends (this is what the Spawn offset slider moves).
+                liveRootDens[i] = liveRootDensity * Mathf.Lerp(1f, t * t, Mathf.Clamp01(SmokeTuning.SrbRootFade));
             }
             liveRootCount = LiveRootPoints;
         }
@@ -528,10 +625,32 @@ namespace RaymarchedPlumeTrails
         // deflector for many seconds.
         //
         // Velocity is purely horizontal - the point is that it spreads, not lifts.
-        public void AddGroundPuff(Vector3 impactPos, Vector3 up, float outwardSpeed, float sizeScale)
+        //
+        // rayId >= 0 switches from a single random direction per puff to a FIXED direction
+        // picked deterministically from rayId/rayCount/up - the same call every tick then
+        // keeps extending the SAME line instead of scattering a new random heading each
+        // time. That is what makes a "jet stream" look possible at all: a continuous
+        // streak is puffs from one ray, spawned close together in time, chained by
+        // BuildActiveOrderedList into one capsule strip. Random-per-puff (rayId -1, the
+        // old pad-deflector behaviour) can only ever read as a diffuse cloud, because nothing
+        // connects any two puffs into the same line for the spine to trace.
+        public void AddGroundPuff(Vector3 impactPos, Vector3 up, float outwardSpeed, float sizeScale,
+            float emitDensity = 1f, int rayId = -1, int rayCount = 8)
         {
             Vector3 dir;
-            if (padAxisValid)
+            if (rayId >= 0 && rayCount > 0)
+            {
+                float angle = (360f / rayCount) * rayId * Mathf.Deg2Rad;
+                // A fixed reference can align with `up` (straight-down engine, near the
+                // poles of this construction) and degenerate; picking whichever world axis
+                // is LEAST parallel to `up` keeps the basis well-conditioned everywhere.
+                Vector3 reference = Mathf.Abs(Vector3.Dot(up, Vector3.forward)) < 0.9f
+                    ? Vector3.forward : Vector3.right;
+                Vector3 tangent = Vector3.ProjectOnPlane(reference, up).normalized;
+                Vector3 bitangent = Vector3.Cross(up, tangent);
+                dir = tangent * Mathf.Cos(angle) + bitangent * Mathf.Sin(angle);
+            }
+            else if (padAxisValid)
             {
                 // exhaust hitting a deflector splits either way from one point
                 dir = padOutflowAxis * (Random.value < 0.5f ? -1f : 1f);
@@ -550,11 +669,17 @@ namespace RaymarchedPlumeTrails
                 age = 0f,
                 sizeMultiplier = sizeScale,
                 expansion = 1f,
-                // Set explicitly: Puff is a struct, so a field left out here defaults to 0
-                // and the ground cloud would render with no density at all.
-                emitDensity = 1f,
+                // Parametrised (28 IX): the landing splash wants a thin, fast-moving skirt
+                // - real ground-effect gas is nowhere near as optically thick as the launch
+                // column, it's just moving fast and low. Defaults to 1 so the original
+                // pad-deflector caller (groundCloudEnabled, off by default) is unaffected.
+                emitDensity = emitDensity,
+                steam = steamFrac,
                 bounced = true,  // already on the ground; no impingement impulse wanted
-                isGround = true
+                isGround = true,
+                groundRayId = rayId,
+                rayDir = dir,
+                groundTick = rayId >= 0 && rayCount > 0 ? groundSeqCounter++ / rayCount : 0
             };
             puffs.Add(p);
         }
@@ -641,6 +766,42 @@ namespace RaymarchedPlumeTrails
             CommitLiveTip();
         }
 
+        // Growth timing is a live slider too; existing puffs pick it up on their next SizeForPuff.
+        // Engine flame as a light source for the smoke. Strength already carries throttle and nozzle size.
+        private Vector3 flamePos;
+        private float flameStrength;
+        private float flameRange = 25f;
+        private Color flameCol = new Color(1f, 0.52f, 0.16f);
+        public void SetFlameColor(Color c) { flameCol = c; }
+        public void SetFlameLight(Vector3 worldPos, float strength, float range)
+        {
+            flamePos = worldPos;
+            flameStrength = strength;
+            flameRange = range;
+        }
+
+        public void SetGrowth(float newSharpness, float newTime)
+        {
+            growthSharpness = newSharpness;
+            growthTime = newTime;
+        }
+
+        // Share of the exhaust that is water vapour (liquid engines) for puffs and the live tip born from now on.
+        private float steamFrac;
+        private float steamWater = 0.12f;
+        private float puffScale = 1f, puffVisDil = 0f;
+        public void SetSteam(float s, float waterFrac, float visibleDilution = 0f, float radiusScale = 1f)
+        {
+            steamFrac = Mathf.Clamp01(s); steamWater = waterFrac;
+            puffVisDil = visibleDilution; puffScale = Mathf.Max(radiusScale, 0.05f);
+        }
+
+        // density (0..1.4) and steam level packed into the spine w (see SpinePointDensity in the shader)
+        private static float EncodeDensity(float d, float steam, float heat = 0f)
+        {
+            return Mathf.Clamp(d, 0f, 1.4f) + 2f * Mathf.RoundToInt(Mathf.Clamp01(steam) * 7f) + 16f * Mathf.RoundToInt(Mathf.Clamp01(heat) * 7f);
+        }
+
         public void SetSizes(float newStartSize, float newMaxSize)
         {
             startSize = newStartSize;
@@ -658,17 +819,272 @@ namespace RaymarchedPlumeTrails
                 sizeMultiplier = Random.Range(0.9f, 1.1f) * ColumnWander(nextSpawnIndex) * sizeScale,
                 expansion = expansion,
                 emitDensity = Mathf.Clamp01(emitDensity),
+                steam = steamFrac,
                 burnId = burnId,
                 spawnIndex = nextSpawnIndex++
             });
+        }
+
+        // ---------------- REAL PHYSICS puffs ----------------
+        private int physRayBudget;
+        private float physLogTime = -999f;
+        public float LastPhysR0;
+        public float LastPhysR0Raw;
+        public float LastPhysD;
+
+        // Per-tick cost counters, printed by the controller's tick log (and reset there).
+        public static int PerfSteps, PerfPqs, PerfRays;
+        public static double PerfTickMs;
+
+        // The atmosphere only depends on altitude, and a body's GetPressure / GetTemperature are not free (mods
+        // that patch the atmosphere make them dearer still), while hundreds of puffs ask every tick. Cached on a
+        // 4 m altitude grid and flushed twice a second.
+        private readonly Dictionary<int, Vector3> ambCache = new Dictionary<int, Vector3>();
+        private float ambCacheFlush;
+
+        private PuffPhysics.Ambient SampleAmbient(Vector3 worldPos, double alt, Vector3 up, float height)
+        {
+            PuffPhysics.Ambient a = new PuffPhysics.Ambient();
+            if (Time.time - ambCacheFlush > 0.5f) { ambCache.Clear(); ambCacheFlush = Time.time; }
+            int key = (int)System.Math.Floor(alt * 0.25);
+            Vector3 pt;
+            if (!ambCache.TryGetValue(key, out pt))
+            {
+                double aq = key * 4.0 + 2.0;
+                double pKpa = body.atmosphere ? body.GetPressure(aq) : 0.0;
+                double tK = body.atmosphere ? body.GetTemperature(aq) : 3.0;
+                pt = new Vector3(Mathf.Max((float)(pKpa * 1000.0), 0.5f), Mathf.Max((float)tK, 3f), 0f);
+                ambCache[key] = pt;
+            }
+            a.P = pt.x;
+            a.T = pt.y;
+            a.rho = Mathf.Max(a.P / (PuffPhysics.RAir * a.T), 1e-6f);
+            // surface wind, logarithmic profile, horizontal, along the configured drift direction
+            Vector3 wd = Vector3.ProjectOnPlane(windDrift, up);
+            if (wd.sqrMagnitude > 1e-6f && SmokeTuning.WindSpeed > 0.001f)
+                a.wind = wd.normalized * PuffPhysics.WindAt(SmokeTuning.WindSpeed, height, Mathf.Max(SmokeTuning.PhysWindRoughness, 0.001f));
+            return a;
+        }
+
+        private static PuffPhysics.Params PhysParams()
+        {
+            return new PuffPhysics.Params
+            {
+                alphaJet = SmokeTuning.PhysAlphaJet, alphaThermal = SmokeTuning.PhysAlphaThermal,
+                ambientTurb = SmokeTuning.PhysAmbientTurb, addedMass = SmokeTuning.PhysAddedMass,
+                groundRestitution = SmokeTuning.PhysRestitution, wallJetFraction = SmokeTuning.PhysWallJet,
+                groundFriction = SmokeTuning.PhysGroundFriction
+            };
+        }
+
+        // Releases a parcel of exhaust at the point where the jet has become smoke. u0 = velocity of the exhaust at
+        // the nozzle relative to the AIR (vessel velocity + ve along the exhaust). The jet entrains air on the way
+        // to xs (Ricou & Spalding), which dilutes and cools it and, by conservation of momentum, slows it by the
+        // same factor.
+        public void AddPhysicalJetPuff(Vector3 worldPos, Vector3 u0, float ve, float xs, float mdot0, float sliceDt, int burnId, float emitDensity)
+        {
+            double alt = body.GetAltitude(worldPos);
+            Vector3 up = (worldPos - body.position).normalized;
+            PuffPhysics.Ambient a = SampleAmbient(worldPos, alt, up, Mathf.Max((float)alt, 1f));
+            float Te = SmokeTuning.PhysExhaustTemp;
+            float rhoE = a.P / (PuffPhysics.RExhaust * Te);
+            // Equivalent nozzle exit diameter from mass continuity, mdot = rho_e * (pi d^2 / 4) * ve. Derived from the
+            // thrust and Isp KSP reports, so it is consistent with the engine whatever size its part model has
+            // (the part's visual width is not the nozzle exit).
+            float dEff = Mathf.Sqrt(4f * Mathf.Max(mdot0, 1f) / (Mathf.PI * rhoE * Mathf.Max(ve, 100f)));
+            LastPhysD = dEff;
+            float D0 = PuffPhysics.JetDilution(xs, dEff, a.rho, rhoE, SmokeTuning.PhysMaxDilution);
+            float T0 = (Te + (D0 - 1f) * a.T) / D0;
+            float M0 = Mathf.Max(D0 * mdot0 * sliceDt, 1f);
+            float Me = M0 / D0;
+            float rho0 = PuffPhysics.Density(a.P, T0, Me, M0);
+            float r0 = PuffPhysics.RadiusFromMass(M0, rho0);
+            LastPhysR0 = r0 * SmokeTuning.PhysRadiusScale * puffScale;
+            LastPhysR0Raw = r0;
+
+            Vector3 jitter = Random.insideUnitSphere * (r0 * 0.15f);
+            puffs.Add(new Puff
+            {
+                localPos = WorldToLocal(worldPos + jitter),
+                velocity = u0 / D0,
+                age = 0f,
+                sizeMultiplier = 1f,
+                expansion = 1f,
+                emitDensity = emitDensity,
+                steam = steamFrac,
+                fw = steamWater,
+                pVis = 1f,
+                pScale = puffScale,
+                pVisDil = puffVisDil,
+                burnId = burnId,
+                spawnIndex = nextSpawnIndex++,
+                physical = true,
+                pM = M0, pMe = Me, pT = T0, pM0 = M0, pR = r0, pR0 = r0
+            });
+
+            if (Time.time - physLogTime > 2f)
+            {
+                physLogTime = Time.time;
+                Debug.Log(string.Format(
+                    "[PlumeTrails] phys release: xs={0:F0}m d={1:F1}m dilution={2:F1} T0={3:F0}K v0={4:F0}m/s M0={5:F0}kg r0={6:F1}m rhoAmb={7:F3} mdot0={8:F0}kg/s",
+                    xs, dEff, D0, T0, (u0 / D0).magnitude, M0, r0, a.rho, mdot0));
+            }
+        }
+
+        // WALL JET BRANCHES. A parcel that has hit the ground, the pad or a trench wall is no longer part of the
+        // rising column: it is a ground-hugging flow going OUT in one direction. Left in the single time-ordered
+        // chain it made the chain zigzag between the two sides of the pad (the "noodles"). It now moves into the
+        // ground-ray machinery instead: one chain per outflow sector (two when a flame trench was surveyed - one
+        // each way along it - otherwise WallSectors around the impact), sorted outward by age. Physics keeps
+        // running on it (entrainment, buoyancy, friction), so each branch widens and lifts into a side cloud.
+        // Glow of a hot ground-hugging parcel (the flame turned by the deflector): by its own temperature, from about
+        // 700 K (dull ember) up to 2200 K (white-yellow). Cools as it entrains air, so it fades into the steam.
+        private static float WallHeat(Puff p)
+        {
+            if (!p.physical || !p.isGround || SmokeTuning.DeflectorFire <= 0f) return 0f;
+            return Mathf.Clamp01((p.pT - 700f) / 1500f) * Mathf.Min(SmokeTuning.DeflectorFire, 1.5f);
+        }
+
+        private const int WallSectors = 8;
+        private void MarkWallJet(ref Puff p, Vector3 up, Vector3 outward)
+        {
+            if (p.isGround || !SmokeTuning.PhysWallChains) return;
+            int sector;
+            if (padAxisValid)
+            {
+                sector = Vector3.Dot(outward, padOutflowAxis) >= 0f ? 0 : 1;
+            }
+            else
+            {
+                Vector3 reference = Mathf.Abs(Vector3.Dot(up, Vector3.forward)) < 0.9f ? Vector3.forward : Vector3.right;
+                Vector3 tangent = Vector3.ProjectOnPlane(reference, up).normalized;
+                Vector3 bitangent = Vector3.Cross(up, tangent);
+                float ang = Mathf.Atan2(Vector3.Dot(outward, bitangent), Vector3.Dot(outward, tangent));
+                sector = Mathf.Clamp(Mathf.FloorToInt((ang + Mathf.PI) / (2f * Mathf.PI) * WallSectors), 0, WallSectors - 1);
+            }
+            // WATER DELUGE. A flame deflector is flooded with water to kill the sound; the flow turned along it is mostly
+            // steam. The parcel takes on water here (condensation then decides how much of it is visible as a cloud),
+            // and while it is still hot it glows (see WallHeat).
+            if (SmokeTuning.PadWater && (padAxisValid || SmokeTuning.PadWaterAlways))
+            {
+                p.steam = 1f;
+                p.fw = Mathf.Max(p.fw, SmokeTuning.PadWaterFrac);
+            }
+            p.isGround = true;
+            p.bounced = true;
+            p.groundRayId = sector;
+            p.rayDir = outward;
+            p.groundTick = groundSeqCounter++ / WallSectors;
+        }
+
+        // One tick of a physical puff. Returns the new world position.
+        private Vector3 StepPhysicalPuff(ref Puff p, Vector3 worldPos, Vector3 up, float dt)
+        {
+            double alt = body.GetAltitude(worldPos);
+            float g = (float)(body.gravParameter / ((body.Radius + alt) * (body.Radius + alt)));
+            PuffPhysics.State s = new PuffPhysics.State
+            {
+                vel = p.velocity, M = p.pM, Me = p.pMe, T = p.pT, M0 = p.pM0, radius = p.pR
+            };
+            PuffPhysics.Params prm = PhysParams();
+
+            // ground height, only worth a terrain query near the surface
+            double groundAlt = double.NegativeInfinity;
+            if (alt < 600.0 + 3.0 * s.radius && body.pqsController != null)
+            {
+                // A terrain query is the dearest call in this loop, and the ground under a drifting puff changes
+                // slowly: re-sample every ~0.25 s (staggered per puff so they do not all land on one tick).
+                if (p.gTime <= 0f || Time.time - p.gTime > 0.25f + (p.spawnIndex % 5) * 0.04f)
+                {
+                    Vector3d radialDir = ((Vector3d)worldPos - body.position).normalized;
+                    double ga = body.pqsController.GetSurfaceHeight(radialDir) - body.Radius;
+                    if (body.ocean && ga < 0.0) ga = 0.0;
+                    p.gAlt = (float)ga;
+                    p.gTime = Time.time;
+                    PerfPqs++;
+                }
+                groundAlt = p.gAlt;
+            }
+            float height = groundAlt > double.NegativeInfinity ? (float)(alt - groundAlt) : (float)alt;
+
+            int sub = Mathf.Clamp(Mathf.CeilToInt(dt / 0.04f), 1, 8);
+            float h = dt / sub;
+            Vector3 pos = worldPos;
+            PuffPhysics.Ambient amb = default(PuffPhysics.Ambient);
+            for (int k = 0; k < sub; k++)
+            {
+                amb = SampleAmbient(pos, alt, up, Mathf.Max(height, 1f));
+                PuffPhysics.Step(ref s, h, amb, up, g, prm);
+                pos += s.vel * h;
+            }
+            PerfSteps++;
+
+            // Scene geometry first: the pad, a flame trench, buildings. The surface normal decides where the
+            // flow goes (a slanted deflector turns it along the slope, walls confine it).
+            bool hitScene = false;
+            if (SmokeTuning.PhysCollide && physRayBudget > 0 && groundAlt > double.NegativeInfinity && height < 12f + 1.3f * s.radius)
+            {
+                Vector3 move = pos - worldPos;
+                float dist = move.magnitude;
+                if (dist > 0.05f)
+                {
+                    physRayBudget--;
+                    PerfRays++;
+                    RaycastHit hit;
+                    if (Physics.Raycast(worldPos, move / dist, out hit, dist + 0.5f * s.radius, GetSceneryCollisionMask(), QueryTriggerInteraction.Ignore))
+                    {
+                        Vector3 n = hit.normal;
+                        Vector3 tang = Vector3.ProjectOnPlane(s.vel, n);
+                        Vector3 outward = tang.sqrMagnitude > 1f
+                            ? tang.normalized
+                            : Vector3.ProjectOnPlane(hit.point - padCentre, n).normalized;
+                        if (outward.sqrMagnitude < 0.5f) outward = Vector3.ProjectOnPlane(Random.onUnitSphere, n).normalized;
+                        PuffPhysics.Collide(ref s, n, outward, dt, prm);
+                        pos = hit.point + n * Mathf.Min(0.6f * s.radius, 2f);
+                        hitScene = true;
+                        MarkWallJet(ref p, up, outward);
+                    }
+                }
+            }
+
+            // terrain / sea level
+            if (!hitScene && groundAlt > double.NegativeInfinity)
+            {
+                float hNow = (float)(body.GetAltitude(pos) - groundAlt);
+                Vector3 outward = Vector3.ProjectOnPlane(pos - padCentre, up);
+                if (outward.sqrMagnitude < 1f) outward = Vector3.ProjectOnPlane(s.vel, up);
+                if (outward.sqrMagnitude < 1e-4f) outward = Vector3.ProjectOnPlane(Random.onUnitSphere, up);
+                outward.Normalize();
+                float nh = PuffPhysics.Ground(ref s, hNow, up, outward, dt, prm);
+                if (nh > hNow) { pos += up * (nh - hNow); MarkWallJet(ref p, up, outward); }
+            }
+
+            p.velocity = s.vel;
+            p.pM = s.M; p.pT = s.T; p.pR = s.radius;
+            if (p.steam > 0.01f)
+            {
+                // Is the water in this parcel condensed (a visible cloud), or still vapour / evaporated again?
+                float cond = PuffPhysics.CondensedFraction(amb, s, p.fw, SmokeTuning.PhysHumidity, (float)alt);
+                p.pVis = Mathf.Lerp(SmokeTuning.SteamMinVisibility, 1f, Mathf.Clamp01(cond / Mathf.Max(SmokeTuning.SteamCondRef, 1e-4f)));
+            }
+            return pos;
         }
 
         public void Tick(float dt)
         {
             if (dt <= 0f) return;
             if (body == null) return;
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            tickCounter++;
+            TickInner(dt);
+            PerfTickMs += (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        }
+
+        private void TickInner(float dt)
+        {
 
             PublishNoiseOffset();
+            physRayBudget = Mathf.RoundToInt(SmokeTuning.PhysCollideBudget);
 
             for (int i = puffs.Count - 1; i >= 0; i--)
             {
@@ -684,6 +1100,24 @@ namespace RaymarchedPlumeTrails
 
                 Vector3 worldPos = LocalToWorld(p.localPos);
                 Vector3 up = (worldPos - body.position).normalized;
+
+                if (p.physical)
+                {
+                    // Old puffs move slowly and are far from the ground: they are stepped every 2nd / 4th tick with the
+                    // matching longer dt (about 1100 puffs were being stepped every tick = 5 ms of every 7 ms tick).
+                    int stride = p.age > 30f ? 4 : p.age > 8f ? 2 : 1;
+                    if (stride > 1 && ((p.spawnIndex + tickCounter) % stride) != 0) { puffs[i] = p; continue; }
+                    Vector3 newPos = StepPhysicalPuff(ref p, worldPos, up, dt * stride);
+                    if (!IsFinite(newPos) || !IsFinite(p.velocity) || float.IsNaN(p.pM) || float.IsNaN(p.pR))
+                    {
+                        p.markedForRemoval = true;
+                        puffs[i] = p;
+                        continue;
+                    }
+                    p.localPos = WorldToLocal(newPos);
+                    puffs[i] = p;
+                    continue;
+                }
 
                 // Flattened against local up. windDrift is world-space, and world axes are
                 // not horizontal on a globe, so it carries a stray vertical component and
@@ -702,12 +1136,50 @@ namespace RaymarchedPlumeTrails
                 // spreading after the initial throw has bled off.
                 if (p.isGround)
                 {
-                    Vector3 outward = Vector3.ProjectOnPlane(worldPos - padCentre, up);
-                    if (outward.sqrMagnitude > 1f) target += outward.normalized * GroundCreepSpeed;
+                    if (p.groundRayId >= 0)
+                    {
+                        // Landing splash: creep along the puff's OWN ray, not away from the
+                        // launch pad. Measured from padCentre, every puff of a lander sitting
+                        // anywhere else crept the same way and the whole cloud sheared into
+                        // parallel streaks flying off to one side (reported). Scaled by this
+                        // group's size so a micro engine's splash does not drift like a
+                        // booster's.
+                        Vector3 rayDirFlat = Vector3.ProjectOnPlane(p.rayDir, up);
+                        if (rayDirFlat.sqrMagnitude > 1e-4f)
+                        {
+                            float creepScale = Mathf.Clamp01(maxSize / Mathf.Max(SmokeTuning.MaxPuffSize, 1f));
+                            target += rayDirFlat.normalized * GroundCreepSpeed * creepScale;
+                        }
+                    }
+                    else
+                    {
+                        Vector3 outward = Vector3.ProjectOnPlane(worldPos - padCentre, up);
+                        if (outward.sqrMagnitude > 1f) target += outward.normalized * GroundCreepSpeed;
+                    }
                 }
                 float convergeRate = p.isGround ? GroundVelocityConvergeRate : VelocityConvergeRate;
                 p.velocity = Vector3.Lerp(p.velocity, target, dt * convergeRate);
                 Vector3 newWorldPos = worldPos + p.velocity * dt;
+
+                // Splash puffs hug the ground. The bounce below only ever pushes a puff UP
+                // out of the terrain, so over falling ground a horizontally-thrown puff kept
+                // its height and hung in the air ("some of them fly"). Pull it back down to
+                // the surface first; the bounce still lifts it over buildings afterwards.
+                // Sea level is the floor over water, not the seabed.
+                if (p.isGround && p.groundRayId >= 0 && body.pqsController != null)
+                {
+                    Vector3d radialDir = ((Vector3d)newWorldPos - body.position).normalized;
+                    double groundAlt = body.pqsController.GetSurfaceHeight(radialDir) - body.Radius;
+                    if (body.ocean && groundAlt < 0.0) groundAlt = 0.0;
+                    double altNow = body.GetAltitude(newWorldPos);
+                    // Loft, as in KerbalFX: the puff floats up as it billows, roughly half its own
+                    // radius above the surface, instead of being pinned flat to the ground.
+                    double hugHeight = 1.0 + 0.5 * SizeForPuff(p);
+                    if (altNow > groundAlt + hugHeight)
+                    {
+                        newWorldPos -= up * (float)(altNow - groundAlt - hugHeight);
+                    }
+                }
 
                 TryBounceOffGround(ref newWorldPos, ref p.velocity, up, ref p.bounced, p.age, dt);
 
@@ -1195,6 +1667,9 @@ namespace RaymarchedPlumeTrails
         // at once. See JellyfishThinningPower.
         private float DensityForPuff(Puff p)
         {
+            if (p.physical)
+                return p.emitDensity * Mathf.Pow(Mathf.Clamp(p.pM0 / Mathf.Max(DilutedMass(p), 1e-3f), 1e-4f, 1f), SmokeTuning.PhysDensityExp)
+                    * (p.steam > 0.01f ? Mathf.Lerp(1f, p.pVis, p.steam) : 1f);
             if (SmokeTuning.SrbOnly && !p.isGround)
             {
                 // Mass conservation along a line. The smoke carried per metre of trail is
@@ -1221,8 +1696,42 @@ namespace RaymarchedPlumeTrails
             return emitted / Mathf.Pow(current, SmokeTuning.JellyfishThinningPower);
         }
 
+        // VISIBLE part of a physical parcel. A parcel keeps entraining air, but only the core where the exhaust is still
+        // concentrated reads as smoke: it holds about (visible dilution x exhaust mass), so past that dilution the visible
+        // radius grows no more (it would hold constant mass) and the density stays put, instead of the whole parcel
+        // ballooning into a faint fat cloud.
+        private static float DilutionLimit(Puff p) { return p.pVisDil * SmokeTuning.PhysVisibleDilution; }
+
+        private static float DilutedMass(Puff p) { return p.pM; }   // density keeps thinning with the full dilution
+
+        private static float VisibleRadiusFactor(Puff p)
+        {
+            float lim = DilutionLimit(p);
+            if (lim <= 1f || p.pMe <= 0f) return 1f;
+            float d = p.pM / p.pMe;
+            // Past the limit the visible radius almost stops growing (a constant-mass core would stop outright; real
+            // plumes keep widening, only slowly) while the density keeps falling with the dilution.
+            return d <= lim ? 1f : Mathf.Pow(lim / d, 0.26f);
+        }
+
+        // GROWTH CAP. A parcel's radius follows its entrained mass, so from the nozzle (a few metres) to old smoke (tens of
+        // metres) it grows ten-fold, and the whole trail reads as a long needle that is thin at the engine and fat far away -
+        // "stretched". A visible plume widens by a few times, not ten. The ratio radius / release radius is limited softly
+        // (asymptote = PhysMaxGrowth, the first part of the growth untouched), so the column keeps a similar width along its
+        // length. 0 = off.
+        private static float GrowthCapFactor(Puff p)
+        {
+            float g = SmokeTuning.PhysMaxGrowth;
+            if (g <= 1.01f || p.pR0 <= 0f) return 1f;
+            float x = p.pR / p.pR0;
+            if (x <= 1f) return 1f;
+            float capped = 1f + (g - 1f) * (1f - Mathf.Exp(-(x - 1f) / (g - 1f)));
+            return capped / x;
+        }
+
         private float SizeForPuff(Puff p)
         {
+            if (p.physical) return Mathf.Max(p.pR * SmokeTuning.PhysRadiusScale * p.pScale * VisibleRadiusFactor(p) * GrowthCapFactor(p), 0.05f);
             // Growth is timed independently of lifeTime. Tying the two together means a
             // puff only reaches full size at the end of its life, by which point the
             // rocket is kilometres away and the visible trail is all young thin puffs.
@@ -1247,7 +1756,20 @@ namespace RaymarchedPlumeTrails
                 // SrbSpreadRate scales how fast it gets there.
                 float k = Mathf.Max((maxSize * maxSize - r0 * r0) * (T + t0) / (T * T), 0f)
                         * SmokeTuning.SrbSpreadRate;
-                grown = Mathf.Sqrt(r0 * r0 + k * p.age * p.age / (p.age + t0));
+                if (p.age <= T)
+                {
+                    grown = Mathf.Sqrt(r0 * r0 + k * p.age * p.age / (p.age + t0));
+                }
+                else
+                {
+                    // Past the size limit the puff should ease off and creep, not keep
+                    // spreading at the rate that got it there: the unbounded sqrt(t) tail
+                    // took a ~34m puff to >100m over its life, and a puff that big lost all
+                    // its structure and read as a blob (28 IX report). Same curve up to T,
+                    // then only a fraction of the diffusion rate.
+                    float rT2 = r0 * r0 + k * T * T / (T + t0);
+                    grown = Mathf.Sqrt(rT2 + k * SmokeTuning.SrbPostLimitGrowth * (p.age - T));
+                }
                 return grown * p.sizeMultiplier * EasedExpansion(p);
             }
 
@@ -1260,7 +1782,11 @@ namespace RaymarchedPlumeTrails
             // constant-width tube. Slow and linear, so young smoke still billows fastest.
             if (p.age > growthTime)
             {
-                grown += (p.age - growthTime) * ContinuedGrowthRate * (p.isGround ? GroundGrowthBoost : 1f);
+                // Scaled by this group's size vs the reference: the rate is in metres per
+                // second, so left absolute a tiny lander's splash still ballooned to
+                // hundreds of metres (reported: a huge dome from a micro engine).
+                float sizeScale = maxSize / Mathf.Max(SmokeTuning.MaxPuffSize, 1f);
+                grown += (p.age - growthTime) * ContinuedGrowthRate * (p.isGround ? GroundGrowthBoost : 1f) * sizeScale;
             }
             // Expansion gets its OWN, much shorter time constant than growth. Riding the
             // growth easing put full width tens of kilometres downrange, because at orbital
@@ -1311,14 +1837,44 @@ namespace RaymarchedPlumeTrails
         private int nextSpawnIndex;
         private bool needTrailSeparator;
 
+        private int groundSeqCounter;
+        private int tickCounter;
+        private readonly List<GroundSortEntry> wallScratch = new List<GroundSortEntry>();
+        private readonly Dictionary<int, Vector3> wallLast = new Dictionary<int, Vector3>();
+        private readonly Dictionary<int, float> wallLastR = new Dictionary<int, float>();
+        private int committedGroundStride = 1;
+
         private struct GroundSortEntry
         {
             public Vector3 pos;
             public float radius;
             public float density;
             public float key;
+            public int rayId;
         }
         private readonly List<GroundSortEntry> groundScratch = new List<GroundSortEntry>();
+
+        private static int AgeBand(float age, float bandT)
+        {
+            // floor(log2(1 + age / bandT)) without a Log call (this runs per puff, several times per frame)
+            float r = 1f + Mathf.Max(age, 0f) / bandT;
+            int b = 1;
+            while (r >= 2f && b < 4096) { r *= 0.5f; b <<= 1; }
+            return b;
+        }
+
+        private int BandedCount(int baseStride, float bandT)
+        {
+            int c = 0;
+            for (int i = 0; i < puffs.Count; i++)
+            {
+                Puff q = puffs[i];
+                if (q.isGround || q.markedForRemoval) continue;
+                int st = baseStride * AgeBand(q.age, bandT);
+                if (st <= 1 || (q.spawnIndex % st) == 0) c++;
+            }
+            return c;
+        }
 
         private void BuildActiveOrderedList()
         {
@@ -1340,13 +1896,80 @@ namespace RaymarchedPlumeTrails
             // spawn order interleaves pad-level puffs with ones high above and the chain
             // zigzags between them.
             groundScratch.Clear();
+            wallLast.Clear(); wallLastR.Clear();
+
+            // Stable thinning for ray puffs. The even stride used for the legacy ground cloud
+            // re-picks EVERY point whenever the stride changes, and with a splash adding
+            // dozens of puffs a second it changes constantly - half the chain swapped per
+            // frame, which is the flicker and the holes. Whole emission ticks are kept by
+            // groundTick % stride == 0 with a power-of-two stride, so the kept set only ever
+            // shrinks (a strict subset), and the stride ratchets up, never down.
+            int rayPuffCount = 0;
+            for (int i = 0; i < puffs.Count; i++)
+            {
+                if (puffs[i].isGround && puffs[i].groundRayId >= 0) rayPuffCount++;
+            }
+            int wantedGroundStride = 1;
+            while (rayPuffCount / wantedGroundStride > MaxGroundSpinePoints) wantedGroundStride *= 2;
+            if (rayPuffCount == 0) committedGroundStride = 1;
+            else if (wantedGroundStride > committedGroundStride) committedGroundStride = wantedGroundStride;
+
             for (int i = 0; i < puffs.Count; i++)
             {
                 if (!puffs[i].isGround) continue;
+                if (puffs[i].groundRayId >= 0 && committedGroundStride > 1
+                    && (puffs[i].groundTick % committedGroundStride) != 0) continue;
                 Vector3 wp = LocalToWorld(puffs[i].localPos);
                 if (AlphaForAge(puffs[i].age) * AlphaForAltitude(wp) <= 0.01f) continue;
-                float key = padAxisValid ? Vector3.Dot(wp - padCentre, padOutflowAxis) : wp.x;
-                groundScratch.Add(new GroundSortEntry { pos = wp, radius = SizeForPuff(puffs[i]), density = DensityForPuff(puffs[i]), key = key });
+                // side clouds: keep a puff only if it is clear of the last kept one in its branch
+                if (puffs[i].physical && puffs[i].groundRayId >= 0 && SmokeTuning.WallSpacing > 0.01f)
+                {
+                    float rr = SizeForPuff(puffs[i]);
+                    Vector3 lastPos; float lastR;
+                    if (wallLast.TryGetValue(puffs[i].groundRayId, out lastPos) && wallLastR.TryGetValue(puffs[i].groundRayId, out lastR)
+                        && Vector3.Distance(wp, lastPos) < SmokeTuning.WallSpacing * (rr + lastR)) continue;
+                    wallLast[puffs[i].groundRayId] = wp; wallLastR[puffs[i].groundRayId] = rr;
+                }
+                // Ray puffs sort by (ray, age) so each ray's own puffs land consecutively
+                // and in travel order, oldest (furthest out) last within the group - see
+                // AddGroundPuff. Non-ray puffs (rayId -1, the old pad-deflector cloud) keep
+                // the original spatial sort, unaffected.
+                float key = puffs[i].groundRayId >= 0
+                    ? puffs[i].groundRayId * 1000000f + puffs[i].age
+                    : (padAxisValid ? Vector3.Dot(wp - padCentre, padOutflowAxis) : wp.x);
+                if (puffs[i].physical && puffs[i].groundRayId >= 0)
+                {
+                    // A ground-hugging flow is a SHEET of billows, not a line: chaining its puffs in time order traced
+                    // each parcel's own flight path and drew it as a looping tube (spaghetti). Each is its own blob.
+                    wallScratch.Add(new GroundSortEntry {
+                        pos = wp, radius = SizeForPuff(puffs[i]), density = EncodeDensity(DensityForPuff(puffs[i]), puffs[i].steam, WallHeat(puffs[i])),
+                        key = puffs[i].spawnIndex, rayId = puffs[i].groundRayId });
+                    continue;
+                }
+                groundScratch.Add(new GroundSortEntry {
+                    pos = wp, radius = SizeForPuff(puffs[i]), density = DensityForPuff(puffs[i]),
+                    key = key, rayId = puffs[i].groundRayId });
+            }
+
+            // isolated blobs: three spine points each (zero-radius separator, then two coincident points of the blob's
+            // radius - a segment with a zero-radius end is skipped by the shader, so nothing connects to anything)
+            if (wallScratch.Count > 0)
+            {
+                int blobStride = 1;
+                int cap = Mathf.Max(8, MaxGroundSpinePoints / 3);
+                while (wallScratch.Count / blobStride > cap && blobStride < 64) blobStride *= 2;
+                for (int b = 0; b < wallScratch.Count; b++)
+                {
+                    GroundSortEntry e = wallScratch[b];
+                    if (blobStride > 1 && ((long)e.key % blobStride) != 0) continue;
+                    float tiny = Mathf.Max(0.03f, e.radius * 0.02f);
+                    activeOrderedPos.Add(e.pos); activeOrderedRadius.Add(0f); activeOrderedDensity.Add(1f);
+                    activeOrderedPos.Add(e.pos); activeOrderedRadius.Add(e.radius); activeOrderedDensity.Add(e.density);
+                    activeOrderedPos.Add(e.pos + Vector3.up * tiny); activeOrderedRadius.Add(e.radius); activeOrderedDensity.Add(e.density);
+                }
+                activeOrderedPos.Add(wallScratch[wallScratch.Count - 1].pos); activeOrderedRadius.Add(0f); activeOrderedDensity.Add(1f);
+                needTrailSeparator = true;
+                wallScratch.Clear();
             }
 
             if (groundScratch.Count > 0)
@@ -1360,11 +1983,48 @@ namespace RaymarchedPlumeTrails
                 // samples the spread rather than clipping one end.
                 int groundStride = Mathf.Max(1,
                     Mathf.CeilToInt(groundScratch.Count / (float)MaxGroundSpinePoints));
+                int lastRayId = int.MinValue;
+                bool haveLastRay = false;
                 for (int i = 0; i < groundScratch.Count; i += groundStride)
                 {
-                    activeOrderedPos.Add(groundScratch[i].pos);
-                    activeOrderedRadius.Add(groundScratch[i].radius);
-                    activeOrderedDensity.Add(groundScratch[i].density);
+                    GroundSortEntry e = groundScratch[i];
+                    // Break between rays, same two-zero-point technique the main trail
+                    // uses between bursts (see the burnId check further down): a single
+                    // ray reads as a "jet stream" only if it never joins the NEXT ray's
+                    // puffs with a capsule ramping across open ground between them - one
+                    // shared spine, several disconnected streaks radiating out of it.
+                    // A ground-hugging flow is drawn as a string of lumps, not one smooth tube: within a branch, puffs
+                    // that are further apart than WallLumpGap x the sum of their radii are not joined.
+                    bool lumpBreak = false;
+                    if (haveLastRay && e.rayId >= 0 && e.rayId == lastRayId && SmokeTuning.WallLumpGap > 0.01f
+                        && activeOrderedPos.Count > 0)
+                    {
+                        float pr = activeOrderedRadius[activeOrderedRadius.Count - 1];
+                        lumpBreak = pr > 0f && Vector3.Distance(e.pos, activeOrderedPos[activeOrderedPos.Count - 1])
+                            > SmokeTuning.WallLumpGap * (pr + e.radius);
+                    }
+                    if (haveLastRay && (lumpBreak || (e.rayId != lastRayId && (e.rayId >= 0 || lastRayId >= 0)))
+                        && activeOrderedPos.Count > 0)
+                    {
+                        Vector3 prevPos = activeOrderedPos[activeOrderedPos.Count - 1];
+                        float prevRadius = activeOrderedRadius[activeOrderedRadius.Count - 1];
+                        float gap = Vector3.Distance(e.pos, prevPos);
+                        if (prevRadius > 0f && gap > 0.01f)
+                        {
+                            Vector3 dir = (e.pos - prevPos) / Mathf.Max(gap, 0.0001f);
+                            activeOrderedPos.Add(prevPos + dir * (prevRadius * 0.5f));
+                            activeOrderedRadius.Add(0f);
+                            activeOrderedDensity.Add(1f);
+                            activeOrderedPos.Add(e.pos - dir * (e.radius * 0.5f));
+                            activeOrderedRadius.Add(0f);
+                            activeOrderedDensity.Add(1f);
+                        }
+                    }
+                    activeOrderedPos.Add(e.pos);
+                    activeOrderedRadius.Add(e.radius);
+                    activeOrderedDensity.Add(e.density);
+                    lastRayId = e.rayId;
+                    haveLastRay = true;
                 }
                 // Closing zero-radius point, with a MATCHING one at the first trail puff
                 // below. One alone is not enough: the capsule from it to the trail still
@@ -1386,9 +2046,54 @@ namespace RaymarchedPlumeTrails
             {
                 if (!puffs[i].isGround && !puffs[i].markedForRemoval) liveTrail++;
             }
-            int trailBudget = Mathf.Max(MaxSpinePoints - activeOrderedPos.Count - 4, 16);
+            // Share of the shared spine buffer this chain gets when clusters are merged. Thinning to
+            // it HERE, by stable spawnIndex, means the merge stage never has to decimate by list
+            // position - that one reselects different points whenever the oldest puff expires and
+            // can drop the newest points (tip + root), which twitched the plume next to the nozzle.
+            int shareBudget = shareBudgetPts > 0 ? shareBudgetPts : MaxSpinePoints;
+            int trailBudget = Mathf.Max(shareBudget - activeOrderedPos.Count - 4, 16);
             int trailStride = 1;
-            while (liveTrail / trailStride > trailBudget) trailStride *= 2;
+            // AGE-BANDED thinning (replaces one global stride): a puff of age t keeps only every
+            // (base * 2^floor(log2(1 + t / bandT)))-th spawn index, so detail is densest at the young end,
+            // where the radius changes fast, and sparser further back. A puff changes band at its own age,
+            // so points leave the spine ONE AT A TIME. The band width bandT is itself CONTINUOUS: under budget
+            // pressure (a second chain starts, e.g. boosters lighting) it is narrowed smoothly, which moves
+            // every band boundary a little, instead of a stride doubling that dropped half the points at once.
+            // bandT = 0 restores the old uniform stride.
+            float bandT = SmokeTuning.SpineBandSeconds;
+            bool banded = bandT > 0.05f;
+            if (banded)
+            {
+                float hi = bandT;
+                float minBand = Mathf.Min(0.15f, bandT);
+                int fullCount = BandedCount(1, hi);
+                lastFullDemand = fullCount + activeOrderedPos.Count + 4;
+                float target;
+                if (fullCount <= trailBudget) target = hi;
+                else if (BandedCount(1, minBand) > trailBudget)
+                {
+                    target = minBand;
+                    while (BandedCount(trailStride, minBand) > trailBudget && trailStride < 1024) trailStride *= 2;
+                }
+                else
+                {
+                    float lo = minBand, up = hi;
+                    for (int it = 0; it < 9; it++)
+                    {
+                        float mid = 0.5f * (lo + up);
+                        if (BandedCount(1, mid) <= trailBudget) lo = mid; else up = mid;
+                    }
+                    target = lo;
+                }
+                // narrowing is immediate (the budget must hold), widening back is slow
+                bandEff = bandEff <= 0f ? target : Mathf.Min(target, bandEff + hi * Mathf.Min(Time.deltaTime, 0.1f) * 0.5f);
+                bandT = bandEff;
+            }
+            else
+            {
+                lastFullDemand = liveTrail + activeOrderedPos.Count + 4;
+                while (liveTrail / trailStride > trailBudget) trailStride *= 2;
+            }
             // RATCHET. Recomputed from scratch the stride can go back DOWN, and near the
             // threshold it oscillates 2<->4 from frame to frame as puffs come and go. Each
             // flip swaps out half the spine points and the whole density field rebuilds -
@@ -1398,14 +2103,20 @@ namespace RaymarchedPlumeTrails
             // Only ever rising costs a little detail late in a flight and buys a spine that
             // is stable by construction.
             if (liveTrail == 0) committedTrailStride = 1;
-            else if (trailStride > committedTrailStride) committedTrailStride = trailStride;
+            else if (trailStride > committedTrailStride)
+            {
+                Debug.Log(string.Format("[PlumeTrails] instance {0}: trail stride {1} -> {2} (live puffs={3}, budget={4}, chains={5})",
+                    instanceId, committedTrailStride, trailStride, liveTrail, trailBudget, clusterChains));
+                committedTrailStride = trailStride;
+            }
             trailStride = committedTrailStride;
 
             for (int i = 0; i < puffs.Count; i++)
             {
                 Puff p = puffs[i];
                 if (p.isGround) continue;   // see Puff.isGround
-                if (trailStride > 1 && (p.spawnIndex % trailStride) != 0) continue;
+                int puffStride = banded ? trailStride * AgeBand(p.age, bandT) : trailStride;
+                if (puffStride > 1 && (p.spawnIndex % puffStride) != 0) continue;
 
                 Vector3 worldPos = LocalToWorld(p.localPos);
                 float alpha = AlphaForAge(p.age) * AlphaForAltitude(worldPos);
@@ -1450,19 +2161,19 @@ namespace RaymarchedPlumeTrails
                 lastEmittedBurnId = p.burnId;
                 activeOrderedPos.Add(worldPos);
                 activeOrderedRadius.Add(radius);
-                activeOrderedDensity.Add(DensityForPuff(p));
+                activeOrderedDensity.Add(EncodeDensity(DensityForPuff(p), p.steam));
             }
 
             if (hasLiveTip)
             {
                 activeOrderedPos.Add(liveTipPos);
                 activeOrderedRadius.Add(liveTipRadius);
-                activeOrderedDensity.Add(liveRootDensity);
+                activeOrderedDensity.Add(EncodeDensity(liveRootDensity, steamFrac));
                 for (int i = 0; i < liveRootCount; i++)
                 {
                     activeOrderedPos.Add(liveRootPos[i]);
                     activeOrderedRadius.Add(liveRootRadius[i]);
-                    activeOrderedDensity.Add(liveRootDensity);
+                    activeOrderedDensity.Add(EncodeDensity(liveRootDens[i], steamFrac));
                 }
             }
         }
@@ -1601,9 +2312,9 @@ namespace RaymarchedPlumeTrails
                     // dependent, since which samples land in that shell depends on the ray.
                     // The AABB and these spheres must pad by the SAME amount. sqrt(3)
                     // covers a worst-case per-axis displacement.
-                    float warpMargin = (SmokeTuning.SilhouetteWarpStrength + SmokeTuning.VortexStrength) * 1.733f + VortexWarpMargin;
+                    float warpMargin = (SmokeTuning.SilhouetteWarpStrength + SmokeTuning.VortexStrength) * 1.733f + VortexWarpMargin + RadiusWarpMargin(smoothedRadii[i]);
                     float reach = Vector3.Distance(centre, smoothedSpine[i])
-                        + smoothedRadii[i] * 1.4f + warpMargin;
+                        + smoothedRadii[i] * 1.4f * (1f + Mathf.Clamp01(SmokeTuning.EdgeProtrusion)) + warpMargin;
                     if (reach > radius) radius = reach;
                 }
 
@@ -1647,7 +2358,8 @@ namespace RaymarchedPlumeTrails
             {
                 float r = activeOrderedRadius[i];
                 float margin = r * BoxRadiusMarginMultiplier
-                             + BoxWarpMargin * Mathf.Clamp(r / ShaderReferenceRadius, 0.35f, 1f);
+                             + BoxWarpMargin * Mathf.Clamp(r / ShaderReferenceRadius, 0.35f, 1f)
+                             + RadiusWarpMargin(r);
                 mn = Vector3.Min(mn, activeOrderedPos[i] - Vector3.one * margin);
                 mx = Vector3.Max(mx, activeOrderedPos[i] + Vector3.one * margin);
             }
@@ -1766,6 +2478,45 @@ namespace RaymarchedPlumeTrails
         private readonly float[] mergeRadii = new float[MaxSpinePoints];
         private readonly float[] mergeDensity = new float[MaxSpinePoints];
 
+        // Split the shared buffer between the chains by WATER-FILLING their demands: a chain that needs less than
+        // an equal share (a booster that has just lit, a short trail) gets exactly what it needs and the rest goes
+        // to the long ones. An equal split halved the old trail's budget the moment a second chain appeared, which
+        // is what made half of it vanish when the SRBs ignited. Continuous in the demands, so no jumps.
+        private static readonly int[] wfShare = new int[64];
+        private static readonly bool[] wfDone = new bool[64];
+        private static void WaterFill(List<SmokeVolumeGroup> members, int budget)
+        {
+            int n = Mathf.Min(members.Count, 64);
+            int open = 0;
+            for (int k = 0; k < n; k++)
+            {
+                wfDone[k] = members[k].activeOrderedPos.Count < 2;
+                wfShare[k] = 0;
+                if (!wfDone[k]) open++;
+            }
+            int remaining = budget;
+            bool changed = true;
+            while (open > 0 && changed)
+            {
+                changed = false;
+                int level = remaining / open;
+                for (int k = 0; k < n; k++)
+                {
+                    if (wfDone[k]) continue;
+                    int d = Mathf.Max(members[k].lastFullDemand, 16);
+                    if (d <= level)
+                    {
+                        wfShare[k] = d; remaining -= d; wfDone[k] = true; open--; changed = true;
+                    }
+                }
+            }
+            for (int k = 0; k < n; k++)
+            {
+                if (members[k].activeOrderedPos.Count < 2) continue;
+                members[k].shareBudgetPts = wfDone[k] ? wfShare[k] : Mathf.Max(remaining / Mathf.Max(open, 1), 16);
+            }
+        }
+
         private int BuildMergedSpine(List<SmokeVolumeGroup> members)
         {
             int rawTotal = 0, chains = 0;
@@ -1775,12 +2526,14 @@ namespace RaymarchedPlumeTrails
                 if (n >= 2) { rawTotal += n; chains++; }
             }
             if (chains == 0) return 0;
+            for (int k = 0; k < members.Count; k++) members[k].clusterChains = chains;
 
             // The buffer is shared, so each chain gets a slice in proportion to its length,
             // after setting aside the two separator points between chains. With one chain
             // this reduces to the old "thin to the buffer size" behaviour.
             int budget = MaxSpinePoints - 2 * (chains - 1);
             int total = 0;
+            WaterFill(members, budget);
 
             for (int k = 0; k < members.Count; k++)
             {
@@ -1797,7 +2550,7 @@ namespace RaymarchedPlumeTrails
                 // EVERY merged chain's budget wobbled continuously, even when nothing about
                 // the smoke itself had changed. chains only changes on an actual merge or
                 // split, which is rare, so this is stable by construction instead of by luck.
-                int perChainBudget = Mathf.Max(4, budget / chains);
+                int perChainBudget = Mathf.Max(4, m.shareBudgetPts > 0 ? m.shareBudgetPts : budget / chains);
                 int room = MaxSpinePoints - total - (total > 0 ? 2 : 0);
                 if (room < 4) break;
                 perChainBudget = Mathf.Min(perChainBudget, room);
@@ -1828,7 +2581,8 @@ namespace RaymarchedPlumeTrails
                     m.polylineThinnedDensity.Clear();
                     for (int i = 0; i < take; i++)
                     {
-                        int src = Mathf.Min(n - 1, i * intStride);
+                        // last point pinned to the newest one (tip/root), never stranded short of it
+                        int src = i == take - 1 ? n - 1 : Mathf.Min(n - 1, i * intStride);
                         m.polylineThinnedPos.Add(m.activeOrderedPos[src]);
                         m.polylineThinnedRadius.Add(m.activeOrderedRadius[src]);
                         m.polylineThinnedDensity.Add(m.activeOrderedDensity[src]);
@@ -1899,7 +2653,7 @@ namespace RaymarchedPlumeTrails
                 radiusSum += r;
 
                 float warpMarginScale = Mathf.Clamp(r / ShaderReferenceRadius, 0.35f, 1f);
-                float boundRadius = r * BoxRadiusMarginMultiplier + BoxWarpMargin * warpMarginScale;
+                float boundRadius = r * BoxRadiusMarginMultiplier + BoxWarpMargin * warpMarginScale + RadiusWarpMargin(r);
                 boxMin = Vector3.Min(boxMin, p - Vector3.one * boundRadius);
                 boxMax = Vector3.Max(boxMax, p + Vector3.one * boundRadius);
             }
@@ -1940,9 +2694,25 @@ namespace RaymarchedPlumeTrails
             polylinePropertyBlock.SetVector("_BoxCenter", new Vector4(boxCenter.x, boxCenter.y, boxCenter.z, 0f));
             polylinePropertyBlock.SetVector("_BoxExtents", new Vector4(boxExtents.x, boxExtents.y, boxExtents.z, 0f));
             polylinePropertyBlock.SetFloat("_TileRadiusRatio", radiusRatio);
+            float maxSpineRadius = 0f;
+            for (int mi = 0; mi < totalPoints; mi++)
+            {
+                if (spineRadiiBuffer[mi] > maxSpineRadius) maxSpineRadius = spineRadiiBuffer[mi];
+            }
+            polylinePropertyBlock.SetFloat("_MaxSpineRadius", maxSpineRadius);
+            // strongest flame among the merged members; a member with no live tip is not burning
+            Vector3 fPos = Vector3.zero; float fStr = 0f, fRange = 25f; Color fCol = flameCol;
+            for (int fi = 0; fi < members.Count; fi++)
+            {
+                SmokeVolumeGroup fm = members[fi];
+                if (fm.hasLiveTip && fm.flameStrength > fStr) { fStr = fm.flameStrength; fPos = fm.flamePos; fRange = fm.flameRange; fCol = fm.flameCol; }
+            }
+            polylinePropertyBlock.SetVector("_FlameLight", new Vector4(fPos.x, fPos.y, fPos.z, fStr * SmokeTuning.FlameLightStrength));
+            polylinePropertyBlock.SetVector("_FlameColor", new Vector4(fCol.r * SmokeTuning.FlameColorR / 1.0f, fCol.g * SmokeTuning.FlameColorG / 0.52f, fCol.b * SmokeTuning.FlameColorB / 0.16f, fRange));
             polylinePropertyBlock.SetFloat("_DepthBiasDistance", ActiveDepthBiasDistance);
             polylinePropertyBlock.SetFloat("_DepthBiasFraction", ActiveDepthBiasFraction);
             SmokeTuning.Apply(polylinePropertyBlock);
+            polylinePropertyBlock.SetFloat("_FireEmission", SmokeTuning.DeflectorFire * 2.4f);
             // After Apply, so it overrides the shared value. Thinning is per-VOLUME (it
             // follows the vessel's ambient pressure), which SmokeTuning cannot express.
             polylinePropertyBlock.SetFloat("_Density", SmokeTuning.Density * densityScale);
@@ -1979,6 +2749,79 @@ namespace RaymarchedPlumeTrails
                     endToEnd, startAlt, endAlt, boxExtents.ToString("F0"),
                     padAxisValid ? padOutflowAxis.ToString("F2") : "none",
                     lastRadiusRatio, lastMarchSteps, lastNoiseShift.ToString("F1"), members.Count));
+
+                // Radius profile along the spine (oldest -> newest), 12 samples. A sudden thinning that is in
+                // THESE numbers comes from the puffs/sizes; one that is not is a rendering matter.
+                var prof = new System.Text.StringBuilder();
+                int samples = Mathf.Min(12, totalPoints);
+                for (int pi = 0; pi < samples; pi++)
+                {
+                    int idx = samples <= 1 ? 0 : pi * (totalPoints - 1) / (samples - 1);
+                    prof.Append(smoothedRadii[idx].ToString("F1")).Append(pi + 1 < samples ? " " : "");
+                }
+                float rMax = 0f, rMin = float.MaxValue;
+                for (int ri = 0; ri < totalPoints; ri++) { float rr = smoothedRadii[ri]; if (rr > rMax) rMax = rr; if (rr > 0.01f && rr < rMin) rMin = rr; }
+                Debug.Log(string.Format("[PlumeTrails] radii: vol#{0} max={1:F1} min={2:F1} profile(old->new)=[{3}]",
+                    instanceId, rMax, rMin == float.MaxValue ? 0f : rMin, prof));
+
+                // Shading snapshot. "Dym ma zero tekstury" / "nieoswietlone popsute" could
+                // be the SHADER doing the wrong thing, or it could be these values reaching
+                // it as zero/default because something upstream never got applied (a stale
+                // material, a property block that lost its values, etc.) - two very
+                // different bugs that look identical on screen. This settles which one by
+                // printing what the volume is ACTUALLY being told to render with.
+                Color probeSky = RenderSettings.ambientSkyColor;
+                Color probeGround = RenderSettings.ambientGroundColor;
+                Debug.Log(string.Format(
+                    "[PlumeTrails] shading: vol#{0} density={1:F2} absorption={2:F2} detail={3:F2} "
+                    + "warp={4:F1} shadowStrength={5:F2} shadowDarkness={6:F2} ambientFloor={7:F2} "
+                    + "multiScatter={8:F2} sunlit={9:F2} ambientProbe=(sky {10:F2} gnd {11:F2}) sceneAmbientBlend={12:F2}",
+                    instanceId, SmokeTuning.Density, SmokeTuning.Absorption, SmokeTuning.DetailStrength,
+                    SmokeTuning.SilhouetteWarpStrength, SmokeTuning.ShadowStrength, SmokeTuning.ShadowDarkness,
+                    SmokeTuning.AmbientFloor, SmokeTuning.MultiScatterIntensity, SmokeTuning.SunlitBrightness,
+                    probeSky.grayscale, probeGround.grayscale, SmokeTuning.SceneAmbientBlend));
+
+                // Hunt for a "neck" - a point whose radius is a real local minimum, much
+                // thinner than both neighbours. A smooth taper never does this; a visible
+                // pinch-then-balloon in a screenshot (unlike the frame-to-frame jump the
+                // live-tip warning catches) is a DIP BAKED INTO THE SPINE ITSELF, which
+                // that warning cannot see because it only watches the newest point. Reused
+                // the existing 1s throttle rather than a new one - a real neck sits on the
+                // spine for more than one frame, so it will still be caught.
+                int worstIdx = -1;
+                float worstDip = 0f;
+                for (int i = 1; i < totalPoints - 1; i++)
+                {
+                    float ra = spineRadiiBuffer[i - 1];
+                    float rb = spineRadiiBuffer[i];
+                    float rc = spineRadiiBuffer[i + 1];
+                    if (ra <= 0f || rb <= 0f || rc <= 0f) continue;
+                    float expected = (ra + rc) * 0.5f;
+                    if (expected < 1f) continue; // ignore noise on near-zero radii
+                    float dip = expected - rb;
+                    if (dip > worstDip)
+                    {
+                        worstDip = dip;
+                        worstIdx = i;
+                    }
+                }
+                // 40% of the expected radius, so ordinary puff-to-puff size variation
+                // (which this system relies on for a natural look) doesn't spam the log -
+                // only a dip sharp enough to actually read as a waist in the silhouette.
+                if (worstIdx >= 0 && worstDip > 0.4f * ((spineRadiiBuffer[worstIdx - 1] + spineRadiiBuffer[worstIdx + 1]) * 0.5f))
+                {
+                    Debug.LogWarning(string.Format(
+                        "[PlumeTrails] instance {0}: spine neck at point {1}/{2}, radius {3:F1}m vs "
+                        + "neighbours {4:F1}m/{5:F1}m ({6:F0}% dip) at world {7}, alt {8:F0}m. If this "
+                        + "lines up with a pinch-then-balloon in a screenshot, the radius CURVE itself "
+                        + "has a kink here (e.g. jet-phase-to-bloom transition, or a burst boundary), "
+                        + "not a rendering/blend artifact.",
+                        instanceId, worstIdx, totalPoints,
+                        spineRadiiBuffer[worstIdx], spineRadiiBuffer[worstIdx - 1], spineRadiiBuffer[worstIdx + 1],
+                        worstDip / ((spineRadiiBuffer[worstIdx - 1] + spineRadiiBuffer[worstIdx + 1]) * 0.5f) * 100f,
+                        spinePointsBuffer[worstIdx].ToString("F0"),
+                        body.GetAltitude((Vector3)spinePointsBuffer[worstIdx])));
+                }
             }
         }
 
@@ -2085,7 +2928,7 @@ namespace RaymarchedPlumeTrails
                 radiusSum += radius;
 
                 float warpMarginScale = Mathf.Clamp(radius / ShaderReferenceRadius, 0.35f, 1f);
-                float boundRadius = radius * BoxRadiusMarginMultiplier + BoxWarpMargin * warpMarginScale;
+                float boundRadius = radius * BoxRadiusMarginMultiplier + BoxWarpMargin * warpMarginScale + RadiusWarpMargin(radius);
                 boxMin = Vector3.Min(boxMin, pos - Vector3.one * boundRadius);
                 boxMax = Vector3.Max(boxMax, pos + Vector3.one * boundRadius);
             }
@@ -2219,6 +3062,8 @@ namespace RaymarchedPlumeTrails
         private const float TargetStepsPerAvgRadius = 3f;
         private const int MaxAdaptiveMarchSteps = 96;
 
+        private float smoothedMarchSteps = -1f;
+
         private void ApplyMarchLOD(MaterialPropertyBlock propertyBlock, Vector3 boxCenter, Vector3 boxExtents, float avgRadius)
         {
             Camera cam = Camera.main;
@@ -2279,12 +3124,30 @@ namespace RaymarchedPlumeTrails
                 int sizeAdaptiveSteps = Mathf.CeilToInt(boxDiagonal / targetStepSize);
                 marchSteps = Mathf.Min(Mathf.Max(marchSteps, sizeAdaptiveSteps), maxAdaptive);
             }
+            else
+            {
+                // Close range still needs the adaptive count when the box is large and the
+                // puffs in it are small (a splash cloud: ~360 m box, ~2 m puffs) - at the
+                // bare near count the ray steps over them and leaves holes. Capped at twice
+                // the near count so a close, screen-filling box stays affordable.
+                float boxDiagonal = boxExtents.magnitude * 2f;
+                float targetStepSize = Mathf.Max(avgRadius / TargetStepsPerAvgRadius, 0.5f);
+                int sizeAdaptiveSteps = Mathf.CeilToInt(boxDiagonal / targetStepSize);
+                marchSteps = Mathf.Min(Mathf.Max(marchSteps, sizeAdaptiveSteps), nearMarch * 2);
+            }
 
             // Detail LOD. Noise frequency is fixed in world space, so as the volume
             // shrinks on screen its detail falls below a pixel - and shaping a silhouette
             // at a scale the screen cannot resolve is what makes distant edges shimmer.
             // Fading it costs nothing visible, since it was never resolvable anyway.
-            float detailFade = Mathf.Lerp(1f, 0.3f,
+            //
+            // Gated by nearOrInside (27 IX fix), same as marchSteps above: dist is to the
+            // BOX CENTRE, and a trail's box spans the whole multi-km column, so a camera
+            // sitting right at the near surface of a tall trail still measured a huge
+            // centre distance and got the far-away 0.3x fade - flattening exactly the
+            // close-up shots that should show the most detail. nearOrInside already means
+            // "the near surface is close", regardless of where the box centre sits.
+            float detailFade = nearOrInside ? 1f : Mathf.Lerp(1f, 0.3f,
                 Mathf.InverseLerp(LODFullQualityDistance, LODMinQualityDistance, dist));
             propertyBlock.SetFloat("_DetailStrength", SmokeTuning.DetailStrength * detailFade);
             propertyBlock.SetFloat("_EdgeErosionStrength", SmokeTuning.EdgeErosionStrength * detailFade);
@@ -2295,6 +3158,18 @@ namespace RaymarchedPlumeTrails
             // between adjacent integers on the slightest movement, every sample position
             // shifts with them, and that is the flicker. Coarse increments change rarely
             // and visibly once instead of dithering every frame.
+            // Fast up, slow down. The near/far branch above flips whenever the camera
+            // crosses the near-surface threshold (which itself jitters as the box grows), and
+            // the two branches give very different counts - log showed 80 -> 24 -> 48 -> 24
+            // within a couple of seconds. Every flip re-seeds all sample positions, and the
+            // low side is coarse enough to leave holes in thin smoke: the reported "holes and
+            // terrible flicker". Rising at once keeps the good count; decaying at a fixed
+            // rate turns a flip into a gentle fade instead of a per-frame toggle.
+            if (smoothedMarchSteps < 0f || marchSteps >= smoothedMarchSteps)
+                smoothedMarchSteps = marchSteps;
+            else
+                smoothedMarchSteps = Mathf.MoveTowards(smoothedMarchSteps, marchSteps, 12f * Time.unscaledDeltaTime);
+            marchSteps = Mathf.RoundToInt(smoothedMarchSteps);
             marchSteps = Mathf.Max(8, (marchSteps / 8) * 8);
             lastMarchSteps = marchSteps;
             lightMarchSteps = Mathf.Max(2, (lightMarchSteps / 2) * 2);

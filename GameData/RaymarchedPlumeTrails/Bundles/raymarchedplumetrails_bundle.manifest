@@ -1,9 +1,9 @@
 ManifestFileVersion: 0
-CRC: 587412901
+CRC: 405495863
 Hashes:
   AssetFileHash:
     serializedVersion: 2
-    Hash: ca6395f4238e8d76ebeed904b027f77e
+    Hash: dca3b2c595212d66e880cf88a9a70b06
   TypeTreeHash:
     serializedVersion: 2
     Hash: 16539637ca66e19ac3f3683282fca82e
@@ -19,6 +19,7 @@ SerializeReferenceClassIdentifiers: []
 Assets:
 - Assets/RaymarchedPlumeTrails/SmokeVolume.shader
 - Assets/RaymarchedPlumeTrails/SmokeVolumeSplat.compute
+- Assets/RaymarchedPlumeTrails/HeatHaze.shader
 - Assets/RaymarchedPlumeTrails/SmokeComposite.shader
 - Assets/RaymarchedPlumeTrails/SmokeVolumeMat.mat
 Dependencies: []
