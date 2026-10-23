@@ -316,7 +316,9 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
             float _DebugBox;
             // engine flame as a point light: xyz = nozzle (world), w = strength; _FlameColor.w = half-range (m)
             float4 _FlameLight;
+            float4 _FlameEnd;      // the other end of the flame as a line of light (xyz, world); w = 1 when there is one (the flame is a column, not a point)
             float _FireEmission;   // explosion fireball glow (set by the plugin; 0 = none)
+            float _SootDark;       // darkening of the NON-steam part of a volume (dark exhaust smoke mixed with white steam); 0 = none
             float4 _FlameColor;
             // strength of the directional N.L term from the column geometry (0 = off)
             float _NormalShade;
@@ -1733,10 +1735,12 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                 float lightTransmittance = 1.0;
                 float skyVisibility = 1.0;
 
+                float curStep = stepSize;
                 [loop]
                 for (int s = 0; s < budget; s++)
                 {
                     if (t >= tFar) break;
+                    if (s > budget / 2) curStep *= 1.08;   // the second half of the budget: coarser and coarser steps, so a long ray ALONG a trail still gets across it
                     float3 samplePos = ro + rd * t;
 
                     // Sphere tracing: advance by the guaranteed-empty radius. The floor is
@@ -1757,7 +1761,7 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                     // depth on average. The step index enters the hash so consecutive
                     // samples differ, which is what breaks banding along the ray.
                     float stepJitter = InterleavedGradientNoise(i.pos.xy + _PlumeJitter.zw + float2(s * 5.588238, s * 3.141593)) - 0.5;
-                    float3 densityPos = samplePos + rd * (stepJitter * stepSize * _MarchJitter);
+                    float3 densityPos = samplePos + rd * (stepJitter * curStep * _MarchJitter);
 
                     float bump, sampleRadiusRatio;
                     float density = DensityAt(densityPos, bump, sampleRadiusRatio) * _Density;
@@ -1767,7 +1771,7 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                     float heatHere = gHeat;
                     if (_SmokeSeaClip > 1.0)
                         density *= smoothstep(0.0, 1.5, length(densityPos - _SmokeBodyCentre.xyz) - _SmokeSeaClip);
-                    if (density <= 0.001) { t += stepSize; continue; }
+                    if (density <= 0.001) { t += curStep; continue; }
 
                     // The light march is the most expensive thing in the shader. Once the
                     // ray is deep inside the cloud its transmittance is tiny, so whatever
@@ -1818,7 +1822,7 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                         }
                     }
 
-                    float stepTransmittance = exp(-density * _Absorption * stepSize);
+                    float stepTransmittance = exp(-density * _Absorption * curStep);
                     float contribution = transmittance * (1.0 - stepTransmittance);
                     // Where along the ray the smoke actually is, weighted by how much of the
                     // pixel each step contributes. The temporal resolve needs a real position
@@ -1842,9 +1846,21 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                     float ndl = smoothstep(-0.3, 0.3, dot(nHere, sunDir)) * 2.0 - 1.0;
                     if (_FlameLight.w > 0.001)
                     {
-                        float3 fd3 = densityPos - _FlameLight.xyz;
+                        // The flame is a column of light from the nozzle to the end of the flame (or to where the jet meets the pad), not a point:
+                        // the distance is taken to the NEAREST point of that segment. A 250 m flame then lights the smoke along its whole length.
+                        float3 fa = _FlameLight.xyz;
+                        float3 fb = _FlameEnd.w > 0.5 ? _FlameEnd.xyz : fa;
+                        float3 fab = fb - fa;
+                        float ft = saturate(dot(densityPos - fa, fab) / max(dot(fab, fab), 1e-3));
+                        float3 fd3 = densityPos - (fa + fab * ft);
                         float fr = max(_FlameColor.w, 1.0);
-                        flameAccum += contribution / (1.0 + dot(fd3, fd3) / (fr * fr));
+                        float fatt = 1.0 / (1.0 + dot(fd3, fd3) / (fr * fr));
+                        // The side of a billow that faces the flame takes its light, the far side does not (the smoke is lit from the engine, it is
+                        // not a uniform orange tint); deep inside the volume the glow is the same all round (light scattered in the smoke).
+                        float3 toF = -fd3 * rsqrt(max(dot(fd3, fd3), 1e-4));
+                        float face = saturate(dot(nHere, toF) * 0.5 + 0.5);
+                        face = lerp(lerp(0.25, 1.0, face), 1.0, saturate(profHere * 0.9));
+                        flameAccum += contribution * fatt * face;
                     }
                     normAccum += contribution * ndl * lerp(1.0, 0.3, saturate(profHere));
                     steamAccum += contribution * steamHere;
@@ -1868,7 +1884,7 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                     transmittance *= stepTransmittance;
                     if (transmittance < 0.01) break;
 
-                    t += stepSize;
+                    t += curStep;
                 }
 
                 float alpha = 1.0 - transmittance;
@@ -1935,9 +1951,14 @@ Shader "RaymarchedPlumeTrails/SmokeVolume"
                 shaded = lerp(shaded, fixed3(1.0, 1.0, 1.0), avgSteam * _SteamWhite);
                 litColor = lerp(litColor, fixed3(1.0, 1.0, 1.0), avgSteam * _SteamWhite * 0.6);
                 col.rgb = lerp(shaded, litColor, litness);
+                // soot: where the smoke is not steam it is dark exhaust smoke (the volume mixes both, so they sort and blend correctly)
+                col.rgb *= lerp(1.0, 1.0 - _SootDark, saturate(1.0 - avgSteam));
                 // Soft-saturating add (screen-like): the flame can tint the smoke orange but cannot blow it out past
                 // white, which a plain additive term did next to a big nozzle.
-                float3 flameAdd = _FlameColor.rgb * (avgFlame * _FlameLight.w);
+                // a hot flame close by is yellower and whiter, a weak or far one is red-orange (black body: the colour follows the brightness)
+                float flameK = avgFlame * _FlameLight.w;
+                float3 flameTint = lerp(_FlameColor.rgb, _FlameColor.rgb * 0.45 + float3(0.62, 0.52, 0.38), saturate(flameK * 0.35) * 0.7);
+                float3 flameAdd = flameTint * flameK;
                 col.rgb = 1.0 - (1.0 - saturate(col.rgb)) * exp(-flameAdd * 1.5);
 
                 // Phase acts as a brightness gain rather than the shading ramp - this is

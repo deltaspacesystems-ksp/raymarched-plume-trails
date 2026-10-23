@@ -16,7 +16,11 @@ namespace RaymarchedPlumeTrails
         public float densityScale = 1f;   // x the liquid plume density
         public float visibilityMul = 1f;  // extra x on top of the kind's visibility
         public float waterFrac = -1f;     // mass fraction of H2O in the exhaust; < 0 = kind default
-        public float dilution = -1f;      // dilution (parcel mass / exhaust mass) out to which the plume stays visible; < 0 = kind default
+        public float dilution = -1f;
+        // physical plume inputs (0 = the propellant's typical value): chamber pressure (Pa), nozzle area ratio, exit diameter (m)
+        public float chamberPressure, expansionRatio, exitDiameter;
+        public NozzleType nozzle = NozzleType.Bell;   // bell | conical | aerospike
+        public float exitHalfAngle;                    // degrees, 0 = the nozzle type's typical value      // dilution (parcel mass / exhaust mass) out to which the plume stays visible; < 0 = kind default
 
         // Colour of the flame as it lights the surroundings, and how strongly (hydrogen burns almost invisibly).
         public Color FlameColor
@@ -79,11 +83,11 @@ namespace RaymarchedPlumeTrails
                 if (dilution >= 0f) return dilution;
                 switch (kind)
                 {
-                    case PlumeKind.Solid: return 50f;
-                    case PlumeKind.Kerolox: return 30f;
-                    case PlumeKind.Hydrolox: return 15f;
-                    case PlumeKind.Methalox: return 22f;
-                    case PlumeKind.Hypergolic: return 25f;
+                    case PlumeKind.Solid: return 55f;
+                    case PlumeKind.Kerolox: return 45f;
+                    case PlumeKind.Hydrolox: return 22f;
+                    case PlumeKind.Methalox: return 30f;
+                    case PlumeKind.Hypergolic: return 35f;
                     default: return 10f;
                 }
             }
@@ -118,13 +122,19 @@ namespace RaymarchedPlumeTrails
     //       densityScale = 1.3               // x plume density
     //       visibility = 1                   // extra x on the kind's visibility
     //       waterFrac = 0.28                 // H2O mass fraction of the exhaust
+    //       chamberPressure = 20             // MPa (physical plume)
+    //       expansionRatio = 69              // nozzle exit / throat area
+    //       exitDiameter = 2.4               // m
+    //       nozzle = bell                    // bell | conical | aerospike (decides the angle at the nozzle lip and altitude compensation)
+    //       exitAngle = 12                   // nozzle exit half-angle, degrees (default: bell 10, conical 15, aerospike 0)
     //   }
     public static class EnginePlumeProfiles
     {
         private class Override
         {
             public PlumeKind? kind;
-            public float? sizeScale, densityScale, visibility, waterFrac, dilution;
+            public float? sizeScale, densityScale, visibility, waterFrac, dilution, chamberPressureMPa, expansionRatio, exitDiameter, exitAngle;
+            public NozzleType? nozzle;
         }
 
         private static readonly Dictionary<string, Override> overrides = new Dictionary<string, Override>(StringComparer.OrdinalIgnoreCase);
@@ -154,6 +164,16 @@ namespace RaymarchedPlumeTrails
                     o.visibility = Parse(n, "visibility");
                     o.waterFrac = Parse(n, "waterFrac");
                     o.dilution = Parse(n, "dilution");
+                    o.chamberPressureMPa = Parse(n, "chamberPressure");
+                    o.expansionRatio = Parse(n, "expansionRatio");
+                    o.exitDiameter = Parse(n, "exitDiameter");
+                    o.exitAngle = Parse(n, "exitAngle");
+                    string nz = n.GetValue("nozzle");
+                    if (!string.IsNullOrEmpty(nz))
+                    {
+                        try { o.nozzle = (NozzleType)Enum.Parse(typeof(NozzleType), nz.Trim(), true); }
+                        catch { Debug.LogWarning("[PlumeTrails] RPT_ENGINE: unknown nozzle '" + nz + "' (bell | conical | aerospike)"); }
+                    }
                     foreach (string part in n.GetValues("part"))
                         overrides[part.Trim().Replace('_', '.')] = o;
                 }
@@ -189,6 +209,8 @@ namespace RaymarchedPlumeTrails
             if (cache.TryGetValue(cacheKey, out p)) return p;
 
             p = Classify(engine);
+            string lk = key.ToLowerInvariant();
+            if (lk.Contains("aerospike") || lk.Contains("linearspike") || lk.Contains("plug")) p.nozzle = NozzleType.Aerospike;
             Override o;
             if (overrides.TryGetValue(key.Replace('_', '.'), out o))
             {
@@ -198,6 +220,11 @@ namespace RaymarchedPlumeTrails
                 if (o.visibility.HasValue) p.visibilityMul = o.visibility.Value;
                 if (o.waterFrac.HasValue) p.waterFrac = o.waterFrac.Value;
                 if (o.dilution.HasValue) p.dilution = o.dilution.Value;
+                if (o.chamberPressureMPa.HasValue) p.chamberPressure = o.chamberPressureMPa.Value * 1e6f;
+                if (o.expansionRatio.HasValue) p.expansionRatio = o.expansionRatio.Value;
+                if (o.exitDiameter.HasValue) p.exitDiameter = o.exitDiameter.Value;
+                if (o.exitAngle.HasValue) p.exitHalfAngle = o.exitAngle.Value;
+                if (o.nozzle.HasValue) p.nozzle = o.nozzle.Value;
                 p.enabled = p.kind != PlumeKind.None;
             }
             cache[cacheKey] = p;

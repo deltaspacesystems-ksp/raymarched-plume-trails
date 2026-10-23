@@ -22,6 +22,7 @@ namespace RaymarchedPlumeTrails
         // Solid motor? Lets the landing cloud tell a liquid engine it was only let in FOR the
         // splash from one that is allowed the full trail.
         public bool isSolid;
+        public PlumeKind kind;       // what the engine burns (solid, kerolox, hydrolox ...): the trail is drawn per kind
         // Delivered thrust of this transform in kN (engine.finalThrust shared over its thrust transforms).
         public float thrustKN;
         // Plume profile of the engine (see EnginePlumeProfiles): size and density multipliers (already including the
@@ -130,6 +131,13 @@ namespace RaymarchedPlumeTrails
             return c;
         }
 
+        // Visits the engines of a vessel (the cached list; nothing is allocated per call).
+        public static void EnumerateEngines(Vessel vessel, System.Action<Part, ModuleEngines, EnginePlumeProfile, PartModule> visit)
+        {
+            VesselEngines c = EnginesOf(vessel);
+            for (int i = 0; i < c.engines.Count; i++) visit(c.parts[i], c.engines[i], c.profiles[i], c.fx[i]);
+        }
+
         // Largest flame length / width among a group's engines (Waterfall), 0 when none is known.
         // Thrust-weighted flame colour and light strength of a group
         public static void GroupFlameColor(List<EngineSample> cluster, out Color color, out float mul)
@@ -170,8 +178,16 @@ namespace RaymarchedPlumeTrails
             return maxThrust;
         }
 
+        // The launch pad phase: the vehicle is on the pad or just off it. The exhaust of every engine meets the pad then, and a hydrolox engine's (hot
+        // steam, cooled and condensed by the deluge) makes a cloud like any other; in flight only the solids / the liquid engines with a plume profile emit.
+        private static bool PadPhase(Vessel vessel)
+        {
+            return SmokeTuning.PadAllEngines && vessel != null && vessel.mainBody != null && vessel.mainBody.atmosphere && vessel.radarAltitude < 250.0 && vessel.srfSpeed < 150.0;
+        }
+
         public static List<EngineSample> GatherEngineSamples(Vessel vessel, bool forceAllEngines = false)
         {
+            if (!forceAllEngines && PadPhase(vessel)) forceAllEngines = true;
             List<EngineSample> samples = new List<EngineSample>();
             VesselEngines c = EnginesOf(vessel);
             float maxThrust = 0f;
@@ -227,6 +243,7 @@ namespace RaymarchedPlumeTrails
                         isp = engine.realIsp,
                         partId = part.flightID,
                         isSolid = prof.IsSolid,
+                        kind = prof.kind,
                         plumeSize = liquidLook ? SmokeTuning.LiquidSizeScale * prof.sizeScale : 1f,
                         plumeDensity = liquidLook ? SmokeTuning.LiquidDensityScale * prof.densityScale * prof.Visibility : 1f,
                         plumeSteam = liquidLook && prof.Steam ? 1f : 0f,
@@ -415,6 +432,7 @@ namespace RaymarchedPlumeTrails
 
         public static List<EnginePartInfo> GatherAllEngineParts(Vessel vessel, bool forceAllEngines = false)
         {
+            if (!forceAllEngines && PadPhase(vessel)) forceAllEngines = true;
             List<EnginePartInfo> result = new List<EnginePartInfo>();
             float minThrust = GetVesselMaxEngineThrust(vessel) * RelativeThrustThreshold;
             VesselEngines c = EnginesOf(vessel);

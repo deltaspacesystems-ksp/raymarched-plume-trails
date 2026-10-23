@@ -1,0 +1,340 @@
+// GPU smoke solver for the cloud that rolls out of a launch pad (stable fluids, as in Plume Lab's Fluid.java, on the GPU).
+//
+// Grid: nx x ny x nz cells of size _Cell metres in a LOCAL frame (x, z horizontal, y up). The pad is a real obstacle: _Height holds
+// the height of the surface under every column (found with rays by the mod), a cell below it is solid. The jet is injected along
+// segments (nozzle -> impact). Fields: velocity (xyz), scalars S = (steam, soot, temperature, -).
+//   Forces    : buoyancy from temperature, weight of the condensate, drag
+//   Vorticity : confinement puts back the small whirls the numerical diffusion removes (the billows)
+//   Advection : semi-Lagrangian for velocity, MacCormack (clamped) for the scalars
+//   Projection: Jacobi pressure solve; solid cells reflect, the sides and the top are open, the bottom is closed
+
+#pragma kernel Clear
+#pragma kernel Inject
+#pragma kernel Forces
+#pragma kernel Curl
+#pragma kernel Vorticity
+#pragma kernel AdvectVelocity
+#pragma kernel AdvectScalarFwd
+#pragma kernel AdvectScalarBack
+#pragma kernel Divergence
+#pragma kernel Jacobi
+#pragma kernel Project
+#pragma kernel Shock
+
+RWTexture3D<float4> _VelOut;
+Texture3D<float4> _VelIn;
+RWTexture3D<float4> _SclOut;
+Texture3D<float4> _SclIn;
+RWTexture3D<float4> _TmpOut;
+Texture3D<float4> _TmpIn;
+RWTexture3D<float4> _CurlOut;
+Texture3D<float4> _CurlIn;
+RWTexture3D<float> _PrsOut;
+Texture3D<float> _PrsIn;
+RWTexture3D<float> _DivOut;
+Texture3D<float> _DivIn;
+Texture2D<float> _Height;     // local height of the surface under each column, from rays (colliders)
+Texture2D<float> _Height2;    // the same from the rendered scenery (height above the bottom of the grid); the higher of the two is solid
+
+SamplerState sampler_linear_clamp;
+
+int3 _Dim;            // nx, ny, nz
+float _Cell;          // metres per cell
+float _OriginY;       // local y of the bottom of the grid
+float _Dt;
+float4 _Params;       // buoyancy, weight, drag, vorticity
+float4 _Params2;      // dissipation (steam), dissipation (soot), cooling, unused
+float4 _Params3;      // x = evaporation rate (per second per unit temperature), y = cooling per unit of water evaporated, z = water physics on (0 / 1)
+int _SrcCount;
+float4 _SrcA[8];      // xyz = start (local, m), w = radius at the start
+float4 _SrcB[8];      // xyz = end (local, m), w = radius at the end
+float4 _SrcC[8];      // x = speed (m/s), y = steam rate, z = soot rate, w = temperature
+float4 _SrcD[8];      // xyz = unit direction along the segment (start -> end), w = sideways spread of the velocity
+float4 _SrcE[8];      // x = fraction of the segment over which the condensate (steam / soot) fades in from the nozzle; 0 = from the start
+
+int _HoleCount;
+float4 _HoleA[8];     // xyz = the nozzle (local, m), w = radius of the flame hole under it
+float4 _HoleB[8];     // x = local y of the floor of the trench under the nozzle
+
+bool Solid(int3 c)
+{
+    if (c.x < 0 || c.z < 0 || c.x >= _Dim.x || c.z >= _Dim.z) return false;
+    if (c.y < 0) return true;
+    if (c.y >= _Dim.y) return false;
+    // The rendered scenery is trusted where it saw something: the physical collider of the pad's ground can lie flat OVER the trench
+    // (the trench is only a model), and taking the higher of the two put a lid on it. The rays are the fallback where nothing is drawn.
+    float hv = _Height2[int2(c.x, c.z)];
+    float h = hv > 0.01 ? hv + _OriginY : _Height[int2(c.x, c.z)];
+    float py = _OriginY + (c.y + 0.5) * _Cell;
+    if (!(py < h)) return false;
+    // The FLAME HOLE: every launch mount has an opening for the exhaust. Under each nozzle the solid between the nozzle and the floor of
+    // the trench is carved out (the floor itself stays), so the jet goes down the trench and not across the top of the mount.
+    for (int i = 0; i < _HoleCount; i++)
+    {
+        float2 d = float2((c.x + 0.5) * _Cell - _HoleA[i].x, (c.z + 0.5) * _Cell - _HoleA[i].z);
+        if (dot(d, d) < _HoleA[i].w * _HoleA[i].w && py < _HoleA[i].y && py > _HoleB[i].x + 0.5 * _Cell) return false;
+    }
+    return true;
+}
+
+float3 Uvw(float3 p) { return (p + 0.5) / float3(_Dim); }
+
+// What flows IN across the open sides and the top of the box is clean air. Clamping the sample to the edge cell (the sampler's mode) fed the
+// edge's own smoke back in for ever wherever the air was drawn inward by the jet: a frozen square ring of smoke at the edge of the grid.
+float Inside(float3 q)
+{
+    float o = max(max(-q.x, q.x - (_Dim.x - 1.0)), max(max(-q.z, q.z - (_Dim.z - 1.0)), q.y - (_Dim.y - 1.0)));
+    return saturate(1.0 - o / 1.5);
+}
+
+[numthreads(4,4,4)]
+void Clear (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    _VelOut[id] = 0; _SclOut[id] = 0; _PrsOut[id] = 0;
+}
+
+[numthreads(4,4,4)]
+void Inject (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    int3 c = int3(id);
+    if (Solid(c)) return;
+    float3 p = float3((c.x + 0.5) * _Cell, _OriginY + (c.y + 0.5) * _Cell, (c.z + 0.5) * _Cell);
+    float4 v = _VelIn[id];
+    float4 s = _SclIn[id];
+    for (int i = 0; i < _SrcCount; i++)
+    {
+        float3 a = _SrcA[i].xyz, b = _SrcB[i].xyz;
+        float3 ab = b - a;
+        float len2 = max(dot(ab, ab), 1e-4);
+        float t = saturate(dot(p - a, ab) / len2);
+        float3 q = a + ab * t;
+        float r = lerp(_SrcA[i].w, _SrcB[i].w, t);
+        float dist = length(p - q);
+        // the jet carries on a little past the end (it ends in the floor): the solid cells stop it
+        float edge = 1.0 - smoothstep(0.7, 1.0, dist / max(r, 1e-3));
+        if (edge <= 0.0) continue;
+        float3 dir = _SrcD[i].xyz;
+        float3 radial = dist > 1e-3 ? (p - q) / dist : float3(0, 0, 0);
+        float3 target = dir * _SrcC[i].x + radial * (_SrcC[i].x * _SrcD[i].w);
+        v.xyz = lerp(v.xyz, target, edge);
+        float ramp = _SrcE[i].x > 0.0 ? smoothstep(0.0, _SrcE[i].x, t) : 1.0;     // at the nozzle the exhaust is hot gas, the steam forms as it mixes
+        // The jet carries its momentum all the way, but its steam, soot and fire are made where it MEETS A SURFACE: in the air column
+        // between the rocket and the pad the smoke trail is the job of the trail, and drawing it here too made a dark pillar up to the
+        // ceiling of the grid. Height above the surface under this column decides.
+        float hv2 = _Height2[int2(c.x, c.z)];
+        float surfH = hv2 > 0.01 ? hv2 + _OriginY : _Height[int2(c.x, c.z)];
+        float nearGround = 1.0 - smoothstep(30.0, 95.0, p.y - surfH);     // the steam fades out slowly with height: no edge where the trail takes over
+        float mass = edge * _Dt * ramp * nearGround;
+        // With the water physics on, the deluge water is injected as LIQUID spray (channel w): it evaporates in the hot gas (see AdvectScalarBack)
+        // and the steam appears where the gas has cooled. Off: the water is injected as steam directly.
+        if (_Params3.z > 0.5) { s.w += mass * _SrcC[i].y * 0.85; s.x += mass * _SrcC[i].y * 0.15; }
+        else s.x += mass * _SrcC[i].y;
+        s.y += mass * _SrcC[i].z;
+        s.z = max(s.z, _SrcC[i].w * edge * nearGround);
+    }
+    _VelOut[id] = v;
+    _SclOut[id] = s;
+}
+
+[numthreads(4,4,4)]
+void Forces (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    if (Solid(int3(id))) { _VelOut[id] = 0; return; }
+    float4 v = _VelIn[id];
+    float4 s = _SclIn[id];
+    float a = _Params.x * s.z - _Params.y * (s.x + s.y + 1.4 * s.w);      // droplets are heavier than the steam
+    v.y += a * _Dt;
+    v.xyz *= (1.0 - _Params.z * _Dt);
+    _VelOut[id] = v;
+}
+
+[numthreads(4,4,4)]
+void Curl (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    int3 c = int3(id);
+    int3 lo = max(c - 1, 0), hi = min(c + 1, _Dim - 1);
+    float inv = 0.5 / _Cell;
+    float3 dx = _VelIn[int3(hi.x, c.y, c.z)].xyz - _VelIn[int3(lo.x, c.y, c.z)].xyz;
+    float3 dy = _VelIn[int3(c.x, hi.y, c.z)].xyz - _VelIn[int3(c.x, lo.y, c.z)].xyz;
+    float3 dz = _VelIn[int3(c.x, c.y, hi.z)].xyz - _VelIn[int3(c.x, c.y, lo.z)].xyz;
+    float3 w = float3(dy.z - dz.y, dz.x - dx.z, dx.y - dy.x) * inv;
+    _CurlOut[id] = float4(w, length(w));
+}
+
+[numthreads(4,4,4)]
+void Vorticity (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    int3 c = int3(id);
+    if (Solid(c)) return;
+    int3 lo = max(c - 1, 0), hi = min(c + 1, _Dim - 1);
+    float inv = 0.5 / _Cell;
+    float3 g = float3(_CurlIn[int3(hi.x, c.y, c.z)].w - _CurlIn[int3(lo.x, c.y, c.z)].w,
+                      _CurlIn[int3(c.x, hi.y, c.z)].w - _CurlIn[int3(c.x, lo.y, c.z)].w,
+                      _CurlIn[int3(c.x, c.y, hi.z)].w - _CurlIn[int3(c.x, c.y, lo.z)].w) * inv;
+    g /= (length(g) + 1e-6);
+    float3 w = _CurlIn[id].xyz;
+    float3 f = cross(g, w);
+    float4 v = _VelIn[id];
+    v.xyz += _Params.w * 0.5 * _Cell * f * _Dt;
+    _VelOut[id] = v;
+}
+
+[numthreads(4,4,4)]
+void AdvectVelocity (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    if (Solid(int3(id))) { _VelOut[id] = 0; return; }
+    float3 p = float3(id);
+    float3 u = _VelIn[id].xyz;
+    float3 back = p - _Dt * u / _Cell;
+    _VelOut[id] = float4(_VelIn.SampleLevel(sampler_linear_clamp, Uvw(back), 0).xyz, 0);
+}
+
+[numthreads(4,4,4)]
+void AdvectScalarFwd (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    if (Solid(int3(id))) { _TmpOut[id] = 0; return; }
+    float3 p = float3(id);
+    float3 u = _VelIn[id].xyz;                       // _VelIn is the projected velocity here
+    float3 q = p - _Dt * u / _Cell;
+    _TmpOut[id] = _SclIn.SampleLevel(sampler_linear_clamp, Uvw(q), 0) * Inside(q);
+}
+
+[numthreads(4,4,4)]
+void AdvectScalarBack (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    if (Solid(int3(id))) { _SclOut[id] = 0; return; }
+    float3 p = float3(id);
+    float3 u = _VelIn[id].xyz;
+    float4 fwd = _TmpIn[id];
+    float3 qb = p + _Dt * u / _Cell;
+    float4 back = _TmpIn.SampleLevel(sampler_linear_clamp, Uvw(qb), 0) * Inside(qb);
+    float4 val = fwd + 0.5 * (_SclIn[id] - back);
+    // clamp to the range of the 8 cells around the departure point (no new extrema)
+    float3 dep = p - _Dt * u / _Cell;
+    int3 b0 = int3(floor(clamp(dep, 0, float3(_Dim) - 1.001)));
+    int3 b1 = min(b0 + 1, _Dim - 1);
+    float4 mn = 1e30, mx = -1e30;
+    for (int k = 0; k < 8; k++)
+    {
+        int3 q = int3((k & 1) ? b1.x : b0.x, (k & 2) ? b1.y : b0.y, (k & 4) ? b1.z : b0.z);
+        float4 f = _SclIn[q];
+        mn = min(mn, f); mx = max(mx, f);
+    }
+    val = clamp(val, mn, mx) * Inside(dep);
+    // slow decay: evaporation, mixing with the air, cooling
+    val.x *= 1.0 - _Params2.x * _Dt;
+    val.y *= 1.0 - _Params2.y * _Dt;
+    val.z *= 1.0 - _Params2.z * _Dt;
+    // LIQUID WATER: it evaporates in the hot gas, at a rate that grows with the temperature; the vapour joins the steam and the latent heat
+    // cools the gas (so the deluge both makes the cloud and quenches the flame). What stays liquid slowly rains out.
+    if (_Params3.z > 0.5)
+    {
+        float e = min(val.w, val.w * val.z * _Params3.x * _Dt);
+        val.w -= e;
+        val.x += e;
+        val.z = max(val.z - e * _Params3.y, 0.0);
+        val.w *= 1.0 - 0.02 * _Dt;
+    }
+    _SclOut[id] = max(val, 0);
+}
+
+float3 VelAt(int3 c, float3 own)
+{
+    if (c.x < 0 || c.y < 0 || c.z < 0 || c.x >= _Dim.x || c.y >= _Dim.y || c.z >= _Dim.z) return own;
+    if (Solid(c)) return 0;
+    return _VelIn[c].xyz;
+}
+
+[numthreads(4,4,4)]
+void Divergence (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    int3 c = int3(id);
+    if (Solid(c)) { _DivOut[id] = 0; return; }
+    float3 o = _VelIn[id].xyz;
+    float d = (VelAt(c + int3(1,0,0), o).x - VelAt(c - int3(1,0,0), o).x
+             + VelAt(c + int3(0,1,0), o).y - VelAt(c - int3(0,1,0), o).y
+             + VelAt(c + int3(0,0,1), o).z - VelAt(c - int3(0,0,1), o).z) / (2.0 * _Cell);
+    _DivOut[id] = d;
+}
+
+// pressure of a neighbour: outside the grid 0 (open) except the bottom (closed: the cell's own), solid cells reflect
+float Pn(int3 c, float own, bool bottomClosed)
+{
+    if (c.y < 0) return own;
+    if (c.x < 0 || c.z < 0 || c.x >= _Dim.x || c.z >= _Dim.z || c.y >= _Dim.y) return 0;
+    if (Solid(c)) return own;
+    return _PrsIn[c];
+}
+
+[numthreads(4,4,4)]
+void Jacobi (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    int3 c = int3(id);
+    if (Solid(c)) { _PrsOut[id] = 0; return; }
+    float own = _PrsIn[id];
+    float sum = Pn(c + int3(1,0,0), own, true) + Pn(c - int3(1,0,0), own, true)
+              + Pn(c + int3(0,1,0), own, true) + Pn(c - int3(0,1,0), own, true)
+              + Pn(c + int3(0,0,1), own, true) + Pn(c - int3(0,0,1), own, true);
+    float target = (sum - _Cell * _Cell * _DivIn[id] / _Dt) / 6.0;
+    _PrsOut[id] = lerp(own, target, 1.0);
+}
+
+[numthreads(4,4,4)]
+void Project (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    int3 c = int3(id);
+    if (Solid(c)) { _VelOut[id] = 0; return; }
+    float own = _PrsIn[id];
+    float3 g = float3(Pn(c + int3(1,0,0), own, true) - Pn(c - int3(1,0,0), own, true),
+                      Pn(c + int3(0,1,0), own, true) - Pn(c - int3(0,1,0), own, true),
+                      Pn(c + int3(0,0,1), own, true) - Pn(c - int3(0,0,1), own, true)) / (2.0 * _Cell);
+    _VelOut[id] = float4(_VelIn[id].xyz - _Dt * g, 0);
+}
+
+// IGNITION OVERPRESSURE. The start of an engine (and the start of a booster) sends a pressure wave out through the air at the speed of
+// sound; the air behind its front moves outward (the induced velocity of a weak shock, du = dp / (rho c): a few tenths of a bar give tens
+// of m/s close to the pad). The front is a shell of radius _ShockA.w that has swept from _ShockB.w since the last step; every cell it
+// passed gets one outward kick that falls off as 1 / r. The smoke is pushed, torn and rolled by the wave. (The real thing is a compressible
+// solution - NASA LAVA / Loci-CHEM - this is its effect on the flow, not the wave itself.)
+float4 _ShockA;       // xyz = source (local, m), w = radius of the front now
+float4 _ShockB;       // x = thickness of the sweep (m), y = induced velocity at 30 m (m/s), z = lift of the direction, w = radius of the front at the last step
+
+[numthreads(4,4,4)]
+void Shock (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    int3 c = int3(id);
+    if (Solid(c)) { _VelOut[id] = 0; return; }
+    float3 p = float3((c.x + 0.5) * _Cell, _OriginY + (c.y + 0.5) * _Cell, (c.z + 0.5) * _Cell);
+    float3 d = p - _ShockA.xyz;
+    float r = length(d);
+    float4 v = _VelIn[id];
+    float inSweep = step(_ShockB.w - _ShockB.x * 0.5, r) * step(r, _ShockA.w + _ShockB.x * 0.5);
+    // the wave does not go through the structure: the walls of the trench and the mount shield what is behind them (line of sight from the source)
+    if (inSweep > 0.5 && r > 4.0)
+    {
+        for (int k = 1; k < 14; k++)
+        {
+            float3 q = _ShockA.xyz + d * (k / 14.0);
+            int3 qc = int3(q.x / _Cell, (q.y - _OriginY) / _Cell, q.z / _Cell);
+            if (all(qc >= 0) && all(qc < _Dim) && Solid(qc)) { inSweep = 0.0; break; }
+        }
+    }
+    if (inSweep > 0.5 && r > 1.0)
+    {
+        float3 dir = normalize(d / r + float3(0.0, _ShockB.z, 0.0));
+        v.xyz += dir * (_ShockB.y * 30.0 / max(r, 30.0));
+    }
+    _VelOut[id] = v;
+}

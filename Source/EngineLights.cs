@@ -7,7 +7,9 @@ namespace RaymarchedPlumeTrails
     // light everything else - the pad, the ground, the rocket's own tanks, nearby scenery - in the colour of the exhaust
     // (orange kerosene, pale blue-violet hydrogen, sooty orange solids), flickering a little the way a flame does.
     // Same reporting pattern as HeatHazeRegistry: a group reports every tick, lights nobody reported for a moment are removed.
+#if !EXPLOSIONS_ONLY
     [KSPAddon(KSPAddon.Startup.Flight, false)]
+#endif
     public class EngineLights : MonoBehaviour
     {
         private class Entry
@@ -17,6 +19,7 @@ namespace RaymarchedPlumeTrails
             public float shownIntensity;
             public float lastReport;
             public float seed;
+            public float born;
         }
 
         private static readonly Dictionary<int, Entry> entries = new Dictionary<int, Entry>();
@@ -24,7 +27,7 @@ namespace RaymarchedPlumeTrails
 
         public static void Report(int key, Vector3 pos, Color color, float range, float intensity)
         {
-            if (!SmokeTuning.EngineLights) return;
+            if (!SmokeTuning.EngineLights || !ModSettings.Enabled) return;
             Entry e;
             if (!entries.TryGetValue(key, out e))
             {
@@ -33,7 +36,7 @@ namespace RaymarchedPlumeTrails
                 l.type = LightType.Point;
                 l.shadows = LightShadows.None;
                 l.bounceIntensity = 0f;
-                e = new Entry { light = l, seed = Random.value * 50f };
+                e = new Entry { light = l, seed = Random.value * 50f, born = Time.time };
                 entries[key] = e;
             }
             e.pos = pos; e.color = color; e.range = range; e.intensity = intensity;
@@ -47,10 +50,15 @@ namespace RaymarchedPlumeTrails
             foreach (KeyValuePair<int, Entry> kv in entries)
             {
                 Entry e = kv.Value;
-                if (e.light == null || now - e.lastReport > 0.3f || !SmokeTuning.EngineLights) { dead.Add(kv.Key); continue; }
+                if (e.light == null || now - e.lastReport > 0.3f || !SmokeTuning.EngineLights || !ModSettings.Enabled) { dead.Add(kv.Key); continue; }
                 // eases in and out (ignition, throttle changes) and flickers; the flicker is two uncorrelated slow noises
                 e.shownIntensity = Mathf.Lerp(e.shownIntensity, e.intensity, 1f - Mathf.Exp(-Time.deltaTime * 8f));
-                float flick = 1f + 0.07f * (Mathf.PerlinNoise(now * 9f, e.seed) - 0.5f) * 2f + 0.04f * (Mathf.PerlinNoise(now * 23f, e.seed + 9f) - 0.5f) * 2f;
+                // three octaves: a slow swell of the whole flame, the quicker flutter of its tongues, and a fast crackle; plus the flash of the ignition,
+                // a brighter first half second (the pressure of the start) that settles
+                float flick = 1f + 0.10f * (Mathf.PerlinNoise(now * 3.1f, e.seed + 31f) - 0.5f) * 2f
+                                 + 0.07f * (Mathf.PerlinNoise(now * 9f, e.seed) - 0.5f) * 2f
+                                 + 0.04f * (Mathf.PerlinNoise(now * 23f, e.seed + 9f) - 0.5f) * 2f;
+                flick *= 1f + 0.9f * Mathf.Exp(-(now - e.born) / 0.45f);
                 e.light.transform.position = e.pos;
                 e.light.color = e.color;
                 e.light.range = e.range * SmokeTuning.EngineLightRange;

@@ -20,6 +20,12 @@ namespace RaymarchedPlumeTrails
         public static readonly Dictionary<Renderer, MaterialPropertyBlock> Blocks =
             new Dictionary<Renderer, MaterialPropertyBlock>();
 
+        // Fixed drawing order for volumes that interpenetrate (sorting those by distance makes them swap places as the camera moves):
+        // lower priority is drawn first = behind. 0 (the default) = sorted by distance among themselves. The pad fluid is -1 (always behind
+        // the trails), the physical plumes +1 (always in front).
+        public static readonly Dictionary<Renderer, int> Priority = new Dictionary<Renderer, int>();
+        public static void SetPriority(Renderer r, int priority) { if (r != null) Priority[r] = priority; }
+
         public static void Register(Renderer r, MaterialPropertyBlock block)
         {
             if (r != null && block != null) Blocks[r] = block;
@@ -38,6 +44,7 @@ namespace RaymarchedPlumeTrails
             if (r == null) return;
             Active.Remove(r);
             Blocks.Remove(r);
+            Priority.Remove(r);
         }
     }
 
@@ -51,7 +58,11 @@ namespace RaymarchedPlumeTrails
     public class HalfResSmokeRenderer : MonoBehaviour
     {
         // after transparents, so the smoke sits where its Transparent-queue draw used to
-        private const CameraEvent Stage = CameraEvent.AfterForwardAlpha;
+        // Where the smoke is laid over the picture. After the transparent queue (the default) it lies on top of everything transparent, clouds
+        // included - and cloud layers write no depth, so smoke that is BEHIND a cloud deck is drawn over it. "Before clouds" puts it earlier, so
+        // the transparent cloud layers are drawn over the smoke (right for smoke behind them, wrong for smoke in front of them): a switch to test.
+        private CameraEvent Stage { get { return SmokeTuning.SmokeLast ? CameraEvent.BeforeImageEffects : (SmokeTuning.SmokeBeforeClouds ? CameraEvent.BeforeForwardAlpha : CameraEvent.AfterForwardAlpha); } }
+        private readonly Dictionary<Camera, CameraEvent> bufferStage = new Dictionary<Camera, CameraEvent>();
         private static readonly int HalfResId = Shader.PropertyToID("_RaymarchedPlumeTrailsHalfRes");
 
         private readonly Dictionary<Camera, CommandBuffer> buffers = new Dictionary<Camera, CommandBuffer>();
@@ -68,6 +79,24 @@ namespace RaymarchedPlumeTrails
         private MaterialPropertyBlock scratchBlock;
         private bool shadowDiagLogged;
         private readonly List<Renderer> sortedVolumes = new List<Renderer>();
+
+        private float proxScale = 1f, proxWanted = 1f, proxSince;
+        private float ProximityScale(Camera cam)
+        {
+            Vector3 eye = cam.transform.position;
+            float best = float.MaxValue;
+            for (int i = 0; i < SmokeRenderRegistry.Active.Count; i++)
+            {
+                Renderer r = SmokeRenderRegistry.Active[i];
+                if (r == null) continue;
+                float d = Mathf.Sqrt(r.bounds.SqrDistance(eye));
+                if (d < best) best = d;
+            }
+            float want = best < 25f ? 0.70f : best < 70f ? 0.85f : 1f;
+            if (Mathf.Abs(want - proxWanted) > 0.01f) { proxWanted = want; proxSince = Time.unscaledTime; }
+            if (Mathf.Abs(proxWanted - proxScale) > 0.01f && Time.unscaledTime - proxSince > (proxWanted < proxScale ? 0.25f : 1.5f)) proxScale = proxWanted;
+            return proxScale;
+        }
         private Material compositeMaterial;
 
         // ---- temporal upscaling ----------------------------------------------------------
@@ -135,6 +164,8 @@ namespace RaymarchedPlumeTrails
         // from LateUpdate was a frame stale whenever the flight camera moved after us.
         private void OnCameraPreRender(Camera cam)
         {
+            if (!ModSettings.Enabled) return;
+            RecordSunMask(cam);
             TemporalState st;
             if (!temporal.TryGetValue(cam, out st) || !st.armed) return;
             st.armed = false;
@@ -176,15 +207,82 @@ namespace RaymarchedPlumeTrails
         private Light sunLight;
         private float sunSearchTimer;
 
-        private void Start()
+        // THE SHADOW IN THE SUN'S SHADOW MASK (deferred rendering, e.g. the Deferred mod): instead of darkening the finished picture (sky light, lamps
+        // and glow too), the trail's shadow is multiplied into the screen-space shadow mask of the sun - the same place EVE puts its cloud shadows - so
+        // the smoke only takes away the SUN, and the shadow lies correctly on the terrain, the tower, the rocket and the buildings. One buffer on the
+        // light, re-recorded before every camera renders (each camera has its own depth and matrices; a camera that is not ours gets an empty buffer).
+        private CommandBuffer maskCb;
+        private Light maskLight;
+        private static int lastMaskDraws;
+
+        private bool MaskMode(Camera cam)
         {
+            return SmokeTuning.ShadowIntoSunMask && cam != null && cam.actualRenderingPath == RenderingPath.DeferredShading
+                && sunLight != null && sunLight.shadows != LightShadows.None && SmokeTuning.ShadowCastStrength > 0.001f;
+        }
+
+        private void RecordSunMask(Camera cam)
+        {
+            if (maskLight != sunLight)
+            {
+                if (maskLight != null && maskCb != null) maskLight.RemoveCommandBuffer(LightEvent.AfterScreenspaceMask, maskCb);
+                maskLight = sunLight;
+                if (maskLight != null)
+                {
+                    if (maskCb == null) maskCb = new CommandBuffer { name = "RaymarchedPlumeTrails shadow into the sun mask" };
+                    maskLight.AddCommandBuffer(LightEvent.AfterScreenspaceMask, maskCb);
+                }
+            }
+            if (maskCb == null) return;
+            maskCb.Clear();
+            if (!IsSceneCamera(cam) || !MaskMode(cam)) return;
+            int drawn = 0;
+            Matrix4x4 invP = cam.projectionMatrix.inverse;
+            Matrix4x4 c2w = cam.cameraToWorldMatrix;
+            // _ZBufferParams of this camera (reversed Z on D3D: x = -1 + far / near, y = 1)
+            float n = cam.nearClipPlane, f = cam.farClipPlane;
+            float zx = SystemInfo.usesReversedZBuffer ? -1f + f / n : 1f - f / n;
+            float zy = SystemInfo.usesReversedZBuffer ? 1f : f / n;
+            Vector4 zb = new Vector4(zx, zy, zx / f, zy / f);
+            for (int i = 0; i < SmokeRenderRegistry.Active.Count; i++)
+            {
+                Renderer r = SmokeRenderRegistry.Active[i];
+                if (r == null || r.sharedMaterial == null || r.sharedMaterial.passCount < 2) continue;
+                MaterialPropertyBlock block;
+                if (!SmokeRenderRegistry.Blocks.TryGetValue(r, out block) || block == null) continue;
+                Vector4 castRect;
+                if (!TryCastRect(cam, r.bounds, out castRect)) continue;
+                block.SetVector("_CastRect", castRect);
+                block.SetFloat("_ShadowCastStrength", SmokeTuning.ShadowCastStrength);
+                block.SetFloat("_ShadowCastDensity", SmokeTuning.ShadowCastDensity);
+                block.SetFloat("_ShadowCastFloor", 0f);         // only the sun is taken away: no floor needed, the sky light stays
+                block.SetInt("_ShadowCastSteps", Mathf.Max(4, Mathf.RoundToInt(SmokeTuning.ShadowCastSteps * SmokeQuality.Current.shadowSteps / 16f)));
+                block.SetFloat("_TrMaskMode", 1f);
+                block.SetFloat("_TrMaskFlip", SmokeTuning.ShadowMaskFlip ? 1f : 0f);
+                block.SetMatrix("_TrInvP", invP);
+                block.SetMatrix("_TrC2W", c2w);
+                block.SetVector("_TrZB", zb);
+                maskCb.DrawMesh(fullscreenQuad, Matrix4x4.identity, r.sharedMaterial, 0, ShadowCastPass, block);
+                block.SetFloat("_TrMaskMode", 0f);              // the copy is in the buffer; the overlay path (another camera) sees the old mode
+                drawn++;
+            }
+            lastMaskDraws = drawn;
+        }
+
+        private bool inited, noShaderLogged;
+
+        private void Start() { if (ModSettings.Enabled) TryInit(); }
+
+        // made when the mod is on and the shaders are loaded (a mod that was off at the start loads nothing: this runs when it is switched on)
+        private bool TryInit()
+        {
+            if (inited) return true;
             if (ShaderCache.SmokeCompositeShader == null)
             {
-                Debug.LogError("[PlumeTrails] No composite shader - half-res rendering is off and smoke " +
-                    "will not draw. Rebuild the AssetBundle.");
-                enabled = false;
-                return;
+                if (!noShaderLogged) { noShaderLogged = true; Debug.LogError("[PlumeTrails] No composite shader - half-res rendering is off and smoke will not draw. Rebuild the AssetBundle."); }
+                return false;
             }
+            inited = true;
             compositeMaterial = new Material(ShaderCache.SmokeCompositeShader);
             Camera.onPreRender += OnCameraPreRender;
 
@@ -204,11 +302,15 @@ namespace RaymarchedPlumeTrails
             // The vertices are clip-space already, so a bounds check against them would
             // cull the quad the moment the camera moved.
             fullscreenQuad.bounds = new Bounds(Vector3.zero, Vector3.one * 1e9f);
+            return true;
         }
 
-        private void OnDestroy()
+        private bool hooksReleased;
+
+        // everything this renderer hung on the cameras and the sun: the command buffers, the history of the temporal resolve. Called when the mod is switched off
+        // (the buffers are made again by themselves when it is switched on) and when the renderer goes.
+        private void ReleaseCameraHooks()
         {
-            Camera.onPreRender -= OnCameraPreRender;
             foreach (KeyValuePair<Camera, TemporalState> pair in temporal)
             {
                 for (int k = 0; k < 2; k++)
@@ -219,7 +321,7 @@ namespace RaymarchedPlumeTrails
             temporal.Clear();
             foreach (KeyValuePair<Camera, CommandBuffer> pair in buffers)
             {
-                if (pair.Key != null) pair.Key.RemoveCommandBuffer(Stage, pair.Value);
+                if (pair.Key != null) { CameraEvent se; if (!bufferStage.TryGetValue(pair.Key, out se)) se = CameraEvent.AfterForwardAlpha; pair.Key.RemoveCommandBuffer(se, pair.Value); }
                 pair.Value.Release();
             }
             buffers.Clear();
@@ -230,6 +332,16 @@ namespace RaymarchedPlumeTrails
                 pair.Value.Release();
             }
             shadowBuffers.Clear();
+            if (maskLight != null && maskCb != null) maskLight.RemoveCommandBuffer(LightEvent.AfterScreenspaceMask, maskCb);
+            if (maskCb != null) maskCb.Release();
+            maskCb = null; maskLight = null;
+
+        }
+
+        private void OnDestroy()
+        {
+            Camera.onPreRender -= OnCameraPreRender;
+            ReleaseCameraHooks();
 
             if (fullscreenQuad != null) Destroy(fullscreenQuad);
             if (compositeMaterial != null) Destroy(compositeMaterial);
@@ -294,15 +406,29 @@ namespace RaymarchedPlumeTrails
             return true;
         }
 
+        // KSP's own sun light (cheap: one component lookup). Scanning every light of the scene (FindObjectsOfType) was what stalled the game every 5 s: a KSP scene
+        // holds thousands of lights (the lamps of the space centre, parts, mods) and RenderSettings.sun is not set.
+        private static Light CheapSun()
+        {
+            try { if (Sun.Instance != null) { Light l = Sun.Instance.GetComponent<Light>(); if (l != null) return l; } } catch { }
+            return RenderSettings.sun;
+        }
+
+        private float nextFullLightScan;
+
         private void UpdateSunDirection()
         {
             sunSearchTimer -= Time.deltaTime;
-            if (sunLight == null || sunSearchTimer <= 0f)
+            bool lost = sunLight == null || !sunLight.isActiveAndEnabled;
+            if (lost || sunSearchTimer <= 0f)
             {
-                sunSearchTimer = 5f; // scene lights change rarely; searching every frame is waste
-                sunLight = RenderSettings.sun;
-                if (sunLight == null)
+                sunSearchTimer = lost ? 1f : 5f;
+                Light cand = CheapSun();
+                if (cand != null) sunLight = cand;
+                else if (lost && Time.unscaledTime >= nextFullLightScan)
                 {
+                    // nothing found the sun: the expensive scan of every light in the scene, at most every 30 s
+                    nextFullLightScan = Time.unscaledTime + 30f;
                     Light[] lights = FindObjectsOfType<Light>();
                     float best = -1f;
                     for (int i = 0; i < lights.Length; i++)
@@ -389,12 +515,14 @@ namespace RaymarchedPlumeTrails
 
             cb.Clear();
             if (SmokeTuning.ShadowCastStrength <= 0.001f) return;
+            if (MaskMode(cam)) return;          // deferred: the shadow goes into the sun's shadow mask (RecordSunMask), not over the picture
             int drawn = 0;
 
             for (int i = 0; i < SmokeRenderRegistry.Active.Count; i++)
             {
                 Renderer r = SmokeRenderRegistry.Active[i];
                 if (r == null || r.sharedMaterial == null) continue;
+                if (r.sharedMaterial.passCount < 2) continue;      // the plume / pad cloud shaders have no cast-shadow pass
 
                 // The spine arrays live in the renderer's property block, so the pass has
                 // to be handed the same block rather than relying on material state.
@@ -436,6 +564,14 @@ namespace RaymarchedPlumeTrails
 
         private void LateUpdate()
         {
+            // the mod is off: nothing is recorded, nothing hangs on the cameras, nothing is looked up
+            if (!ModSettings.Enabled)
+            {
+                if (!hooksReleased) { ReleaseCameraHooks(); hooksReleased = true; }
+                return;
+            }
+            hooksReleased = false;
+            if (!inited && !TryInit()) return;
             var perfSw = System.Diagnostics.Stopwatch.StartNew();
             try
             {
@@ -448,11 +584,12 @@ namespace RaymarchedPlumeTrails
                 {
                     renderPerfLogTimer = 1f;
                     double ms = perfSw.Elapsed.TotalMilliseconds;
-                    if (ms >= 0.5)
+                    if (ms >= 0.5 && SmokeTuning.DebugLogging)
                     {
                         Debug.Log(string.Format(
-                            "[PlumeTrails] render: cpuMs={0:F2} activeVolumes={1} shadowDraws={2}",
-                            ms, SmokeRenderRegistry.Active.Count, lastShadowDraws));
+                            "[PlumeTrails] render: cpuMs={0:F2} activeVolumes={1} shadowDraws={2} sunMaskDraws={3} (path {4}, sun shadows {5})",
+                            ms, SmokeRenderRegistry.Active.Count, lastShadowDraws, lastMaskDraws,
+                            Camera.main != null ? Camera.main.actualRenderingPath.ToString() : "-", sunLight != null ? sunLight.shadows.ToString() : "no sun"));
                     }
                 }
             }
@@ -495,6 +632,19 @@ namespace RaymarchedPlumeTrails
                 cb = new CommandBuffer { name = "RaymarchedPlumeTrails half-res smoke" };
                 cam.AddCommandBuffer(Stage, cb);
                 buffers[cam] = cb;
+                bufferStage[cam] = Stage;
+            }
+            else
+            {
+                CameraEvent have;
+                if (bufferStage.TryGetValue(cam, out have) && have != Stage)
+                {
+                    // the switch changed: move the buffer to the other stage
+                    cam.RemoveCommandBuffer(have, cb);
+                    cam.AddCommandBuffer(Stage, cb);
+                    bufferStage[cam] = Stage;
+                    Debug.Log("[PlumeTrails] smoke is now composited " + (SmokeTuning.SmokeLast ? "at the very END (before the image effects: after every cloud layer)" : SmokeTuning.SmokeBeforeClouds ? "BEFORE the transparent queue (cloud layers are drawn over it)" : "AFTER the transparent queue (smoke over the cloud layers)"));
+                }
             }
 
             cb.Clear();
@@ -541,6 +691,10 @@ namespace RaymarchedPlumeTrails
             // edge-aware upsample takes over, and the governor only gets there when the
             // frame rate says it has to.
             float renderScale = SmokeQuality.Current.renderScale;
+            // close to the smoke it fills the screen and the cost is the number of pixels: the buffer is made smaller there (it is upscaled with
+            // the temporal accumulation anyway). Three steps, and a step is only taken after it has been wanted for half a second, so that the
+            // buffers are not reallocated back and forth.
+            if (SmokeTuning.TemporalUpscale && renderScale < 0.999f) renderScale = Mathf.Max(0.30f, renderScale * ProximityScale(cam));
             int w = Mathf.Max(1, Mathf.RoundToInt(cam.pixelWidth * renderScale));
             int h = Mathf.Max(1, Mathf.RoundToInt(cam.pixelHeight * renderScale));
 
@@ -586,7 +740,13 @@ namespace RaymarchedPlumeTrails
             }
             Vector3 eye = cam.transform.position;
             sortedVolumes.Sort((a, b) =>
-                (b.bounds.center - eye).sqrMagnitude.CompareTo((a.bounds.center - eye).sqrMagnitude));
+            {
+                int pa, pb;
+                SmokeRenderRegistry.Priority.TryGetValue(a, out pa);
+                SmokeRenderRegistry.Priority.TryGetValue(b, out pb);
+                if (pa != pb) return pa.CompareTo(pb);
+                return (b.bounds.center - eye).sqrMagnitude.CompareTo((a.bounds.center - eye).sqrMagnitude);
+            });
 
             // "Laguje mimo ze rakieta jest 4km od dymu" - this pass costs PIXELS, not
             // vessel-to-camera distance, so the number that actually predicts its cost is

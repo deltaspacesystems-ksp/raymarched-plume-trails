@@ -13,11 +13,11 @@ namespace RaymarchedPlumeTrails
     {
         // Overall smoke opacity, applied at composite: 1 = as rendered, 0 = invisible.
         public static float Opacity = 1.0f;
-        public static float Density = 3.0f;
+        public static float Density = 1.21591f;
         public static float Absorption = 1.5f;
 
         // Surface bumpiness. Above ~0.9 it shreds the volume into flat scraps.
-        public static float DetailStrength = 0.72f;
+        public static float DetailStrength = 0.966851f;
         // 0 = detail adds and subtracts density, 1 = add only. In the saturated core there
         // is no headroom to add, so the symmetric form only ever carved holes - patchy.
         public static float DetailBias = 1.0f;
@@ -48,9 +48,9 @@ namespace RaymarchedPlumeTrails
         public static float SilhouetteWarpScale = 0.07f;
         // Swirl on top of the warp. Eased back alongside the warp, same reason.
         public static float VortexScale = 0.2f;
-        public static float VortexStrength = 1.0f;
+        public static float VortexStrength = 3.90055f;
         // Lower = bigger features.
-        public static float SilhouetteNoiseScale = 0.09f;
+        public static float SilhouetteNoiseScale = 0.129779f;
 
         // Ambient, washout and shadow darkness all set the same thing - lit-to-shaded
         // contrast - so they have to be moved together. Pushing ambient and washout up at
@@ -64,7 +64,7 @@ namespace RaymarchedPlumeTrails
         // LightReach, ShadowStrength, ShadowDarkness (and its dark-end colour in Apply), Washout,
         // LightSizeScaling and DetailShadeStrength were moved together - they all set the same
         // lit-to-shaded contrast, so change them together.
-        public static float AmbientFloor = 0.35f;        // lower = deeper shadows
+        public static float AmbientFloor = 0.432873f;        // lower = deeper shadows
         // Fraction of the real extinction the shadow ray sees. Lower = softer gradient.
         // 0.12 was near the top of the range and that is the binary regime: exp() over a
         // multi-metre step is then effectively lit-or-black, so every density boundary
@@ -76,7 +76,7 @@ namespace RaymarchedPlumeTrails
 
         // How far the shadow ray reaches. Must be comparable to the cloud's own thickness,
         // or a ray dies inside the lobe it started in and lobes never shadow each other.
-        public static float LightReach = 45f;
+        public static float LightReach = 320.028f;
         // Grows LightReach and SkyOcclusionDistance with the local puff size (exponent on
         // size relative to the 18 m reference, capped at 8x). 0 = fixed metres, which is
         // fine for small puffs and shades a big bloomed one flat, since the shadow ray
@@ -84,7 +84,7 @@ namespace RaymarchedPlumeTrails
         public static float LightSizeScaling = 0.2f;
         // Strength of the one-sample full-detail tap toward the sun that lets surface bumps
         // shade each other (the cheap light march has no noise, so texture was flat).
-        public static float DetailShadeStrength = 0.25f;
+        public static float DetailShadeStrength = 0.896409f;
         // Hierarchical billows whose lattice follows the local puff radius (see
         // ApplyDetailBuildup): 0 = old single fixed-size detail, 1 = fully billows. Cell is
         // the largest lobe size relative to the radius.
@@ -114,9 +114,9 @@ namespace RaymarchedPlumeTrails
         // profile is smaller than the old smoothstep coverage, so 1.3 restores the body size).
         // Supersedes LobeMix (now 0) and BillowErode (now 0), which did the same job badly.
         public static float ErodeMix = 1.0f;
-        public static float ErodeDepth = 0.3f;
-        public static float ErodeSharp = 0.75f;
-        public static float ErodeBoost = 1.3f;
+        public static float ErodeDepth = 0.112983f;
+        public static float ErodeSharp = 0.908011f;
+        public static float ErodeBoost = 1.06298f;
         // Lobes standing out past the capsule (fraction of the radius, 0 = off) and a bright additive rim.
         public static float EdgeProtrusion = 0f;
         public static float RimLight = 0f;
@@ -128,22 +128,61 @@ namespace RaymarchedPlumeTrails
         // no blocky lattice-aligned streaks. Applied when the volume is baked, i.e. at the next game start.
         // Version of the saved tuning.cfg layout. When a build changes the DEFAULT of a value (see
         // SmokeTuningConfig.ResetBelow), an older saved file must not keep pinning the old one.
-        public static int ConfigVersion = 3;
+        public static int ConfigVersion = SmokeTuningConfig.Layout;      // not a setting: the layout of tuning.cfg (see SmokeTuningConfig)
         public static bool GradientNoise = true;
         // Aerial perspective: how strongly far-away smoke is pulled toward the sky colour, and the distance (m, at sea
         // level) at which 63% of the contrast is gone. The haze thins with the air density at the camera.
         public static float AerialStrength = 0.6f;
         public static float AerialDistance = 14000f;
         // Heat haze over the nozzle: screen-space refraction of what is behind the hot exhaust.
+        // Physical plumes: the free jet of each burning nozzle (shock cells, Mach disk, core, afterburning), drawn volumetrically
+        public static bool PhysicalPlumes = false;        // off by default: Waterfall draws the flame; switch on to replace it with the physical plume
+        public static float PlumeExposure = 2.5f;
+        public static float PlumeStreak = 0.8f;           // the long smooth streak of a high-altitude launch (a long exposure): 0 = off, 1 = full (it grows in with altitude)
+        public static float PlumeScale = 1.0f;
+        public static int PlumeSteps = 56;
+        public static int PlumeMaxEngines = 16;
+        public static bool PlumeHideWaterfall = true;     // switch off Waterfall's flame while ours is drawn
+        // Pad fluid: a GPU smoke solver around the launch pad. The pad, trench and deflector are real obstacles (heights found with
+        // rays), the jet hits them, is turned, confined, flows out of the trench and rolls up into billows by itself. Replaces the
+        // billows-on-rails pad cloud while it runs (needs compute shaders).
+        public static bool PadVoxel = false;              // the pad as 3D geometry (peeled layers + distance field): the streams run through the trench under the mount
+        public static bool PadStreams = false;            // surface mode draws the flow along the pad as streamlines traced over the height map (not as simulated parcels)
+        public static bool PadSurface = false;            // surface mode: the puffs of the trail and of the pad flow over the surface seen in the height map (trench, deflector), sampled every 30 cm
+        public static bool PadFluid = false;               // the GPU solver is experimental: off by default (the surface mode is on)
+        public static float PadFluidCell = 2.5f;            // grid cell (m): smaller = finer and slower
+        public static float PadFluidLife = 50f;           // s the cloud is kept after the last engine report
+        public static float PadFluidDensity = 1.4f;
+        public static float PadFluidErode = 0.9f;        // how much the surface is eaten into cauliflower by noise
+        public static int PadFluidSteps = 64;             // ray steps
+        public static float PadFluidExposure = 1f;
+        public static float PadFluidFire = 1f;            // glow of the hot gas / the deflected flame
+        public static float PadFluidSun = 1.7f;
+        public static float PadFluidAmbient = 0.7f;
+        public static float PadFluidBuoyancy = 1f;
+        public static float PadFluidVorticity = 1.8f;
+        public static bool SmokeLast = false;              // composite the smoke at the very end (before the image effects): after EVE's volumetric clouds, which know nothing of the smoke and cover it when a cloud lies on the same ray
+        public static bool SmokeBeforeClouds = false;      // composite the smoke before the transparent queue: cloud layers (no depth) are then drawn over it
+        public static bool PadFluidShock = false;         // ignition overpressure wave: pushes the smoke and draws a condensation ring
+        public static float PadFluidShockStrength = 1f;
+        public static bool PadFluidWater = false;         // liquid water (deluge spray) that evaporates in the hot gas and condenses into steam
+        public static bool PlumeDeflect = true;           // the physical plume is turned by the surface it hits (flame deflector, trench floor)
+        public static float PlumeDeflectSpread = 1f;      // how fast the turned flame thickens
+        public static bool PadFluidDebug = false;         // draw what the solver sees of the pad (heights from rays vs from the rendered scenery), the jet and the flame hole
+        public static float PadFluidSize = 1f;            // width of the jet and so of the cloud (x)
+        public static float PadFluidSpread = 1f;          // how fast the jet spreads sideways (x)
+        public static float PadFluidShockSize = 1f;       // reach and thickness of the ignition wave (x)
+        public static float PadFluidShockSpeed = 1f;      // speed of the visible ring (x the speed of sound)
+        public static float PadFluidJet = 1f;             // speed of the jet where it reaches the pad (x)
         public static bool HeatHaze = true;
-        public static float HeatHazeStrength = 0.5f;      // overall, also scaled by throttle and air density
-        public static float HeatHazeAmount = 0.2f;        // displacement size
+        public static float HeatHazeStrength = 0.3f;     // overall, also scaled by throttle and air density
+        public static float HeatHazeAmount = 0.1f;        // displacement size
         public static float HeatHazeLengthDiameters = 14f; // length of the hot region, in nozzle diameters
         public static float HeatHazeScale = 1.6f;         // noise cell size (m)
         public static float HeatHazeSpeed = 30f;          // m/s, how fast it streams away from the nozzle
         public static float SteamBright = 0.9f;
         public static float SteamWhite = 0.7f;
-        public static float FineDetail = 0.5f;
+        public static float FineDetail = 0.3f;
         // Protruding edge made of round lobes (flat-looking discs) instead of wisps; off by default.
         public static bool EdgeRoundLobes = false;
         // Multiple scattering (Wrenninge / Nubis): indirect light = BeerMS(density toward the sun)
@@ -151,13 +190,13 @@ namespace RaymarchedPlumeTrails
         public static float MSMix = 1.0f;
         public static float DarkEdge = 0.6f;
         // Sky ambient occlusion from the radial profile instead of a 3-sample march (cheaper).
-        public static bool ProfileAO = true;
+        public static bool ProfileAO = false;
         public static float LobeCell = 1.0f;
         // Borrowed from EVE (LGhassen): normal-based diffuse (bumps facing the sun brighter, away
         // darker; the normal comes from the density falling toward the sun) and a glow on thin
         // translucent edges (silver lining), stronger when looking toward the light.
-        public static float FacingShade = 0.1f;
-        public static float EdgeGlow = 0.6f;
+        public static float FacingShade = 0.513812f;
+        public static float EdgeGlow = 0.254144f;
         public static float EdgeFeather = 1.0f;
         // Amplitude of the light-march and primary-march dithers (1 = old full strength).
         // Full strength put a fine stipple over the whole surface; offscreen A/B at 0.15-0.3
@@ -172,11 +211,11 @@ namespace RaymarchedPlumeTrails
         // reported: "sunlit side looks like it's in shadow"). Blending in some flatLit
         // gives sunlit-facing regions a brighter floor without discarding self-shadow
         // contrast entirely. Phase math itself was checked and is not inverted.
-        public static float ShadowStrength = 0.3f;       // 0 = flat, 1 = full self-shadowing
+        public static float ShadowStrength = 0.50442f;       // 0 = flat, 1 = full self-shadowing
         // 0 = near-white shaded side, 1 = deep blue-grey.
         // Raised 28 IX alongside the warp strengths - deeper valleys between lobes were
         // one of the three things asked for ("more contrast between billows").
-        public static float ShadowDarkness = 0.35f;
+        public static float ShadowDarkness = 1.0f;
         // 0 makes SmoothMax fall through to max(), whose gradient jumps at every capsule
         // joint - and each joint then renders as a transverse rib, i.e. pancakes.
         public static float SpineBlend = 0.30f;
@@ -198,7 +237,7 @@ namespace RaymarchedPlumeTrails
 
         // Large-scale density variation - soft dark patches. Scale is 1/metres.
         public static float MacroNoiseScale = 0.02f;
-        public static float MacroStrength = 0.0f;
+        public static float MacroStrength = 0.154696f;
 
         // Washout stands in for the multiple scattering a single-scattering march can't
         // produce; it's what keeps real launch smoke bright and low-contrast.
@@ -237,9 +276,10 @@ namespace RaymarchedPlumeTrails
         // parcel of exhaust that entrains air (Morton-Taylor-Turner), is buoyant in the real atmosphere,
         // is carried by the wind through the entrained air and meets the ground as a wall jet. See
         // Docs/PHYSICS.md. Off by default; the old model stays available for comparison.
-        public static bool PhysicsMode = false;
+        public static bool PhysicsMode = true;
         public static float PhysAlphaJet = 0.055f;        // entrainment coefficient of a momentum jet (Fischer 1979)
         public static float PhysAlphaThermal = 0.25f;     // ... of a buoyant thermal (Turner 1973)
+        public static float PhysJetMomentum = 0f;         // x the momentum the exhaust parcels start with in FLIGHT (air frame; near the pad they get all of it)
         public static float PhysAmbientTurb = 0.15f;      // m/s entrainment floor from ambient turbulence
         public static float PhysAddedMass = 0.5f;         // virtual-mass coefficient of a sphere
         public static float PhysRestitution = 0.1f;      // rebound off a surface (gas does not bounce like a ball)
@@ -258,14 +298,14 @@ namespace RaymarchedPlumeTrails
         public static float WallLumpGap = 1.1f;
         // Side-cloud puffs closer to the previous kept one than this x the sum of their radii are dropped, so a branch is a
         // string of distinct billows instead of a smooth tube (0 = keep all).
-        public static float WallSpacing = 0.7f;
+        public static float WallSpacing = 0.9f;
         // Condensation of the water vapour in liquid-engine plumes (see PuffPhysics.CondensedFraction): surface
         // relative humidity, the visibility an uncondensed (invisible-vapour) parcel keeps, and the liquid mass
         // fraction at which the cloud is fully dense.
         public static float PhysHumidity = 0.6f;
         public static float SteamMinVisibility = 0.7f;
         public static float SteamCondRef = 0.012f;            // collide puffs with the scene (pad, trench, buildings)
-        public static float PhysCollideBudget = 300f;     // scene raycasts per tick
+        public static float PhysCollideBudget = 120f;     // scene raycasts per tick
         // Debug overlay: purple = empty pixels inside the march box, red = rays that ran out of march budget.
         public static bool DebugBox = false;
         // Directional light/shade from the column's own geometry: the side facing the sun is lit, the
@@ -304,7 +344,7 @@ namespace RaymarchedPlumeTrails
         public static float NightAmbient = 0.18f;
         // Metres over which the terminator softens. Also sets how gradually a climbing
         // plume comes back into sunlight after the ground below has gone dark.
-        public static float TerminatorSoftness = 4000f;
+        public static float TerminatorSoftness = 4058.01f;
 
         // Shadow the cloud casts onto the terrain and the vessel. 0 disables the pass
         // outright, which is also the first thing to try if it costs too much: it is a
@@ -331,6 +371,8 @@ namespace RaymarchedPlumeTrails
         // before chasing it further; re-enable only after retesting confirms or rules
         // this out.
         public static float ShadowCastStrength = 0.7f;
+        public static bool ShadowIntoSunMask = false;       // EXPERIMENTAL, deferred rendering: the shadow goes into the sun's screen-space mask. Unity's deferred path may not use that mask (the shadow did not show), so it is off: the shadow is a multiply over the lit picture
+        public static bool ShadowMaskFlip = false;          // developer: flips the sun-mask shadow upside down (if it lands mirrored)
         // optical-depth scale of the cast shadow and the lowest it can get (sky light still reaches the ground)
         public static float ShadowCastDensity = 0.5f;
         public static float ShadowCastFloor = 0.3f;
@@ -348,6 +390,13 @@ namespace RaymarchedPlumeTrails
         // was the single biggest source of wrong-looking trails. Liquid-engine smoke is
         // gated off, not deleted - clear this to bring it back.
         public static bool SrbOnly = true;
+        public static bool PhysicalJetBend = true;           // the plume bends the way the gas moves (the air frame u0 = v + ve e, slowing by entrainment, the rocket going on): it curls into the track of a turning rocket
+        public static float PadStreamWater = 0.5f;          // the water of the deluge in the stream, kg per kg of the jet where it lands (it evaporates in the hot gas, cools it and condenses again)
+        public static float PadMistFraction = 0.06f;        // the share of the liquid water that stays in the air as fine mist (the rest is spray that rains out at once)
+        public static float PadStreamT0 = 800f;             // the temperature of the jet where it lands on the pad, K
+        public static float PadOpacityRef = 12f;            // the extinction (per metre) at which a stream is half opaque in the picture: lower = whiter and flatter
+        public static bool NozzleThreads = true;            // the smoke of every nozzle of a cluster is its own thread at first; the threads mix into the one trail as the jets spread into each other
+        public static bool PadAllEngines = false;          // on the pad (until the vehicle is 250 m up) EVERY engine feeds the pad cloud, hydrolox included: its exhaust is hot steam, and the deluge adds more
 
         // Plumes for LIQUID engines too. They run the same solid-jet / physics model as the boosters, but a
         // kerolox / hydrolox / methalox exhaust carries far less condensate than aluminised SRB smoke, so it is
@@ -366,27 +415,42 @@ namespace RaymarchedPlumeTrails
         // flame length (so it continues from the flame instead of overlapping it); the haze wraps WaterfallHazeLength x it.
         public static bool WaterfallIntegration = true;
         public static float WaterfallHandoff = 0.7f;
-        public static float WaterfallHazeLength = 1.0f;
+        public static float WaterfallHazeLength = 0.6f;
         // Volumetric explosions replace the stock blast effect (fireball + smoke cloud, size from the energy)
         public static bool ExplosionsEnabled = true;
+        public static bool ExplosionMushroom = false;      // a big blast of a tank rises as a mushroom cloud (vortex ring on a stem)
         public static float ExplosionScale = 1f;
         public static float ExplosionLife = 1f;
         public static float ExplosionFire = 1f;
+        public static bool ExplosionShockLens = true;      // the shock front bends the light (a ring that displaces the picture behind it)
+        public static float ExplosionShockLensGain = 6f;   // exaggeration of the real (tiny) refraction of air; 1 = physical
+        public static bool ExplosionSound = true;          // the bang, when the blast wave reaches the camera (delay and level from the physics of the blast)
+        public static float ExplosionSoundVolume = 1f;
+        public static float ExplosionShake = 1f;           // camera shake when the blast wave arrives (0 = off)
+        public static bool ExplosionDust = true;           // the shock front lifts dust off the ground as it passes (a ring that races out)
+        public static bool ExplosionDebris = true;         // fragments thrown out by a blast, with trails
+        public static float ExplosionDebrisAmount = 1f;
+        public static bool ExplosionVacuum = true;         // in a vacuum the blast is free expansion of the gas (no air wave); only where there is an oxidiser
+        public static float ExplosionShock = 1f;           // the shock wave of a fluid blast: strength of the push and the dust (0 = none)
+        public static bool ExplosionFluid = true;          // a blast is solved as a fluid on the GPU (off: the blob model)
+        public static float ExplosionFluidSpeed = 1.5f;   // how fast the fluid blast runs (1 = real time; slower looks bigger and heavier)
+        public static float ExplosionFluidErosion = 1.05f; // how ragged the surface of the fluid blast is
         // Physics mode: the smoke's release radius is matched to the flame's width (x this) so it continues the flame
-        public static bool WaterfallMatchStart = true;
+        public static bool WaterfallMatchStart = false;   // off: the plume is a narrow tube at the engine that widens steadily
         public static float WaterfallStartWidth = 0.5f;
         // Physical plumes: how far the exhaust may be diluted by entrained air and still count as visible smoke, as a
         // multiple of the engine kind's own value (SRB 90, kerolox 45, methalox 30, hydrolox 22). 0 = no limit.
         public static float PhysVisibleDilution = 1f;
         // Largest widening of a physical parcel's visible radius relative to its release radius (soft asymptote); keeps the
         // column from being a needle at the engine and fat far behind. 0 = off.
-        public static float PhysMaxGrowth = 3f;
+        public static float PhysMaxGrowth = 4f;
+        public static float PhysFarTaper = 0.25f;   // old smoke drawn this much narrower (0 = off)
         // largest shift of the heat haze, as a fraction of the screen
-        public static float HeatHazeMaxShift = 0.006f;
+        public static float HeatHazeMaxShift = 0.003f;
         public static float NozzleThrustScale = 1f;
         public static float LiquidDensityScale = 0.3f;
         // relative to kerolox: liquid hydrogen exhaust is almost pure water vapour, methane burns clean
-        public static float HydrogenPlumeVisibility = 0.35f;
+        public static float HydrogenPlumeVisibility = 0.9f;   // hydrogen exhaust is ~90 % water: it condenses to a dense white fog
         public static float MethanePlumeVisibility = 0.7f;
 
         // Exponent on how a spreading solid-motor trail thins. 2 is mass conservation along
@@ -433,7 +497,7 @@ namespace RaymarchedPlumeTrails
 
         // Multiplier on how fast the trail spreads, and the length of the slow near-field
         // phase before turbulent spreading takes over (seconds).
-        public static float SrbSpreadRate = 1.0f;
+        public static float SrbSpreadRate = 1.01547f;
         // Reversed 27 IX: an earlier cut to 0.35 was backwards. t0 sits in the
         // denominator of t^2/(t+t0) - a SMALLER t0 makes the curve rise FASTER at
         // small t, not slower (checked numerically: t0=0.35 reaches 61% of max width
@@ -453,7 +517,7 @@ namespace RaymarchedPlumeTrails
         // 0 Low, 1 Medium, 2 High, 3 Ultra. Low + temporal upscaling is the default (30 IX): it looks best.
         public static int QualityPreset = 0;
         // Let the frame-time governor trade resolution and sample counts down on demand.
-        public static bool AutoQuality = true;
+        public static bool AutoQuality = false;
         // Frame time the governor defends, in milliseconds (22 = ~45 fps).
         public static float TargetFrameMs = 22f;
 
@@ -472,6 +536,88 @@ namespace RaymarchedPlumeTrails
         // How much of the previous frame is kept, 0..1. Higher = smoother and sharper at
         // rest but slower to react; lower = more shimmer, less ghosting.
         public static float TemporalFeedback = 0.88f;
+        public static bool ScattererSunTint = true;          // light the smoke with the colour that Scatterer gives the sun (red at a low sun)
+        public static float ScattererTintStrength = 1.0f;      // measured against the clouds of a game: the full Rayleigh tint (blue 0.86 of red) made a trail r/b 1.14 where a sunlit cloud next to it was 1.05
+        // THE NEW TRAIL (CapsuleTrail + TrailCapsules.shader): the track of the emitters as capsules, radius and fade from the age, no puffs. Drawn IN ADDITION to the old
+        // smoke while it is being developed: turn the old trail off (Smoke on/off in Effects) to see it alone.
+        public static bool NewTrail = true;
+        public static bool NewTrailCloudShadow = true;      // EVE's volumetric clouds shade the trail (their light volume: the sun that gets through the clouds)
+        public static float NewTrailCloudShadowStrength = 1f;
+        public static int NewTrailEveMapVariant = 0;
+        public static bool EveCalibOverlay = false;          // red over the ground where the trail thinks EVE's clouds cast their shadow (calibration)        // the axes of the mapping of EVE's light volume (calibration; 0..15)
+        public static bool NewTrailPhysicalLight = true;    // sun scattering + sky light added (the model of cloud renderers and KSA) instead of the blend of the old palette
+        public static float NewTrailSunBright = 4f;          // the physical light: brightness of the sun
+        public static float NewTrailSkyBright = 1f;          // the physical light: brightness of the sky light
+        public static float NewTrailRoundLobes = 1.0f;      // 0 = the fbm noise (stringy), 1 = round perlin-worley lobes (like KSA); above 1 the lobes are fuller (less eroded)
+        public static float NewTrailGlow = 1.0f;            // how strongly the hot exhaust next to the nozzle glows (the orange start of the trail)
+        public static bool NewTrailPowder = false;          // the powdery fringe around the edge: off by default (a matter of taste)
+        public static float NewTrailDust = 0.7f;            // the powdery fringe around the edge (fine grains of thin smoke), 0 = a clean edge
+        public static bool NewTrailRoot = true;             // the new trail grows out of the flame (a tapering root from inside the flame) instead of starting as a round cap below it
+        public static bool HideStockSmoke = true;           // with the new trail on: hides the particle smoke the engine parts bring themselves (the thread between the flame and our trail)
+        public static bool HideOldTrail = true;             // hides the old trail (puffs) only: the pad, the plumes, the explosions and the new trail stay
+        public static float NewTrailMaxRadius = 70f;        // the radius the smoke grows to (m)
+        public static float NewTrailGrowTau = 6f;          // the time of growth (s)
+        public static float NewTrailLife = 300f;            // the life of the smoke (s), it fades over the last 45%
+        public static float NewTrailDensityK = 8f;           // the column of smoke: density = K / radius (like KSA: soft, lit through; 30 was a solid lump)
+        public static float NewTrailErosion = 0.8f;         // how deep the noise cuts into the shape (0..1)
+        public static float NewTrailSharpness = 0.8f;       // the sharpness of the eroded edge (KSA 0.95; 0.45 with the thin smoke of K 8 read as fog)
+        public static float NewTrailLightSoft = 0.4f;       // the edge sharpness the LIGHT march sees (the eye sees NewTrailSharpness): soft shadows inside the smoke (0 = same as the eye)
+        // THE TRAIL BY ENGINE TYPE: how much smoke (density) and how wide (size) the trail of an engine that burns this is, relative to a solid motor (1). 0 density = no trail
+        public static float TrailDensSolid = 1f, TrailSizeSolid = 1f;
+        public static float TrailDensKerolox = 0.5f, TrailSizeKerolox = 0.7f;
+        public static float TrailDensHydrolox = 0f, TrailSizeHydrolox = 0.5f;
+        public static float TrailDensMethalox = 0.25f, TrailSizeMethalox = 0.6f;
+        public static float TrailDensHypergolic = 0.3f, TrailSizeHypergolic = 0.6f;
+        public static float TrailDensNuclear = 0f, TrailSizeNuclear = 0.5f;
+        public static float TrailDensity(PlumeKind k)
+        {
+            switch (k)
+            {
+                case PlumeKind.Solid: return TrailDensSolid;
+                case PlumeKind.Kerolox: return TrailDensKerolox;
+                case PlumeKind.Hydrolox: return TrailDensHydrolox;
+                case PlumeKind.Methalox: return TrailDensMethalox;
+                case PlumeKind.Hypergolic: return TrailDensHypergolic;
+                case PlumeKind.Nuclear: return TrailDensNuclear;
+                default: return 0f;
+            }
+        }
+        public static float TrailSize(PlumeKind k)
+        {
+            switch (k)
+            {
+                case PlumeKind.Solid: return TrailSizeSolid;
+                case PlumeKind.Kerolox: return TrailSizeKerolox;
+                case PlumeKind.Hydrolox: return TrailSizeHydrolox;
+                case PlumeKind.Methalox: return TrailSizeMethalox;
+                case PlumeKind.Hypergolic: return TrailSizeHypergolic;
+                case PlumeKind.Nuclear: return TrailSizeNuclear;
+                default: return 0.5f;
+            }
+        }
+        public static bool ModEnabled = true;               // the master switch: off = no assets loaded, no hooks, nothing runs (saved with the settings)
+        public static float NewTrailEndAltitude = 25f;      // km: the trail does not exist above this altitude (0 = no limit); below it the smoke thins out over the fade length
+        public static float NewTrailFadeLength = 10f;       // km: the length over which the trail thins out before it ends
+        public static float NewTrailFill = 0f;              // the inner fill: from this profile inward the smoke is solid (the noise shapes only the surface; 0 = off)
+        public static float NewTrailNoiseFreq = 0.004f;    // noise frequency (1/m) at the radius of 80 m: the lobes are about 1 / this wide
+        public static float NewTrailShadowExt = 0.6f;       // how much of the extinction the light feels (self-shadow depth)
+        public static float NewTrailLightReach = 1.2f;      // the length of the light march (in radii)
+        public static float NewTrailSkyOcc = 0.8f;          // how much the smoke above blocks the sky light (dark undersides)
+        public static float NewTrailEngineLight = 1.0f;     // the light of the engine's flame on the smoke next to it (0 = off)
+        public static float NewTrailWobble = 0.3f;           // how much the width wanders and the column meanders (0 = a straight machined cone)
+        public static bool NewTrailAerial = false;          // aerial perspective (far smoke veiled by the air): off for now, to be done properly later
+        public static bool NewTrailShadow = true;           // the trail casts a shadow on the ground and the scene (strength and floor: the cast shadow settings)
+        public static float NewTrailDetail = 0f;           // the second, smaller scale of lobes (cauliflower) on the big ones
+        public static float NewTrailSilver = 6f;            // the light that shines through the thin parts of the smoke toward the sun (silver lining), 0 = off
+        public static float NewTrailTint = 0.4f;           // how much of the colour of the light (low sun, sky, ground) the smoke keeps: 0 = neutral grey, 1 = all of it
+        public static float NewTrailBillow = 0f;             // how far the big lobes move the edge (fraction of the radius)
+        public static float NewTrailBillowFreq = 0.37f;     // the frequency of the big lobes relative to the erosion noise
+        public static float NewTrailLightGain = 0.7f;      // how much of the sun the smoke takes (low = more contrast inside the plume)
+        public static float NewTrailSun = 5f;               // the brightness of the sun-lit smoke
+        public static float NewTrailAmbient = 0.35f;       // the least light (shadow floor)
+        public static float NewTrailDarkEdge = 0.2f;        // the multiple scattering at the rim (1 = no dark edge)
+        public static bool DebrisSmokeVolume = false;       // the smoke of the biggest fragments as blobs of the smoke raymarcher (it cost a lot and looked like beads)
+        public static float MinTrailPixels = 1.6f;          // a trail never gets thinner on the screen than this many pixels of the render buffer (far away it would be lost between pixels and the temporal filter); its density falls with the area, so the amount of smoke stays the same
 
         public static float ShadowCastDebug = 0f;
 
@@ -520,7 +666,7 @@ namespace RaymarchedPlumeTrails
         // bandT keeps every 2nd spawn index, older than 3 bandT every 4th, and so on, so points leave the spine
         // one at a time instead of half of them at once.
         public static float SpineBandSeconds = 3f;
-        public static float MaxPuffSize = 34f;
+        public static float MaxPuffSize = 11.2597f;
         // --- emission density (30 IX, live) --------------------------------------------------
         // Seconds between puffs while flying slowly; gaps between physics frames are filled by
         // interpolation anyway. Lower = denser chain, so single puffs no longer read as separate blobs.
@@ -533,12 +679,30 @@ namespace RaymarchedPlumeTrails
         // the flame and fading with distance (1 / (1 + (d/range)^2)). 0 = off.
         public static float FlameLightStrength = 1.0f;
         // Distance (m) at which the flame light has fallen to half, before the nozzle-size factor.
-        public static float FlameLightRange = 25f;
+        public static float FlameLightRange = 7.58563f;
         // Real Unity point lights for the engine flames (lights the pad, ground, rocket and scenery)
         // Flame deflector / pad: water deluge steam and the glowing deflected flame
-        public static bool PadWater = true;            // water-deluge steam in the flow that hits a deflector
+        // Pad flow rays (experimental, off): rays find where the exhaust meets the pad and where it flows from there
+        // Pad cloud: billows on rails along the PadFlow paths (the Saturn V cloud); needs the pad flow rays, which it switches on
+        public static bool PadCloud = false;
+        public static float PadCloudLife = 14f;
+        public static float PadCloudScale = 1f;
+        public static float PadCloudDensity = 1f;
+        public static float PadCloudSpeed = 1f;
+        public static float PadCloudLift = 1f;
+        public static bool PadFlowRays = false;
+        public static bool PadFlowVisibleOnly = false;  // a collider is a surface only if a renderer is drawn on it (ignores invisible lids)
+        public static bool PadFlowDebug = false;        // draw the found paths (yellow lines)
+        public static int PadFlowRayCount = 24;
+        public static float PadFlowStep = 4f;
+        public static float PadFlowMaxLength = 250f;
+        public static float PhysWallLift = 0.6f;       // a ground-hugging flow climbs at most this x its sideways speed (0 = free)
+        public static float PhysWallMomentum = 0.9f;    // a wall jet keeps this share of its sideways momentum while it entrains air (the r^-1.1 decay sets its speed instead); a sphere that swallows air over its whole surface stopped within ~20 m
+        public static float PhysWallDecay = 1f;         // wall jet speed ~ r^(-1.1 x this) from the impact (0 = no decay)
+        public static float PhysWallSpread = 0.1f;      // wall jet half-thickness / distance from the impact (Glauert ~0.1); 0 = off
+        public static bool PadWater = false;           // water-deluge steam in the flow that hits a deflector
         public static bool PadWaterAlways = false;      // ... on ANY ground impact, not only where a deflector / trench was detected
-        public static float PadWaterFrac = 0.6f;        // mass fraction of water in the deflected flow
+        public static float PadWaterFrac = 0.7f;        // mass fraction of water in the deflected flow
         public static float DeflectorFire = 1f;         // glow of the hot deflected flow (0 = off)
         public static bool EngineLights = true;
         public static float EngineLightIntensity = 1.5f;
@@ -558,7 +722,7 @@ namespace RaymarchedPlumeTrails
         public static float SpeedBillowMin = 20f;
         public static float SpeedThinTrailMax = 500f;
         public static float ThinTrailSizeMult = 0.8f;
-        public static float SpawnOffset = 15f;
+        public static float SpawnOffset = 32.2541f;
 
         // --- landing cloud (28 IX) -------------------------------------------------------
         // Big, dramatic ground-effect cloud during a powered landing - the Starship/booster
@@ -643,7 +807,7 @@ namespace RaymarchedPlumeTrails
         // huge translucent bell. It is the SAME plume as the launch column, not a second
         // effect: driven by one continuous pressure term, a real ascent passes smoothly
         // from one look to the other. Two discrete modes would visibly switch mid-flight.
-        public static bool JellyfishEnabled = true;
+        public static bool JellyfishEnabled = false;      // the altitude bloom is opt-in
         // How the plume thins as it expands, as an exponent on the size boost.
         //
         // Derived rather than dialled in by hand, because the two are not independent: the
@@ -750,7 +914,7 @@ namespace RaymarchedPlumeTrails
             block.SetFloat("_MarchJitter", MarchJitter);
             block.SetFloat("_ShadowStrength", ShadowStrength);
             block.SetColor("_SunlitColor",
-                new Color(SunlitBrightness, SunlitBrightness * 0.99f, SunlitBrightness * 0.97f));
+                new Color(SunlitBrightness, SunlitBrightness * 0.99f, SunlitBrightness * 0.97f));          // the colour of the sun at the smoke's place: ScattererSun.ApplyAt
             block.SetColor("_ShadowColor", Color.Lerp(
                 new Color(0.95f, 0.96f, 0.99f), new Color(0.30f, 0.34f, 0.42f), ShadowDarkness));
 

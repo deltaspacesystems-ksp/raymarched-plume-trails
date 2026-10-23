@@ -3,6 +3,8 @@
 #pragma kernel Splat
 #pragma kernel Blur
 #pragma kernel BakeNoise
+#pragma kernel BakeWorley
+#pragma kernel NormalizeWorley
 
 #define MAX_PUFFS 256
 
@@ -277,4 +279,63 @@ void BakeNoise(uint3 id : SV_DispatchThreadID)
     outValue.a = perlinWorleyTiled(p, _NoisePeriod);
 
     _NoiseOut[id] = outValue;
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// THE NOISE OF THE NEW TRAIL: inverted worley fbm (1 - F1, several octaves) - round, billowy lobes like a cumulus, the kind of
+// noise cloud renderers erode with. No perlin in it: perlin's ridges read as a bony spine with bits stuck to it.
+// Octaves double the cell count (lacunarity 2) with the weight falling by 0.57 per octave; the result is stretched to 0..1
+// by the minimum and maximum found over the whole volume (NormalizeWorley), so the erosion depth means the same at any setting.
+// ---------------------------------------------------------------------------------------------------------------------------
+RWTexture3D<float> _WorleyOut;
+
+// the distance to the nearest feature point, SMOOTHED (a soft minimum over the 27 cells, -log(sum exp(-k d)) / k): the plain minimum has a crease
+// wherever two cells meet, and those creases showed as flat plates with hard edges on wide old smoke
+float worleySmoothTiled(float3 p, float period, float k)
+{
+    float3 baseCell = floor(p);
+    float sum = 0.0;
+    for (int x = -1; x <= 1; x++)
+    for (int y = -1; y <= 1; y++)
+    for (int z = -1; z <= 1; z++)
+    {
+        float3 cell = baseCell + float3(x, y, z);
+        float3 cellPoint = cell + hash3Tiled(cell, period);
+        sum += exp(-k * length(p - cellPoint));
+    }
+    return -log(max(sum, 1e-30)) / k;
+}
+RWStructuredBuffer<uint> _WorleyStats;     // [0] = max, [1] = min, x 100000
+int _WorleyCells;                          // cells per tile in the first octave
+int _WorleyOctaves;
+float _WorleySoftK;                        // the smoothing of the cell edges (lower = rounder puffs; the F1 creases read as flat plates at a sharp edge)
+
+[numthreads(4,4,4)]
+void BakeWorley(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_NoiseResolution.x || id.y >= (uint)_NoiseResolution.y || id.z >= (uint)_NoiseResolution.z) return;
+    float3 uvw = (float3(id) + 0.5) / float3(_NoiseResolution);
+    float sum = 0.0, wsum = 0.0, amp = 1.0;
+    float cells = (float)_WorleyCells;
+    for (int o = 0; o < _WorleyOctaves; o++)
+    {
+        sum += saturate(worleySmoothTiled(uvw * cells, cells, _WorleySoftK > 0.0 ? _WorleySoftK : 8.0)) * amp;
+        wsum += amp;
+        amp *= 0.57;
+        cells *= 2.0;
+    }
+    float v = 1.0 - saturate(sum / wsum);
+    _WorleyOut[id] = v;
+    uint q = (uint)(v * 100000.0);
+    InterlockedMax(_WorleyStats[0], q);
+    InterlockedMin(_WorleyStats[1], q);
+}
+
+[numthreads(4,4,4)]
+void NormalizeWorley(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_NoiseResolution.x || id.y >= (uint)_NoiseResolution.y || id.z >= (uint)_NoiseResolution.z) return;
+    float mx = _WorleyStats[0] / 100000.0, mn = _WorleyStats[1] / 100000.0;
+    _WorleyOut[id] = saturate((_WorleyOut[id] - mn) / max(mx - mn, 1e-4));
 }

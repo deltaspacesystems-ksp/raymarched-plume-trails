@@ -7,18 +7,16 @@ using UnityEngine;
 
 namespace RaymarchedPlumeTrails
 {
-    // Persists every public static float / int / bool in SmokeTuning to a .cfg, so a look that was
-    // dialled in with the in-game sliders survives a restart - and can be read, diffed and pasted
-    // back into the defaults. The compiled-in defaults are captured before the file is applied, so
-    // "Reset to defaults" always works and a missing or partial file is harmless.
+    // Persists the public static float / int / bool values of SmokeTuning that the player CHANGED to PluginData/tuning.cfg.
+    //
+    // Only the differences from the compiled-in defaults are written. A value the player never touched is not in the file, so a
+    // new default in a later version reaches everyone; a value they did change keeps their choice. (Before 1.0 the file held
+    // every value, which froze the defaults of the day it was written - every retune then needed a list of values to ignore
+    // in old files. Those pre-1.0 files are set aside as tuning-pre1.cfg and not read.)
     public static class SmokeTuningConfig
     {
-        // Defaults changed in layout 2: the cast shadow was saved as 0 (it had been switched off) and would have kept the
-        // new analytic shadow off for ever.
-        private static readonly string[] ResetBelow2 = { "ShadowCastStrength", "ShadowCastDensity", "ShadowCastFloor" };
-
-        // Layout 3: smoke expansion and haze defaults were reduced (the plume had become huge); old saved values would undo it.
-        private static readonly string[] ResetBelow3 = { "PhysMaxGrowth", "WaterfallStartWidth", "WaterfallHazeLength", "HeatHazeStrength" };
+        // 18 = 1.0: the file holds only the changed values
+        public const int Layout = 18;
 
         private static readonly Dictionary<string, object> Defaults = new Dictionary<string, object>();
         private static bool captured;
@@ -38,6 +36,7 @@ namespace RaymarchedPlumeTrails
             foreach (FieldInfo f in typeof(SmokeTuning).GetFields(BindingFlags.Public | BindingFlags.Static))
             {
                 if (f.IsLiteral || f.IsInitOnly) continue;
+                if (f.Name == "ConfigVersion") continue;
                 if (f.FieldType == typeof(float) || f.FieldType == typeof(int) || f.FieldType == typeof(bool))
                     yield return f;
             }
@@ -57,6 +56,24 @@ namespace RaymarchedPlumeTrails
             return Convert.ToString(v, CultureInfo.InvariantCulture);
         }
 
+        private static bool IsDefault(FieldInfo f)
+        {
+            object d;
+            if (!Defaults.TryGetValue(f.Name, out d)) return false;
+            object v = f.GetValue(null);
+            if (v is float) return Mathf.Abs((float)v - (float)d) <= 1e-6f * Mathf.Max(1f, Mathf.Abs((float)d));
+            return v.Equals(d);
+        }
+
+        // how many values differ from the defaults (shown in the window)
+        public static int ChangedCount()
+        {
+            Capture();
+            int n = 0;
+            foreach (FieldInfo f in Fields()) if (!IsDefault(f)) n++;
+            return n;
+        }
+
         public static void Load()
         {
             Capture();
@@ -67,16 +84,20 @@ namespace RaymarchedPlumeTrails
                 ConfigNode root = ConfigNode.Load(path);
                 ConfigNode n = root != null ? root.GetNode("PLUME_TUNING") : null;
                 if (n == null) return;
+                int fileLayout = 1;
+                if (n.HasValue("ConfigVersion")) int.TryParse(n.GetValue("ConfigVersion"), out fileLayout);
+                if (fileLayout < Layout)
+                {
+                    // a pre-1.0 file holds every value of its day, not the player's choices: set it aside, start from the 1.0 defaults
+                    string backup = Path.Combine(Path.GetDirectoryName(path), "tuning-pre1.cfg");
+                    try { if (File.Exists(backup)) File.Delete(backup); File.Move(path, backup); } catch (Exception) { }
+                    Debug.Log("[PlumeTrails] tuning.cfg from before 1.0 (layout " + fileLayout + ") set aside as " + backup + "; the 1.0 defaults are used");
+                    return;
+                }
                 int applied = 0;
-                int fileVersion = 1;
-                if (n.HasValue("ConfigVersion")) int.TryParse(n.GetValue("ConfigVersion"), out fileVersion);
                 foreach (FieldInfo f in Fields())
                 {
                     if (!n.HasValue(f.Name)) continue;
-                    if (f.Name == "ConfigVersion") continue;
-                    // a value whose default was changed on purpose since the file was written is not applied from it
-                    if (fileVersion < 2 && Array.IndexOf(ResetBelow2, f.Name) >= 0) continue;
-                    if (fileVersion < 3 && Array.IndexOf(ResetBelow3, f.Name) >= 0) continue;
                     string s = n.GetValue(f.Name);
                     try
                     {
@@ -87,8 +108,7 @@ namespace RaymarchedPlumeTrails
                     }
                     catch (Exception) { Debug.LogWarning("[PlumeTrails] tuning.cfg: bad value '" + s + "' for " + f.Name); }
                 }
-                SmokeTuning.ConfigVersion = 3;
-                Debug.Log("[PlumeTrails] tuning.cfg loaded, " + applied + " values from " + path + (fileVersion < 2 ? " (older layout: refreshed defaults for " + string.Join(", ", ResetBelow2) + ")" : ""));
+                Debug.Log("[PlumeTrails] tuning.cfg loaded: " + applied + " changed values from " + path);
             }
             catch (Exception e) { Debug.LogWarning("[PlumeTrails] tuning.cfg load failed: " + e.Message); }
         }
@@ -100,11 +120,19 @@ namespace RaymarchedPlumeTrails
             {
                 ConfigNode root = new ConfigNode();
                 ConfigNode n = root.AddNode("PLUME_TUNING");
-                foreach (FieldInfo f in Fields()) n.AddValue(f.Name, Format(f.GetValue(null)));
+                n.AddValue("ConfigVersion", Layout);
+                int written = 0;
+                foreach (FieldInfo f in Fields())
+                {
+                    if (IsDefault(f)) continue;
+                    n.AddValue(f.Name, Format(f.GetValue(null)));
+                    written++;
+                }
                 string path = FilePath;
+                if (written == 0) { if (File.Exists(path)) File.Delete(path); return; }      // nothing changed: no file at all
                 Directory.CreateDirectory(Path.GetDirectoryName(path));
-                root.Save(path, "Raymarched Plume Trails - every tuning value; written by 'Save settings' in the debug menu");
-                Debug.Log("[PlumeTrails] tuning saved to " + path);
+                root.Save(path, "Raymarched Plume Trails - only the values you changed in the settings window (delete the file to go back to the defaults)");
+                Debug.Log("[PlumeTrails] tuning saved: " + written + " changed values to " + path);
             }
             catch (Exception e) { Debug.LogWarning("[PlumeTrails] tuning.cfg save failed: " + e.Message); }
         }

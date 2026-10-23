@@ -10,8 +10,17 @@ namespace RaymarchedPlumeTrails
         public static Shader SmokeVolumeShader;
         public static Shader SmokeCompositeShader;
         public static Shader HeatHazeShader;
+        public static Shader PlumeCoreShader;
+        public static Shader PadFluidShader;
+        public static Shader PadHeightShader;
+        public static Shader PadLayerShader;
+        public static Shader ShockLensShader;
+        public static Shader DebrisShader;
+        public static ComputeShader PadFluidCompute;
+        public static ComputeShader BlastFluidCompute;
         public static ComputeShader SmokeVolumeSplatCompute;
         public static RenderTexture NoiseTexture;
+        public static RenderTexture WorleyTexture;          // the noise of the new trail (inverted worley fbm)
     }
 
     // runs once on the main menu, before any vessel loads
@@ -66,9 +75,26 @@ namespace RaymarchedPlumeTrails
             return null;
         }
 
+        private static bool assetsLoaded;
+
         private void Awake()
         {
             SmokeTuningConfig.Load();
+            if (!ModSettings.Enabled) { Debug.Log("[PlumeTrails] switched off: no assets are loaded, nothing hooks into the game (switch it on in the settings window: the assets are loaded then)"); return; }
+            LoadAssets();
+        }
+
+        // called when the mod is switched on while the game runs and nothing was loaded at the start
+        public static void EnsureLoaded()
+        {
+            if (assetsLoaded) return;
+            LoadAssets();
+        }
+
+        private static void LoadAssets()
+        {
+            if (assetsLoaded) return;
+            assetsLoaded = true;
             // Environment banner. "UI is there, bundle is there, nothing renders" is
             // otherwise undiagnosable from a log - every requirement below can fail
             // silently. Ask for these lines first in any blank-screen report.
@@ -116,7 +142,24 @@ namespace RaymarchedPlumeTrails
                     "' missing from the bundle - smoke will not be drawn. Rebuild the AssetBundle.");
             }
 
-ShaderCache.HeatHazeShader = bundle.LoadAsset<Shader>("HeatHaze");
+ShaderCache.PlumeCoreShader = bundle.LoadAsset<Shader>("PlumeCore");
+            if (ShaderCache.PlumeCoreShader == null)
+                Debug.LogWarning("[PlumeTrails] plume shader missing from the bundle (rebuild it) - no physical plumes");
+            ShaderCache.PadHeightShader = bundle.LoadAsset<Shader>("PadHeight");
+            ShaderCache.PadLayerShader = bundle.LoadAsset<Shader>("PadLayer");
+            ShaderCache.ShockLensShader = bundle.LoadAsset<Shader>("ShockLens");
+            ShaderCache.DebrisShader = bundle.LoadAsset<Shader>("BlastDebris");
+            if (ShaderCache.ShockLensShader == null || ShaderCache.DebrisShader == null) Debug.LogWarning("[PlumeTrails] shock lens / debris shader missing from the bundle (rebuild it)");
+            if (ShaderCache.PadLayerShader == null) Debug.LogWarning("[PlumeTrails] pad layer shader missing from the bundle (rebuild it) - the pad is a height map only");
+            CapsuleTrail.TrailShader = bundle.LoadAsset<Shader>("TrailCapsules");
+            if (CapsuleTrail.TrailShader == null) Debug.LogWarning("[PlumeTrails] capsule trail shader missing from the bundle (rebuild it)");
+            ShaderCache.PadFluidShader = bundle.LoadAsset<Shader>("PadFluid");
+            ShaderCache.PadFluidCompute = bundle.LoadAsset<ComputeShader>("PadFluid");
+            ShaderCache.BlastFluidCompute = bundle.LoadAsset<ComputeShader>("BlastFluid");
+            if (ShaderCache.BlastFluidCompute == null) Debug.LogWarning("[PlumeTrails] blast fluid compute missing from the bundle (rebuild it) - explosions use the blob model");
+            if (ShaderCache.PadFluidShader == null || ShaderCache.PadFluidCompute == null)
+                Debug.LogWarning("[PlumeTrails] pad fluid shader / compute missing from the bundle (rebuild it) - no GPU pad cloud");
+            ShaderCache.HeatHazeShader = bundle.LoadAsset<Shader>("HeatHaze");
             if (ShaderCache.HeatHazeShader == null)
                 Debug.LogWarning("[PlumeTrails] heat haze shader missing from the bundle (rebuild it) - no heat haze");
 
@@ -205,6 +248,7 @@ ShaderCache.HeatHazeShader = bundle.LoadAsset<Shader>("HeatHaze");
 
             ShaderCache.NoiseTexture = tex;
             Shader.SetGlobalTexture("_RaymarchedPlumeTrailsNoise", tex);
+            BakeWorleyTexture(compute);
             Shader.SetGlobalFloat("_NoiseTilePeriod", NoisePeriod);
 
             Debug.Log(string.Format(
@@ -212,7 +256,41 @@ ShaderCache.HeatHazeShader = bundle.LoadAsset<Shader>("HeatHaze");
                 NoiseResolution, NoisePeriod));
         }
 
-        private void LoadShaderFromMaterial(AssetBundle bundle, string materialAssetName, ref Shader target)
+        // THE NOISE OF THE NEW TRAIL: an inverted worley fbm (round, billowy lobes - no perlin, whose ridges read as a bony spine with bits stuck to it),
+        // stretched to 0..1 by the min / max of the whole volume (found with atomics on the GPU). 4 cells per tile in the first octave, 5 octaves.
+        private const int WorleyCells = 3, WorleyOctaves = 8;        // like KSA: big base puffs (~1 radius) with 8 octaves of smaller puffs on them; 3 octaves showed plates and terraces at a sharp edge
+        private static void BakeWorleyTexture(ComputeShader compute)
+        {
+            int kb = compute.FindKernel("BakeWorley"), kn = compute.FindKernel("NormalizeWorley");
+            if (kb < 0 || kn < 0) { Debug.LogError("[PlumeTrails] the bundle has no BakeWorley kernel - rebuild the AssetBundle"); return; }
+            RenderTexture wt = new RenderTexture(NoiseResolution, NoiseResolution, 0, RenderTextureFormat.RHalf)
+            {
+                dimension = UnityEngine.Rendering.TextureDimension.Tex3D,
+                volumeDepth = NoiseResolution,
+                enableRandomWrite = true,
+                wrapMode = TextureWrapMode.Repeat,
+                filterMode = FilterMode.Trilinear,
+                useMipMap = false
+            };
+            if (!wt.Create()) { Debug.LogError("[PlumeTrails] could not create the worley noise volume"); return; }
+            ComputeBuffer stats = new ComputeBuffer(2, 4);
+            stats.SetData(new uint[] { 0u, 0xffffffffu });
+            compute.SetInts("_NoiseResolution", NoiseResolution, NoiseResolution, NoiseResolution);
+            compute.SetInt("_WorleyCells", WorleyCells);
+            compute.SetInt("_WorleyOctaves", WorleyOctaves);
+            compute.SetFloat("_WorleySoftK", 4f);         // rounder cell edges (8 left creases that read as flat plates at the sharp edge)
+            int groups = NoiseResolution / 4;
+            compute.SetTexture(kb, "_WorleyOut", wt); compute.SetBuffer(kb, "_WorleyStats", stats);
+            compute.Dispatch(kb, groups, groups, groups);
+            compute.SetTexture(kn, "_WorleyOut", wt); compute.SetBuffer(kn, "_WorleyStats", stats);
+            compute.Dispatch(kn, groups, groups, groups);
+            stats.Release();
+            ShaderCache.WorleyTexture = wt;
+            Shader.SetGlobalTexture("_TrWorleyNoise", wt);
+            Debug.Log("[PlumeTrails] Baked the " + NoiseResolution + "^3 worley noise of the trail (" + WorleyCells + " cells, " + WorleyOctaves + " octaves).");
+        }
+
+        private static void LoadShaderFromMaterial(AssetBundle bundle, string materialAssetName, ref Shader target)
         {
             Material mat = bundle.LoadAsset<Material>(materialAssetName);
             if (mat == null)

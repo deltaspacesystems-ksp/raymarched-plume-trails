@@ -1,0 +1,319 @@
+// The GPU solver of an EXPLOSION: stable fluids (semi-Lagrangian velocity, MacCormack scalars, vorticity confinement, pressure projection) in a box
+// around the blast. A hot sphere of gas is injected (the fireball) and left alone: it expands, rises by its own buoyancy, rolls up into
+// vortices and breaks into billows - nobody models the cauliflower, the flow makes it. Scalars: x = steam (white vapour), y = soot (dark
+// smoke), z = temperature (0..1+, glows and gives buoyancy), w = unused. The ground is the closed bottom of the box; the other faces are open.
+// Rendered by PadFluid.shader (the same medium as the pad cloud).
+#pragma kernel Moments
+#pragma kernel Clear
+#pragma kernel Burst
+#pragma kernel Forces
+#pragma kernel Curl
+#pragma kernel Vorticity
+#pragma kernel AdvectVelocity
+#pragma kernel AdvectScalarFwd
+#pragma kernel AdvectScalarBack
+#pragma kernel Divergence
+#pragma kernel Jacobi
+#pragma kernel Project
+#pragma kernel Shock
+
+RWTexture3D<float4> _VelOut;
+Texture3D<float4> _VelIn;
+RWTexture3D<float4> _SclOut;
+Texture3D<float4> _SclIn;
+RWTexture3D<float4> _TmpOut;
+Texture3D<float4> _TmpIn;
+RWTexture3D<float4> _CurlOut;
+Texture3D<float4> _CurlIn;
+RWTexture3D<float> _PrsOut;
+Texture3D<float> _PrsIn;
+RWTexture3D<float> _DivOut;
+Texture3D<float> _DivIn;
+
+SamplerState sampler_linear_clamp;
+
+int3 _Dim;            // nx, ny, nz
+float _Cell;          // metres per cell
+float _Vacuum;          // 1 = a blast in a vacuum: no ground, the box is open on all sides
+float4 _Dilute;       // free expansion of a vacuum blast (the grid expands with the cloud): x = concentration of the scalars, y = temperature, z = velocity
+float3 _Wind;         // the wind that carries the whole blast (m/s, local frame) - for a blast in the air also minus the velocity of the box (it follows the cloud)
+float3 _Bulk;         // the velocity of the vehicle that blew up, relative to the air (m/s, local frame): the whole cloud starts with it (first step only, see _BulkOn)
+float _BulkOn;
+float _DragK;         // drag of the air on the cloud, 1/m: dv/dt = - k_c |v| v where there is smoke (k_c is larger where the cloud is thin: the light edges are stopped first)
+float _Dt;
+float4 _Params;       // buoyancy, weight, drag, vorticity
+float4 _Params2;      // dissipation (steam), dissipation (soot), cooling, unused
+int _BurstCount;
+float4 _BurstA[32];    // xyz = centre of the source (local, m), w = its radius
+float4 _BurstB[32];    // x = outward speed kick (m/s, applied once), y = steam per second, z = soot per second, w = lift of the kick (0..1)
+float4 _BurstC[32];    // x = temperature of the injected gas, y = noise seed, z = how lumpy the kick is (0..1), w = strength of the continuing injection (0..1)
+
+bool Solid(int3 c) { return _Vacuum < 0.5 && c.y < 0; }
+
+float3 Uvw(float3 p) { return (p + 0.5) / float3(_Dim); }
+
+float Inside(float3 q)
+{
+    float o = max(max(-q.x, q.x - (_Dim.x - 1.0)), max(max(-q.z, q.z - (_Dim.z - 1.0)), q.y - (_Dim.y - 1.0)));
+    return saturate(1.0 - o / 1.5);
+}
+
+float Hash(float3 p)
+{
+    p = frac(p * 0.3183099 + 0.1);
+    p *= 17.0;
+    return frac(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+
+// the moments of the smoke along x for every line (y, z): (mass, mass * x, mass * y, mass * z) in cells; the CPU adds the lines up (the centre of the cloud)
+RWStructuredBuffer<float4> _MomOut;
+[numthreads(8,8,1)]
+void Moments (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_Dim.y || id.y >= (uint)_Dim.z) return;
+    int y = (int)id.x, z = (int)id.y;
+    float4 acc = 0;
+    for (int x = 0; x < _Dim.x; x++)
+    {
+        float4 s = _SclIn[int3(x, y, z)];
+        float m = s.x + 1.25 * s.y + 0.6 * s.w + 0.8 * s.z;
+        acc += float4(m, m * x, m * y, m * z);
+    }
+    _MomOut[z * _Dim.y + y] = acc;
+}
+
+[numthreads(4,4,4)]
+void Clear (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    _VelOut[id] = 0; _SclOut[id] = 0; _PrsOut[id] = 0;
+}
+
+// the fireballs: spheres of hot gas (continuing injection) and, on the first step, the outward kick of each blast with a lumpy strength.
+// Several blasts share ONE grid, so their flows push each other, merge and roll up together.
+[numthreads(4,4,4)]
+void Burst (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    int3 c = int3(id);
+    float3 p = float3((c.x + 0.5) * _Cell, (c.y + 0.5) * _Cell, (c.z + 0.5) * _Cell);
+    float4 v = _VelIn[id];
+    float4 s = _SclIn[id];
+    for (int b = 0; b < _BurstCount; b++)
+    {
+        float3 d = p - _BurstA[b].xyz;
+        float r = length(d);
+        float R = _BurstA[b].w;
+        if (r > R) continue;
+        float w = 1.0 - smoothstep(0.55, 1.0, r / R);
+        // lumps: the blast is not a perfect sphere - random strength per patch of cells (these seed the billows)
+        float lump = lerp(1.0, 0.35 + 1.3 * Hash(floor(p / (0.18 * R)) + _BurstC[b].y), _BurstC[b].z);
+        if (_BurstB[b].x > 0.0)
+        {
+            float3 dir = r > 1e-3 ? d / r : float3(0, 1, 0);
+            dir = normalize(dir + float3(0.0, _BurstB[b].w, 0.0));
+            v.xyz += dir * (_BurstB[b].x * lump * w);
+        }
+        float k = _BurstC[b].w * w;
+        s.x += _BurstB[b].y * _Dt * k * lump;
+        s.y += _BurstB[b].z * _Dt * k * lump;
+        s.z = max(s.z, _BurstC[b].x * k * (0.7 + 0.3 * lump));
+    }
+    // the cloud of a blast of a vehicle that was flying: all the gas goes on with the speed of the vehicle (the air around it is at rest)
+    if (_BulkOn > 0.5) v.xyz += _Bulk * saturate(s.z * 1.2);
+    _VelOut[id] = v;
+    _SclOut[id] = s;
+}
+
+[numthreads(4,4,4)]
+void Forces (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    float4 v = _VelIn[id];
+    float4 s = _SclIn[id];
+    float a = _Params.x * s.z - _Params.y * (s.x + s.y);
+    v.y += a * _Dt;
+    v.xyz *= (1.0 - _Params.z * _Dt);
+    if (_DragK > 0.0)
+    {
+        // the drag of the air (at rest) on the smoke: where there is none the velocity is that of the air and is left alone
+        float dens = s.x + 1.25 * s.y + 0.6 * s.w + 0.8 * s.z;
+        float m = saturate(dens * 1.2);
+        float kc = _DragK * lerp(2.2, 0.7, m);
+        v.xyz -= kc * length(v.xyz) * v.xyz * m * _Dt;
+    }
+    v.xyz *= _Dilute.z;
+    _VelOut[id] = v;
+}
+
+[numthreads(4,4,4)]
+void Curl (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    int3 c = int3(id);
+    int3 lo = max(c - 1, 0), hi = min(c + 1, _Dim - 1);
+    float inv = 0.5 / _Cell;
+    float3 dx = _VelIn[int3(hi.x, c.y, c.z)].xyz - _VelIn[int3(lo.x, c.y, c.z)].xyz;
+    float3 dy = _VelIn[int3(c.x, hi.y, c.z)].xyz - _VelIn[int3(c.x, lo.y, c.z)].xyz;
+    float3 dz = _VelIn[int3(c.x, c.y, hi.z)].xyz - _VelIn[int3(c.x, c.y, lo.z)].xyz;
+    float3 w = float3(dy.z - dz.y, dz.x - dx.z, dx.y - dy.x) * inv;
+    _CurlOut[id] = float4(w, length(w));
+}
+
+[numthreads(4,4,4)]
+void Vorticity (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    int3 c = int3(id);
+    int3 lo = max(c - 1, 0), hi = min(c + 1, _Dim - 1);
+    float inv = 0.5 / _Cell;
+    float3 g = float3(_CurlIn[int3(hi.x, c.y, c.z)].w - _CurlIn[int3(lo.x, c.y, c.z)].w,
+                      _CurlIn[int3(c.x, hi.y, c.z)].w - _CurlIn[int3(c.x, lo.y, c.z)].w,
+                      _CurlIn[int3(c.x, c.y, hi.z)].w - _CurlIn[int3(c.x, c.y, lo.z)].w) * inv;
+    g /= (length(g) + 1e-6);
+    float3 w = _CurlIn[id].xyz;
+    float3 f = cross(g, w);
+    float4 v = _VelIn[id];
+    v.xyz += _Params.w * 0.5 * _Cell * f * _Dt;
+    _VelOut[id] = v;
+}
+
+[numthreads(4,4,4)]
+void AdvectVelocity (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    float3 p = float3(id);
+    float3 u = _VelIn[id].xyz + _Wind;
+    float3 back = p - _Dt * u / _Cell;
+    _VelOut[id] = float4(_VelIn.SampleLevel(sampler_linear_clamp, Uvw(back), 0).xyz, 0);
+}
+
+[numthreads(4,4,4)]
+void AdvectScalarFwd (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    float3 p = float3(id);
+    float3 u = _VelIn[id].xyz + _Wind;
+    float3 q = p - _Dt * u / _Cell;
+    _TmpOut[id] = _SclIn.SampleLevel(sampler_linear_clamp, Uvw(q), 0) * Inside(q);
+}
+
+[numthreads(4,4,4)]
+void AdvectScalarBack (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    float3 p = float3(id);
+    float3 u = _VelIn[id].xyz + _Wind;
+    float4 fwd = _TmpIn[id];
+    float3 qb = p + _Dt * u / _Cell;
+    float4 back = _TmpIn.SampleLevel(sampler_linear_clamp, Uvw(qb), 0) * Inside(qb);
+    float4 val = fwd + 0.5 * (_SclIn[id] - back);
+    float3 dep = p - _Dt * u / _Cell;
+    int3 b0 = int3(floor(clamp(dep, 0, float3(_Dim) - 1.001)));
+    int3 b1 = min(b0 + 1, _Dim - 1);
+    float4 mn = 1e30, mx = -1e30;
+    for (int k = 0; k < 8; k++)
+    {
+        int3 q = int3((k & 1) ? b1.x : b0.x, (k & 2) ? b1.y : b0.y, (k & 4) ? b1.z : b0.z);
+        float4 f = _SclIn[q];
+        mn = min(mn, f); mx = max(mx, f);
+    }
+    val = clamp(val, mn, mx) * Inside(dep);
+    val.x *= 1.0 - _Params2.x * _Dt;
+    val.y *= 1.0 - _Params2.y * _Dt;
+    val.z *= 1.0 - _Params2.z * _Dt;
+    val.xy *= _Dilute.x;
+    val.z *= _Dilute.y;
+    _SclOut[id] = max(val, 0);
+}
+
+float3 VelAt(int3 c, float3 own)
+{
+    if (c.x < 0 || c.y < 0 || c.z < 0 || c.x >= _Dim.x || c.y >= _Dim.y || c.z >= _Dim.z) return own;
+    return _VelIn[c].xyz;
+}
+
+[numthreads(4,4,4)]
+void Divergence (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    int3 c = int3(id);
+    float3 o = _VelIn[id].xyz;
+    float d = (VelAt(c + int3(1,0,0), o).x - VelAt(c - int3(1,0,0), o).x
+             + VelAt(c + int3(0,1,0), o).y - ((c.y == 0 && _Vacuum < 0.5) ? 0.0 : VelAt(c - int3(0,1,0), o).y)
+             + VelAt(c + int3(0,0,1), o).z - VelAt(c - int3(0,0,1), o).z) / (2.0 * _Cell);
+    // the fireball expands: the sphere of burning gas is a source of volume (per second), only while it is fed
+    float3 pc = float3((c.x + 0.5) * _Cell, (c.y + 0.5) * _Cell, (c.z + 0.5) * _Cell);
+    for (int b = 0; b < _BurstCount; b++)
+        d -= _Params2.w * _BurstC[b].w * (1.0 - smoothstep(0.55, 1.35, length(pc - _BurstA[b].xyz) / max(_BurstA[b].w, 1e-3)));
+    _DivOut[id] = d;
+}
+
+float Pn(int3 c, float own)
+{
+    if (c.y < 0) return _Vacuum > 0.5 ? 0.0 : own;             // the ground: closed (open in a vacuum)
+    if (c.x < 0 || c.z < 0 || c.x >= _Dim.x || c.z >= _Dim.z || c.y >= _Dim.y) return 0;
+    return _PrsIn[c];
+}
+
+[numthreads(4,4,4)]
+void Jacobi (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    int3 c = int3(id);
+    float own = _PrsIn[id];
+    float sum = Pn(c + int3(1,0,0), own) + Pn(c - int3(1,0,0), own)
+              + Pn(c + int3(0,1,0), own) + Pn(c - int3(0,1,0), own)
+              + Pn(c + int3(0,0,1), own) + Pn(c - int3(0,0,1), own);
+    float target = (sum - _Cell * _Cell * _DivIn[id] / _Dt) / 6.0;
+    _PrsOut[id] = target;
+}
+
+[numthreads(4,4,4)]
+void Project (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    int3 c = int3(id);
+    float own = _PrsIn[id];
+    float3 g = float3(Pn(c + int3(1,0,0), own) - Pn(c - int3(1,0,0), own),
+                      Pn(c + int3(0,1,0), own) - Pn(c - int3(0,1,0), own),
+                      Pn(c + int3(0,0,1), own) - Pn(c - int3(0,0,1), own)) / (2.0 * _Cell);
+    float3 v = _VelIn[id].xyz - _Dt * g;
+    if (c.y == 0 && _Vacuum < 0.5) v.y = max(v.y, 0.0);         // nothing goes down through the ground
+    _VelOut[id] = float4(v, 0);
+}
+
+// SHOCK WAVES. The front of every blast is a shell that races out through the air; the air behind it is thrown outward (the induced velocity of
+// a shock, falling as 1 / r) and, where the front sweeps over the ground, it throws up a layer of dust. Each cell the front passes over gets ONE kick
+// (the band between the radius at the last step and now; the kick is scaled when the band had to be widened to one cell).
+int _ShockCount;
+float4 _ShockA[8];    // xyz = centre (local, m), w = radius of the front now
+float4 _ShockB[8];    // x = radius of the front at the last step, y = induced velocity at 30 m (m/s), z = lift of the direction, w = unused
+float4 _ShockC[8];    // x = dust thrown up where the front sweeps the ground (soot units), yzw unused
+
+[numthreads(4,4,4)]
+void Shock (uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_Dim)) return;
+    int3 c = int3(id);
+    float3 p = float3((c.x + 0.5) * _Cell, (c.y + 0.5) * _Cell, (c.z + 0.5) * _Cell);
+    float4 v = _VelIn[id];
+    float4 s = _SclIn[id];
+    for (int b = 0; b < _ShockCount; b++)
+    {
+        float3 d = p - _ShockA[b].xyz;
+        float r = length(d);
+        float hi = _ShockA[b].w;
+        float lo = min(_ShockB[b].x, hi - _Cell);
+        if (r > lo && r <= hi && r > 1.0)
+        {
+            float k = saturate((hi - _ShockB[b].x) / max(hi - lo, 1e-3));
+            float3 dir = normalize(d / r + float3(0.0, _ShockB[b].z, 0.0));
+            v.xyz += dir * (_ShockB[b].y * 30.0 / max(r, 30.0) * k);
+            float g = 1.0 - saturate(p.y / (2.5 * _Cell));
+            s.y += _ShockC[b].x * g * k;
+        }
+    }
+    _VelOut[id] = v;
+    _SclOut[id] = s;
+}

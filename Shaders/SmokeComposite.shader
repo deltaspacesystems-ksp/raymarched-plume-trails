@@ -111,6 +111,7 @@ Shader "RaymarchedPlumeTrails/SmokeComposite"
             sampler2D_float _CameraDepthTexture;
             sampler2D_float _PlumeAux;   // x = sum(distance * weight), y = sum(weight)
             sampler2D _PlumeHistory;     // last frame's resolved result, full resolution
+            float4 _PlumeHistory_TexelSize;
             // previous view space <- current view space, with the body's own motion folded
             // in (rotation, floating origin, Krakensbane), so it is exact for smoke that is
             // at rest in the air
@@ -158,6 +159,29 @@ Shader "RaymarchedPlumeTrails/SmokeComposite"
                 return lerp(smooth, nearest, saturate(bestDiff * 0.5));
             }
 
+            // Catmull-Rom (sharpness 0.5) in 5 taps: the history is resampled without the blur of a bilinear fetch (that blur, repeated every frame, softens the smoke)
+            float4 SampleHistoryCR(float2 uv)
+            {
+                float2 dims = _PlumeHistory_TexelSize.zw, inv = _PlumeHistory_TexelSize.xy;
+                float2 pos = dims * uv;
+                float2 c = floor(pos - 0.5) + 0.5;
+                float2 f = pos - c, f2 = f * f, f3 = f * f2;
+                const float S = 0.5;
+                float2 w0 = -S * f3 + 2.0 * S * f2 - S * f;
+                float2 w1 = (2.0 - S) * f3 + (S - 3.0) * f2 + 1.0;
+                float2 w2 = (S - 2.0) * f3 + (3.0 - 2.0 * S) * f2 + S * f;
+                float2 w3 = S * f3 - S * f2;
+                float2 w12 = w1 + w2;
+                float2 tc12 = inv * (c + w2 / w12), tc0 = inv * (c - 1.0), tc3 = inv * (c + 2.0);
+                float4 s0 = tex2D(_PlumeHistory, float2(tc12.x, tc0.y));
+                float4 s1 = tex2D(_PlumeHistory, float2(tc0.x, tc12.y));
+                float4 s2 = tex2D(_PlumeHistory, float2(tc12.x, tc12.y));
+                float4 s3 = tex2D(_PlumeHistory, float2(tc3.x, tc12.y));
+                float4 s4 = tex2D(_PlumeHistory, float2(tc12.x, tc3.y));
+                float k0 = w12.x * w0.y, k1 = w0.x * w12.y, k2 = w12.x * w12.y, k3 = w3.x * w12.y, k4 = w12.x * w3.y;
+                return (s0 * k0 + s1 * k1 + s2 * k2 + s3 * k3 + s4 * k4) / (k0 + k1 + k2 + k3 + k4);
+            }
+
             float4 fragResolve(v2f i) : SV_Target
             {
                 float2 uv = i.uv;
@@ -170,7 +194,7 @@ Shader "RaymarchedPlumeTrails/SmokeComposite"
                 // instead of smeared behind as a ghost.
                 float2 texel = _MainTex_TexelSize.xy;
                 float2 base = (floor(uv / texel) + 0.5) * texel;
-                float4 nmin = cur, nmax = cur;
+                float4 nmin = cur, nmax = cur, m1 = float4(0, 0, 0, 0), m2 = float4(0, 0, 0, 0);
                 for (int y = -1; y <= 1; y++)
                 {
                     for (int x = -1; x <= 1; x++)
@@ -178,6 +202,7 @@ Shader "RaymarchedPlumeTrails/SmokeComposite"
                         float4 c = tex2D(_MainTex, base + float2(x, y) * texel);
                         nmin = min(nmin, c);
                         nmax = max(nmax, c);
+                        m1 += c; m2 += c * c;
                     }
                 }
 
@@ -198,11 +223,18 @@ Shader "RaymarchedPlumeTrails/SmokeComposite"
                         float2 ndc = (vprev.xy / -vprev.z) * p11_22 + p13_23;
                         uvPrev = ndc * 0.5 + 0.5;
                     }
+                    // the smoke itself moved (it grew): where this point of it was a frame ago, from the volume pass
+                    uvPrev += aux.zw / aux.y;
                 }
                 if (any(uvPrev < 0.0) || any(uvPrev > 1.0)) return cur;
 
-                float4 histRaw = tex2D(_PlumeHistory, uvPrev);
-                float4 hist = clamp(histRaw, nmin, nmax);
+                float4 histRaw = SampleHistoryCR(uvPrev);
+                // the history is kept inside mean +- 1.25 sigma of the 3x3 of the current frame (a statistical clamp: min/max alone lets a ghost through at the edge of
+                // the range), then inside min / max so that no colour appears that the neighbourhood does not have
+                float4 mean = m1 / 9.0;
+                float4 sigma = sqrt(max(m2 / 9.0 - mean * mean, 0.0));
+                float4 hist = clamp(histRaw, mean - 1.25 * sigma, mean + 1.25 * sigma);
+                hist = clamp(hist, nmin, nmax);
 
                 // Where the clamp had to move the history a long way it was describing
                 // something else, so trust it less rather than only clipping it.

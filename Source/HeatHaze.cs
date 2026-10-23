@@ -56,7 +56,9 @@ namespace RaymarchedPlumeTrails
     //
     // BeforeForwardAlpha, the same stage as the cast shadow: terrain, sky and vehicles are in the target and the depth
     // texture is resolved; the flame particles and the smoke are drawn afterwards, over the distorted background.
+#if !EXPLOSIONS_ONLY
     [KSPAddon(KSPAddon.Startup.Flight, false)]
+#endif
     public class HeatHazeRenderer : MonoBehaviour
     {
         // After all forward rendering (smoke and flame included): the Blit that copies the target must not run between
@@ -109,7 +111,7 @@ namespace RaymarchedPlumeTrails
 
         private void LateUpdate()
         {
-            if (!SmokeTuning.HeatHaze || ShaderCache.HeatHazeShader == null) { ClearAll(); return; }
+            if (!ModSettings.Enabled || !SmokeTuning.HeatHaze || ShaderCache.HeatHazeShader == null) { ClearAll(); return; }
             if (material == null) material = new Material(ShaderCache.HeatHazeShader) { hideFlags = HideFlags.HideAndDontSave };
 
             int n = HeatHazeRegistry.Collect(active);

@@ -65,6 +65,29 @@ namespace RaymarchedPlumeTrails
             return any;
         }
 
+        // Switches the flame models of a Waterfall module on or off WITHOUT touching its own bookkeeping (forceRenderingOff only
+        // stops them being drawn), so Waterfall keeps running and the flame returns the moment we stop drawing the physical plume.
+        public static void SetFlameVisible(PartModule module, bool visible)
+        {
+            if (module == null || fAllFX == null || fEffRenderers == null) return;
+            try
+            {
+                IEnumerable effects = fAllFX.GetValue(module) as IEnumerable;
+                if (effects == null) return;
+                foreach (object eff in effects)
+                {
+                    IList renderers = fEffRenderers.GetValue(eff) as IList;
+                    if (renderers == null) continue;
+                    for (int i = 0; i < renderers.Count; i++)
+                    {
+                        Renderer r = renderers[i] as Renderer;
+                        if (r != null) r.forceRenderingOff = !visible;
+                    }
+                }
+            }
+            catch (Exception) { }
+        }
+
         // Measures the flame that belongs to one nozzle: the renderers of the module's effects that touch the neighbourhood
         // of the thrust transform. length = how far past the nozzle the flame reaches along the exhaust, width = its widest
         // diameter. Both 0 when nothing is showing.

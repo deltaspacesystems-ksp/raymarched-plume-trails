@@ -25,7 +25,9 @@ namespace RaymarchedPlumeTrails
     //   Hide                - shrinks to a small badge for this session
     // Settings live in PluginData/update.cfg:  CheckForUpdates = true/false, SkipVersion = x.y.z,
     // ReleaseApiUrl = (override, for testing).
+#if !EXPLOSIONS_ONLY
     [KSPAddon(KSPAddon.Startup.MainMenu, true)]
+#endif
     public class UpdateChecker : MonoBehaviour
     {
         private enum St { Idle, Checking, Available, Downloading, Staged, Error }

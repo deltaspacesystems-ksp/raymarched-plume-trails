@@ -11,8 +11,18 @@ namespace RaymarchedPlumeTrails
     [KSPAddon(KSPAddon.Startup.Flight, false)]
     public class DepthTextureEnabler : MonoBehaviour
     {
+        private float nextCheck;
+
         private void Start()
         {
+            if (ModSettings.Enabled) EnableOnAllCameras();
+        }
+
+        // re-asserted every 2 s while the mod is on (also when it is switched on after the scene started); idempotent and cheap. Off: nothing is asked of the cameras.
+        private void Update()
+        {
+            if (!ModSettings.Enabled || Time.unscaledTime < nextCheck) return;
+            nextCheck = Time.unscaledTime + 2f;
             EnableOnAllCameras();
         }
 
@@ -20,7 +30,7 @@ namespace RaymarchedPlumeTrails
         // rather than only once at Start
         private void OnLevelWasLoaded(int level)
         {
-            EnableOnAllCameras();
+            if (ModSettings.Enabled) EnableOnAllCameras();
         }
 
         // KSP's flight scene splits the world across several cameras; only the two

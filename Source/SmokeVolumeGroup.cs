@@ -32,6 +32,8 @@ namespace RaymarchedPlumeTrails
         private struct Puff
         {
             public Vector3 localPos;
+            public Vector3 hitLocal;          // where this parcel hit the surface (origin of its wall jet)
+            public float hitSpeed, hitR0;     // its sideways speed there, and the length scale of the wall jet (m)
             public Vector3 velocity;
             public float age;
             public float sizeMultiplier;
@@ -56,6 +58,7 @@ namespace RaymarchedPlumeTrails
             // jump between the vessel and the pad on alternate links - a thin spike
             // running the length of the flight.
             public bool isGround;
+            public float liftFreeUntil;       // until then the climb limit of a wall jet is off (it is running up a wall)
             // Which continuous burst of emission this puff belongs to. Incremented by the
             // controller whenever spawning resumes after a pause, so a chain break is an
             // exact fact rather than something inferred from geometry.
@@ -91,6 +94,10 @@ namespace RaymarchedPlumeTrails
             // pM0 = mass at release, pR = equivalent-sphere radius. velocity above is reused (surface frame).
             public bool physical;
             public float pM, pMe, pT, pM0, pR;
+            // What is DRAWN: the radius and the condensate visibility eased toward the physical values every tick. Old parcels are stepped
+            // only every 2nd-8th tick, and their size changed in steps (at a different tick for each, so a different slice of the spine
+            // jumped every frame: the twitching).
+            public float pRs, pVisS;
         }
 
         private readonly List<Puff> puffs = new List<Puff>();
@@ -519,6 +526,9 @@ namespace RaymarchedPlumeTrails
         private float liveRootDensity = 1f;
 
         public bool HasLiveTip => hasLiveTip;
+        public Vector3 LiveTipPosition => liveTipPos;
+        // KSP moved the origin of the world (the active vessel is brought back to it): the live tip is raw world space, so it moves with it
+        public void ShiftLiveTip(Vector3 delta) { liveTipPos += delta; }
 
         // Turn the live tip and root into ordinary puffs at the moment emission stops.
         //
@@ -713,6 +723,14 @@ namespace RaymarchedPlumeTrails
         // that stopped calling SetLiveTip altogether, not to react to one slow tick.
         private const float LiveTipStaleAfter = 0.5f;
 
+        // the vessel was moved far away at once (a revert, a quickload, a teleport): the old trail belongs to a flight that no longer exists
+        public void ClearPuffs()
+        {
+            puffs.Clear();
+            hasLiveTip = false;
+            liveRootCount = 0;
+        }
+
         public void Orphan()
         {
             orphaned = true;
@@ -732,6 +750,7 @@ namespace RaymarchedPlumeTrails
 
         private void Update()
         {
+            if (!ModSettings.Enabled) return;
             // Runs for EVERY instance, orphaned or not - a live tip left un-refreshed for
             // half a second gets frozen regardless of why. Orphan() already does this the
             // instant the controller is destroyed, but destruction ordering on a vessel
@@ -773,11 +792,20 @@ namespace RaymarchedPlumeTrails
         private float flameRange = 25f;
         private Color flameCol = new Color(1f, 0.52f, 0.16f);
         public void SetFlameColor(Color c) { flameCol = c; }
+        private Vector3 flameEnd;
+        private bool flameSegment;
         public void SetFlameLight(Vector3 worldPos, float strength, float range)
         {
             flamePos = worldPos;
             flameStrength = strength;
             flameRange = range;
+            flameSegment = false;
+        }
+        // the flame as a line of light: from the nozzle (worldPos) to the end of the flame / to where the jet meets the pad
+        public void SetFlameLight(Vector3 worldPos, float strength, float range, Vector3 endPos)
+        {
+            SetFlameLight(worldPos, strength, range);
+            flameEnd = endPos; flameSegment = true;
         }
 
         public void SetGrowth(float newSharpness, float newTime)
@@ -810,6 +838,8 @@ namespace RaymarchedPlumeTrails
 
         public void AddPuff(Vector3 worldPos, Vector3 initialVelocity, float sizeScale = 1f, int burnId = 0, float expansion = 1f, float emitDensity = 1f)
         {
+            // the legacy trail is hidden (the default since 1.0): it would never be drawn, so it is not simulated either
+            if (SmokeTuning.HideOldTrail) return;
             Vector3 jitter = Random.insideUnitSphere * (startSize * PositionJitterFraction);
             puffs.Add(new Puff
             {
@@ -939,16 +969,496 @@ namespace RaymarchedPlumeTrails
         // running on it (entrainment, buoyancy, friction), so each branch widens and lifts into a side cloud.
         // Glow of a hot ground-hugging parcel (the flame turned by the deflector): by its own temperature, from about
         // 700 K (dull ember) up to 2200 K (white-yellow). Cools as it entrains air, so it fades into the steam.
+        // Each billow of a ground-hugging flow has its own size (0.65 .. 1.35 x): equal blobs at equal spacing merged into a smooth
+        // tube (a "noodle"); unequal ones read as the lumpy, rolling front a real wall jet has.
+        private static float BillowJitter(int index)
+        {
+            float h = Mathf.Sin(index * 12.9898f) * 43758.5453f;
+            return 0.65f + 0.7f * (h - Mathf.Floor(h));
+        }
+
         private static float WallHeat(Puff p)
         {
             if (!p.physical || !p.isGround || SmokeTuning.DeflectorFire <= 0f) return 0f;
             return Mathf.Clamp01((p.pT - 700f) / 1500f) * Mathf.Min(SmokeTuning.DeflectorFire, 1.5f);
         }
 
+        // the real surface under a firing engine, set by the controller (altitude above the datum, position, time)
+        private static bool padSurfValid;
+        private static Vector3 padSurfPos;
+        private static double padSurfAlt;
+        private static float padSurfTime;
+        public static void NotePadSurface(Vector3 worldPoint)
+        {
+            CelestialBody b = FlightGlobals.currentMainBody;
+            if (b == null) return;
+            padSurfPos = worldPoint; padSurfAlt = b.GetAltitude(worldPoint);
+            padSurfTime = Time.time; padSurfValid = true;
+        }
+
+        // ---- SURFACE STREAMS ----
+        private class StreamSource
+        {
+            public Vector3 local;                 // where the jet lands (group-local, so that it survives origin shifts)
+            public float r0 = 6f, v0 = 40f;       // radius of the jet where it lands, speed of the flow along the surface
+            public float born, lastSeen, traceT;
+            public Vector3 tracedAt;
+            public int streams;
+            public bool axesOk, hasB; public float azA, azB; public Vector3 axesAt;     // the flow axes found in the geometry (the trench), see ScanAxes
+            public Vector3[][] path; public float[][] clear; public int[] count;
+            public float[][] widthH, head;       // the room the flow has: the free width at 4 heights above it (per point), the headroom
+            public float[][] rad, dn, tArr, tK;  // the stream tube (StreamTube): radius, opacity of the smoke, the time the front gets there, buoyancy g' (m/s2), per point
+        }
+        private readonly List<StreamSource> streamSources = new List<StreamSource>();
+        private static readonly float[] StreamSched = { 0f, 6f, 15f, 28f, 46f, 72f, 108f, 155f, 215f };
+        private const float StreamFrontScale = 100f;   // the front slows down: s(t) = L ln(1 + v0 t / L)
+
+        private void NoteStreamImpact(Vector3 hitLocal, float radius, float speed)
+        {
+            float now = Time.time;
+            StreamSource best = null; float bd = 10f * 10f;
+            for (int i = 0; i < streamSources.Count; i++)
+            {
+                float d = (streamSources[i].local - hitLocal).sqrMagnitude;
+                if (d < bd) { bd = d; best = streamSources[i]; }
+            }
+            if (best == null)
+            {
+                if (streamSources.Count >= 8) return;
+                best = new StreamSource { local = hitLocal, born = now, lastSeen = now, r0 = radius, v0 = Mathf.Clamp(speed, 25f, 120f) };
+                streamSources.Add(best);
+                return;
+            }
+            if (now - best.lastSeen > 3f) best.born = now;          // a new ignition
+            best.local = Vector3.Lerp(best.local, hitLocal, 0.08f);
+            best.r0 = Mathf.Lerp(best.r0, radius, 0.1f);
+            best.v0 = Mathf.Lerp(best.v0, Mathf.Clamp(speed, 25f, 120f), 0.1f);
+            best.lastSeen = now;
+        }
+
+        private readonly Vector3[] streamTmpW = new Vector3[16];
+        private readonly float[] streamTmpC = new float[16];
+        private readonly float[] streamTmpWH = new float[64], streamTmpHd = new float[16];
+
+        // Each source throws a fan of streamlines along the pad surface (PadFluid.TraceStream). A stream is one chain of the spine: radius grows
+        // with the distance like a wall jet / steam cloud (and never exceeds what the walls around it allow), the front advances and slows down,
+        // and when the jet is gone the tail leaves the source and the whole thing fades.
+        // debug: what the last EmitStreams did (why it drew nothing, or how much)
+        public static string DbgEmit = "never called"; private static int dbgCalls;
+        // THE STREAM TUBE. The flow along one ray is integrated like a real turbulent wall jet, a tube with a cross-section that changes along its way, and with
+        // the WATER of the deluge in it (a pad is flooded with it: several times the mass of the exhaust, which is what makes the cloud):
+        //   mass       d(m)/ds = rho_a E u P_free          the air it entrains over the part of its surface that is free (not against the floor or a wall)
+        //   momentum   d(J)/ds = - Cf rho u^2 / 2 P_wet    the friction of the floor and the walls; the entrained air starts at rest, so J = m u is kept
+        //   enthalpy   H = m_dry cp T + m_w cw T + L m_v   the heat of the gas goes into the water: it evaporates (m_v, up to saturation at T) and cools the gas;
+        //                                                  T is found from H at every step, and when the mixture cools the vapour condenses and gives the heat back
+        //   area       A = Q / u,  Q = (m_dry Rd + m_v Rv) T / p   the volume of the gas (the droplets take no room); the radius is that of a circle of that area,
+        //                                                  limited by the room (half of the free width at the height of the stream, 0.8 of the headroom)
+        // What is SEEN: the alumina of the exhaust (a share of the flow) and the fine MIST (a small share of the liquid; the rest is spray that rains out) over
+        // the volume Q, sigma = kappa_p c_p + kappa_d c_mist, and the picture's opacity is sigma / (sigma + sigma_ref) (it falls gradually as the stream thins out,
+        // instead of staying a solid white as long as the extinction is over 1/m). The buoyancy is g' = g (rho_a - rho_eff) / rho_eff with the load of the mist in
+        // rho_eff: warm gas and vapour rise, a cold wet stream does not. The front of the cloud travels at 0.7 of the local speed of the flow.
+        private const float TubeE = 0.08f, TubeCf = 0.005f, TubeKappaP = 2000f, TubeKappaD = 150f, TubeParticleShare = 0.09f;
+        private const float MCp = 1050f, MCw = 4186f, MLv = 2.5e6f, MRd = 287f, MRv = 461.5f, MPa = 101325f, MTa = 288f;
+
+        private static float QSat(float T)
+        {
+            float es = 611.2f * Mathf.Exp(17.67f * (T - 273.15f) / (T - 29.65f));
+            if (es >= 0.95f * MPa) return 1000f;
+            return 0.622f * es / (MPa - es);
+        }
+
+        // the temperature at which the mixture holds the enthalpy H (the vapour is whatever the water and the saturation allow)
+        private static float SolveMoistT(float H, float md, float mw, out float mv)
+        {
+            float lo = 200f, hi = 1500f;
+            for (int it = 0; it < 22; it++)
+            {
+                float mid = 0.5f * (lo + hi);
+                float v = Mathf.Min(mw, md * QSat(mid));
+                float h = md * MCp * mid + mw * MCw * mid + MLv * v;
+                if (h < H) lo = mid; else hi = mid;
+            }
+            float T = 0.5f * (lo + hi);
+            mv = Mathf.Min(mw, md * QSat(T));
+            return T;
+        }
+
+        private void StreamTube(StreamSource src, int k, int c, int nRays, Vector3 w)
+        {
+            float[] rad = new float[c], dn = new float[c], tA = new float[c], gpA = new float[c];
+            float rhoA = MPa / (MRd * MTa);
+            float r0 = Mathf.Clamp(src.r0, 3f, 12f), u0 = Mathf.Max(src.v0, 10f);
+            float T0g = Mathf.Max(SmokeTuning.PadStreamT0, 350f);
+            float m0 = MPa / (MRd * T0g) * Mathf.PI * r0 * r0 * u0 / Mathf.Max(nRays, 1);          // this ray's share of the flow where the jet lands
+            float md = m0, mw = Mathf.Max(SmokeTuning.PadStreamWater, 0f) * m0;                    // the dry gas and the water, kg/s
+            float mp = TubeParticleShare * m0;                                                    // the particles per second (they do not mix away)
+            float H = md * MCp * T0g + mw * MCw * 300f;
+            float mv; float T = SolveMoistT(H, md, mw, out mv);
+            float J = (md + mw) * u0, tt = 0f;
+            float rPrev = r0 / Mathf.Sqrt(Mathf.Max(nRays, 1));
+            float mist = Mathf.Clamp01(SmokeTuning.PadMistFraction);
+            for (int j = 0; j < c; j++)
+            {
+                if (j > 0)
+                {
+                    float sA = StreamSched[j - 1], sB = StreamSched[j];
+                    int nsub = Mathf.Max(1, Mathf.CeilToInt((sB - sA) / 2f));
+                    float dsub = (sB - sA) / nsub;
+                    for (int q = 0; q < nsub; q++)
+                    {
+                        float f = (q + 0.5f) / nsub;
+                        float mtot = md + mw;
+                        float u = Mathf.Max(J / mtot, 1.5f);
+                        float Q = (md * MRd + mv * MRv) * T / MPa;
+                        float A = Q / u;
+                        float rFree = Mathf.Sqrt(A / Mathf.PI);
+                        float hq = Mathf.Clamp(rFree * 1.4f, 1f, 12f);
+                        float hf = hq <= 3f ? Mathf.InverseLerp(1f, 3f, hq) : hq <= 6f ? 1f + Mathf.InverseLerp(3f, 6f, hq) : 2f + Mathf.InverseLerp(6f, 12f, hq);
+                        int h0 = Mathf.Clamp(Mathf.FloorToInt(hf), 0, 2); float hfr = Mathf.Clamp01(hf - h0);
+                        float room = Mathf.Lerp(Mathf.Lerp(src.widthH[k][(j - 1) * 4 + h0], src.widthH[k][j * 4 + h0], f), Mathf.Lerp(src.widthH[k][(j - 1) * 4 + h0 + 1], src.widthH[k][j * 4 + h0 + 1], f), hfr);
+                        float roof = Mathf.Lerp(src.head[k][j - 1], src.head[k][j], f);
+                        float rCap = Mathf.Max(1.2f, Mathf.Min(0.5f * room, 0.8f * roof));
+                        float r = Mathf.Min(rFree, rCap);
+                        bool boxed = rFree > rCap * 0.97f;
+                        float cf = 0.25f + (boxed ? 0.45f : 0f);                 // the part of the surface that touches the floor and the walls
+                        float dm = rhoA * TubeE * u * 2f * Mathf.PI * r * (1f - cf) * dsub;
+                        float dJ = -0.5f * TubeCf * (mtot / Mathf.Max(Q, 1e-3f)) * u * u * 2f * Mathf.PI * r * cf * dsub;
+                        H += dm * MCp * MTa;
+                        md += dm;
+                        J = Mathf.Max(J + dJ, 0.02f * (md + mw) * u0);
+                        T = SolveMoistT(H, md, mw, out mv);
+                        tt += dsub / Mathf.Max(0.7f * u, 1f);
+                        rPrev = r;
+                    }
+                }
+                float mt = md + mw;
+                float Qn = (md * MRd + mv * MRv) * T / MPa;
+                float mMist = mist * Mathf.Max(mw - mv, 0f);
+                float rhoEff = (md + mv + mMist) / Mathf.Max(Qn, 1e-3f);            // the gas, the vapour and the load of the mist
+                float gp = 9.81f * (rhoA - rhoEff) / Mathf.Max(rhoEff, 0.05f);
+                float sigma = (TubeKappaP * mp + TubeKappaD * mMist) / Mathf.Max(Qn, 1e-3f);        // extinction, 1/m
+                rad[j] = Mathf.Min(Mathf.Max(rPrev, 0.6f), 14f);
+                // no axis in the geometry (open ground): the wall jet spreads the same in all directions, as a DISC, not as twelve separate petals. Each ray
+                // then covers the arc between it and its neighbours: the radius at a distance s is at least the half-gap of the fan there.
+                if (!src.axesOk) rad[j] = Mathf.Min(Mathf.Max(rad[j], 0.85f * StreamSched[j] * Mathf.PI / Mathf.Max(nRays, 1)), 40f);
+                float sref = Mathf.Max(SmokeTuning.PadOpacityRef, 0.5f);
+                dn[j] = sigma / (sigma + sref);
+                tA[j] = tt; gpA[j] = gp;
+            }
+            src.rad[k] = rad; src.dn[k] = dn; src.tArr[k] = tA; src.tK[k] = gpA;
+        }
+
+        // the arc length the front has reached after `age` seconds (the table of arrival times of the stream tube, StreamSched[j] -> tA[j])
+        private static float FrontAt(float[] tA, int c, float age)
+        {
+            if (tA == null || c < 2) return 0f;
+            if (age <= 0f) return 0f;
+            for (int j = 1; j < c; j++)
+                if (age < tA[j]) return Mathf.Lerp(StreamSched[j - 1], StreamSched[j], Mathf.InverseLerp(tA[j - 1], tA[j], age));
+            return StreamSched[c - 1];
+        }
+
+        // THE SMOKE OF EVERY NOZZLE. A cluster of engines is one group with one trail, but the jets that make it are separate at first: each has its own radius
+        // (that of its nozzle), widens at the rate of a free jet (0.1 m per metre) and meets its neighbours where the radii touch, after
+        //     s_m = (d / 2 - r0) / 0.1                     d = the distance to the nearest nozzle, r0 = the radius of the nozzle
+        // and from there they are one jet (the mixing: the lateral offset of a thread from the axis goes to zero over about s_m, and its density is taken over by the
+        // main trail). The threads are chains of the same volume, laid along the beginning of the main trail (the end of the list, at the nozzles).
+        private readonly List<Vector3> nozLat = new List<Vector3>();
+        private readonly List<float> nozR = new List<float>();
+        private readonly Vector3[] thPos = new Vector3[64]; private readonly float[] thR = new float[64], thD = new float[64], thCum = new float[64];
+
+        public void SetNozzles(List<EngineSample> smp, Vector3 centroid, Vector3 fwd)
+        {
+            nozLat.Clear(); nozR.Clear();
+            if (smp == null || smp.Count < 2) return;
+            for (int i = 0; i < smp.Count && i < 40; i++)
+            {
+                nozLat.Add(Vector3.ProjectOnPlane(smp[i].position - centroid, fwd));
+                nozR.Add(Mathf.Max(0.4f, 0.5f * smp[i].nozzleDiameter));
+            }
+        }
+
+        private static float ScalePackedDensity(float packed, float k)
+        {
+            float hh = Mathf.Floor(packed / 16f), rem = packed - 16f * hh, ss = Mathf.Floor(rem / 2f), dd = rem - 2f * ss;
+            return dd * k + 2f * ss + 16f * hh;
+        }
+
+        private static readonly float[] ThreadFrac = { 1.7f, 1.25f, 0.85f, 0.5f, 0.22f, 0f };      // where the threads are laid, in merge lengths from the nozzle end, far to near
+        private void EmitNozzleThreads(int shareBudget)
+        {
+            int n = nozLat.Count;
+            if (n < 2 || !SmokeTuning.NozzleThreads) return;
+            int cnt = activeOrderedPos.Count;
+            if (cnt < 3) return;
+            int maxThreads = Mathf.Min(n, Mathf.Max(0, (int)(shareBudget * 0.42f / 8f)));
+            if (maxThreads < 2) return;
+            // the merge length of every nozzle, from the distance to the nearest neighbour
+            float sMaxNeed = 0f;
+            float[] sm = new float[n];
+            for (int i = 0; i < n; i++)
+            {
+                float dn = float.MaxValue;
+                for (int j = 0; j < n; j++) if (j != i) dn = Mathf.Min(dn, (nozLat[i] - nozLat[j]).magnitude);
+                sm[i] = Mathf.Clamp((0.5f * dn - nozR[i]) / 0.1f, 2f, 150f);
+                sMaxNeed = Mathf.Max(sMaxNeed, 1.75f * sm[i]);
+            }
+            // the head of the main trail: from the newest end back, until a break or far enough
+            int hc = 0; float cum = 0f;
+            for (int i = cnt - 1; i >= 0 && hc < 64; i--)
+            {
+                if (activeOrderedRadius[i] <= BreakRadius) break;
+                thPos[hc] = activeOrderedPos[i]; thR[hc] = activeOrderedRadius[i]; thD[hc] = activeOrderedDensity[i];
+                if (hc > 0) cum += (thPos[hc] - thPos[hc - 1]).magnitude;
+                thCum[hc] = cum;
+                hc++;
+                if (cum > sMaxNeed) break;
+            }
+            if (hc < 2) return;
+            // the main trail gives way to the threads near the nozzles: it takes the whole density only where they have mixed
+            float smAvg = 0f; for (int i = 0; i < n; i++) smAvg += sm[i]; smAvg /= n;
+            for (int q = 0; q < hc; q++)
+            {
+                float m = Mathf.SmoothStep(0f, 1f, (thCum[q] - 0.4f * smAvg) / (1.2f * smAvg));
+                activeOrderedDensity[cnt - 1 - q] = ScalePackedDensity(activeOrderedDensity[cnt - 1 - q], Mathf.Lerp(0.3f, 1f, m));
+            }
+            int step = Mathf.Max(1, n / maxThreads);
+            for (int ti = 0, emitted = 0; ti < n && emitted < maxThreads; ti += step, emitted++)
+            {
+                float s_m = sm[ti], r0 = nozR[ti];
+                Vector3 lastP = Vector3.zero; bool first = true;
+                for (int f = 0; f < ThreadFrac.Length; f++)
+                {
+                    float s = ThreadFrac[f] * s_m;
+                    if (s > thCum[hc - 1]) s = thCum[hc - 1];
+                    int k = 1; while (k < hc - 1 && thCum[k] < s) k++;
+                    float span = Mathf.Max(thCum[k] - thCum[k - 1], 1e-3f);
+                    float t = Mathf.Clamp01((s - thCum[k - 1]) / span);
+                    Vector3 pos = Vector3.Lerp(thPos[k - 1], thPos[k], t);
+                    Vector3 tan = (thPos[k] - thPos[k - 1]); tan = tan.sqrMagnitude > 1e-8f ? tan.normalized : Vector3.up;
+                    float rMain = Mathf.Lerp(thR[k - 1], thR[k], t);
+                    float dPacked = Mathf.Lerp(thD[k - 1], thD[k], t);
+                    float hhh = Mathf.Floor(dPacked / 16f), rem = dPacked - 16f * hhh, sss = Mathf.Floor(rem / 2f), dMain = rem - 2f * sss;
+                    float m = Mathf.SmoothStep(0f, 1f, (s - 0.4f * s_m) / (1.2f * s_m));
+                    Vector3 lat = nozLat[ti] - tan * Vector3.Dot(nozLat[ti], tan);
+                    Vector3 p = pos + lat * (1f - m);
+                    float r = Mathf.Min(r0 + 0.1f * s, Mathf.Max(rMain, r0));
+                    float dens = Mathf.Min(1.2f, dMain * Mathf.Min(1f, (rMain * rMain) / (n * r * r)) * (1f - m));
+                    if (first) { activeOrderedPos.Add(p); activeOrderedRadius.Add(0f); activeOrderedDensity.Add(1f); first = false; }
+                    activeOrderedPos.Add(p); activeOrderedRadius.Add(r); activeOrderedDensity.Add(EncodeDensity(Mathf.Max(dens, 0.01f), sss / 7f, hhh / 7f));
+                    lastP = p;
+                }
+                activeOrderedPos.Add(lastP); activeOrderedRadius.Add(0f); activeOrderedDensity.Add(1f);
+            }
+            needTrailSeparator = true;
+        }
+
+        private const int StreamReserve = 96;
+
+        // THE AXES OF THE FLOW. The jet that lands in a flame trench does not spread evenly in all directions: the walls turn it, and what comes out goes along
+        // the trench, both ways (a fan of rays at even angles gave three fat lobes 120 degrees apart that had nothing to do with the trench). So the geometry
+        // decides: a fan of 16 test rays is traced through the voxels, and the direction in which the flow gets farthest while it is still between walls is the
+        // first axis, the farthest one that goes the opposite way the second (the other end of the trench). The streams are then a bundle along them.
+        private static readonly Vector3[] scanDisp = new Vector3[16];
+        private static readonly float[] scanLen = new float[16];
+        private void ScanAxes(StreamSource src, Vector3 w, Vector3 up)
+        {
+            const int NA = 16;
+            src.axesAt = w; src.axesOk = false; src.hasB = false;
+            for (int a = 0; a < NA; a++)
+            {
+                scanLen[a] = 0f;
+                float az = a * Mathf.PI * 2f / NA;
+                int c = PadFluid.TraceStream(w, az, 1.25f, StreamSched, StreamSched.Length, streamTmpW, streamTmpC);
+                if (c < 3) continue;
+                scanDisp[a] = Vector3.ProjectOnPlane(streamTmpW[c - 1] - w, up);
+                int conf = 0; float rise = 0f;
+                for (int j = 0; j < c; j++) { if (streamTmpC[j] < 22f) conf++; rise = Mathf.Max(rise, Vector3.Dot(streamTmpW[j] - w, up)); }
+                // a ray that climbed a wall and flew over it is not a flow along the geometry: the farther it climbed, the less it counts
+                scanLen[a] = scanDisp[a].magnitude * (0.35f + 0.65f * conf / c) * Mathf.Exp(-Mathf.Max(rise - 2f, 0f) / 4f);
+            }
+            int ia = -1; float bl = 0f;
+            for (int a = 0; a < NA; a++) if (scanLen[a] > bl) { bl = scanLen[a]; ia = a; }
+            if (ia < 0 || bl < 8f) return;
+            int ib = -1; float bl2 = 0.3f * bl;
+            for (int a = 0; a < NA; a++) if (scanLen[a] > bl2 && Vector3.Dot(scanDisp[a], scanDisp[ia]) < 0f) { bl2 = scanLen[a]; ib = a; }
+            src.azA = ia * Mathf.PI * 2f / NA; src.axesOk = true;
+            if (ib >= 0) { src.azB = ib * Mathf.PI * 2f / NA; src.hasB = true; }
+        }
+        // The pad flow has the priority for the points of the group only while the rocket is still at the pad: when the live end of the trail is far from the
+        // place where the jet lands (hundreds of metres: the rocket has lifted off) the trail needs the points, and what is left of the pad cloud gets a small share.
+        // Without this the reserved share (96 points) and three quarters of the rest went to a cloud that the rocket had left, and the trail of the climbing rocket
+        // came out as a stub of 20-30 points: it appeared, thinned out, and only a blob at the engine was left.
+        private bool PadFlowIsNearTip()
+        {
+            if (!hasLiveTip || streamSources.Count == 0 || body == null) return true;
+            for (int i = 0; i < streamSources.Count; i++)
+                if ((LocalToWorld(streamSources[i].local) - liveTipPos).sqrMagnitude < 300f * 300f) return true;
+            return false;
+        }
+
+        public bool HasLiveStreams(float within)
+        {
+            float now = Time.time;
+            for (int i = 0; i < streamSources.Count; i++) if (now - streamSources[i].lastSeen < within) return PadFlowIsNearTip();
+            return false;
+        }
+
+        private void EmitStreams(int shareBudget)
+        {
+            float now = Time.time;
+            dbgCalls++;
+            int dbgStart = activeOrderedPos.Count;
+            for (int i = streamSources.Count - 1; i >= 0; i--)
+                if (now - streamSources[i].lastSeen > 30f) streamSources.RemoveAt(i);
+            int ns = streamSources.Count;
+            if (ns == 0 || !PadFluid.SurfaceReady) { DbgEmit = "calls " + dbgCalls + ": returned, sources " + ns + ", SurfaceReady " + PadFluid.SurfaceReady; return; }
+            // The streams share the spine with the trail of the same group, and the trail must not be starved by them (the log: a trail budget
+            // of 23 points with 216 of the stream, so the trail was thinned to a few puffs that came and went). A third of this group's share while
+            // the jet is still on the pad, an eighth once it is gone (the cloud lingers, but it is a ghost of what it was).
+            bool anyLive = false;
+            for (int i = 0; i < ns; i++) if (now - streamSources[i].lastSeen < 1f) { anyLive = true; break; }
+            if (anyLive && !PadFlowIsNearTip()) anyLive = false;
+            // the share of a group that is the source of the flow goes mostly to the flow (its own trail is a few metres long on the pad); the cloud that
+            // lingers after the jet is gone keeps a floor so it does not vanish the moment the share shrinks
+            int streamBudget = Mathf.RoundToInt(shareBudget * (anyLive ? 0.72f : (HasLiveStreams(12f) ? 0.4f : 0.2f)));
+            if (!PadFlowIsNearTip()) streamBudget = Mathf.Min(streamBudget, Mathf.RoundToInt(shareBudget * 0.12f));       // the rocket is gone: the trail comes first
+            else if (streamBudget < 28 && shareBudget >= 28) streamBudget = 28;
+            if (streamBudget < 20) { DbgEmit = "calls " + dbgCalls + ": stream budget " + streamBudget + " < 20 (share " + shareBudget + ")"; return; }
+            int nStreams = Mathf.Clamp(streamBudget / (ns * 10), 2, 12);
+            if (nStreams > 2) nStreams &= ~1;                      // even numbers only: the fan is not re-traced for every point of the budget
+            int traced = 0;
+            float maxS = StreamSched[StreamSched.Length - 1];
+            bool any = false;
+            for (int si = 0; si < ns; si++)
+            {
+                StreamSource src = streamSources[si];
+                Vector3 w = LocalToWorld(src.local);
+                Vector3 up = (w - body.position).normalized;
+                if ((src.path == null || src.streams != nStreams || (src.tracedAt - w).sqrMagnitude > 4f || now - src.traceT > 2f) && traced < 1)
+                {
+                    traced++;
+                    src.streams = nStreams; src.tracedAt = w; src.traceT = now;
+                    src.path = new Vector3[nStreams][]; src.clear = new float[nStreams][]; src.count = new int[nStreams];
+                    src.widthH = new float[nStreams][]; src.head = new float[nStreams][];
+                    src.rad = new float[nStreams][]; src.dn = new float[nStreams][]; src.tArr = new float[nStreams][]; src.tK = new float[nStreams][];
+                    if (!src.axesOk || (src.axesAt - w).sqrMagnitude > 16f) ScanAxes(src, w, up);
+                    for (int k = 0; k < nStreams; k++)
+                    {
+                        float az, tilt;
+                        if (src.axesOk)
+                        {
+                            // a bundle of near-parallel rays along each axis (a few degrees apart, at different heights above the floor)
+                            int axis = src.hasB ? (k & 1) : 0, idx = src.hasB ? (k >> 1) : k, per = src.hasB ? (nStreams + 1) / 2 : nStreams;
+                            float off = per > 1 ? idx / (float)(per - 1) - 0.5f : 0f;
+                            az = (axis == 0 ? src.azA : src.azB) + off * 0.3f;
+                            tilt = Mathf.Lerp(1.0f, 1.45f, (idx * 0.618f) % 1f);
+                        }
+                        else
+                        {
+                            az = k * Mathf.PI * 2f / nStreams;
+                            tilt = (k & 1) == 0 ? 0.95f : 1.25f;          // no axis found: a fan, 54 or 72 degrees from the jet axis
+                        }
+                        int c = PadFluid.TraceStream(w, az, tilt, StreamSched, StreamSched.Length, streamTmpW, streamTmpC, streamTmpWH, streamTmpHd);
+                        src.count[k] = c;
+                        src.path[k] = new Vector3[c]; src.clear[k] = new float[c]; src.widthH[k] = new float[c * 4]; src.head[k] = new float[c];
+                        for (int j = 0; j < c; j++)
+                        {
+                            src.path[k][j] = streamTmpW[j]; src.clear[k][j] = streamTmpC[j]; src.head[k][j] = streamTmpHd[j];
+                            for (int hi = 0; hi < 4; hi++) src.widthH[k][j * 4 + hi] = streamTmpWH[j * 4 + hi];
+                        }
+                        StreamTube(src, k, c, nStreams, w);
+                    }
+                }
+                if (src.path == null) continue;
+
+                float lost = Mathf.Max(0f, now - src.lastSeen - 0.5f);
+                // once the jet is gone the cloud is a thermal that goes on mixing with the air: it widens (r ~ t^0.7) and the same smoke fills more room (the density
+                // falls with the area), and it thins out with a time of about 45 s
+                float life = Mathf.Exp(-lost / 45f);
+                if (life <= 0.03f) continue;
+                float sf = Mathf.Min(maxS, StreamFrontScale * Mathf.Log(1f + src.v0 * (now - src.born) / StreamFrontScale));
+                float st = 0f;                                          // the cloud stays where it is and fades (it does not leave the pad)
+                if (sf - st < 1f) continue;
+                float r0s = Mathf.Clamp(src.r0, 3f, 12f);
+                float grow = Mathf.Min(Mathf.Pow(1f + lost / 25f, 0.6f), 1.9f);
+                float rise = 0.05f * lost;
+
+                for (int k = 0; k < src.streams; k++)
+                {
+                    int c = src.count[k];
+                    if (c < 2) continue;
+                    float sEnd = Mathf.Min(FrontAt(src.tArr[k], c, now - src.born), StreamSched[c - 1]);
+                    if (sEnd - st < 1f) continue;
+                    bool first = true; Vector3 lastP = Vector3.zero;
+                    // the samples: st, the scheduled distances between, sEnd
+                    int jj = 0;
+                    while (jj < c && StreamSched[jj] <= st + 0.01f) jj++;
+                    // THE RADIUS OF THE STREAM, from physics. A turbulent jet entrains the air around it and widens at a rate of about 0.1 m per metre (the half-angle
+                    // of a round jet, 5-6 degrees); it cannot widen into a wall, so where the geometry leaves less room than that the stream FILLS the room (half of the
+                    // free width, and of the headroom) and goes on in it, and where the room grows again (it comes out of the trench) it widens again from the size it
+                    // has. A wall blocks it only if it reaches as high as the stream is thick: the free width is measured at the stream's own height.
+                    float sCur = st;
+                    while (true)
+                    {
+                        // position and clearance at sCur by interpolation along the traced points
+                        int a = Mathf.Clamp(jj - 1, 0, c - 2);
+                        float t = Mathf.InverseLerp(StreamSched[a], StreamSched[a + 1], sCur);
+                        Vector3 pos = Vector3.Lerp(src.path[k][a], src.path[k][a + 1], t);
+                        float r = Mathf.Lerp(src.rad[k][a], src.rad[k][a + 1], t);
+                        r *= grow;
+                        float tip = Mathf.Clamp01((sEnd - sCur) / Mathf.Max(8f, 0.15f * sEnd));
+                        float tail = st > 0f ? Mathf.Clamp01((sCur - st) / Mathf.Max(8f, 0.15f * st)) : 1f;
+                        r *= Mathf.Lerp(0.25f, 1f, tip) * Mathf.Lerp(0.25f, 1f, tail);
+                        // BILLOWS: the eddies of a turbulent stream are of its own size and they grow with the distance, so the radius swells and narrows along it, and the more
+                        // the farther it is from the nozzle: a string of round lumps (cumulus) instead of a smooth tube
+                        float billowAmp = Mathf.Lerp(0.10f, 0.24f, Mathf.Clamp01(sCur / 120f));
+                        r *= 1f + billowAmp * (0.65f * Mathf.Sin(sCur / Mathf.Max(0.9f * r, 2f) + k * 2.1f + si * 1.3f) + 0.35f * Mathf.Sin(sCur / Mathf.Max(0.4f * r, 1.2f) + k * 3.7f + si * 0.6f));
+                        float dens = Mathf.Clamp(Mathf.Lerp(src.dn[k][a], src.dn[k][a + 1], t), 0.03f, 1f) * life / (grow * grow);
+                        float heat = 0f;
+                        // BUOYANCY: the gas is warmer than the air, so lighter, and the stream lifts off the floor: a thermal of radius r rises at about sqrt(g' r),
+                        // g' = g (T - Ta) / Ta, and the excess of heat is mixed away with a time of about 25 s (so the rise goes on slowing down). Where the stream
+                        // has travelled for longer it has risen higher (and a cloud that lingers after the jet is gone goes on rising): it billows up along both
+                        // sides of the trench instead of lying flat. The root, where the gas is young, stays at the floor.
+                        float tPt = Mathf.Lerp(src.tArr[k][a], src.tArr[k][a + 1], t);
+                        float agePt = tPt + lost;          // the flow is steady while the jet lasts: the gas at a point left the nozzle area tPt ago; when it ends, the time since adds
+                        float gP = Mathf.Max(Mathf.Lerp(src.tK[k][a], src.tK[k][a + 1], t), 0f);
+                        float w0 = Mathf.Sqrt(gP * Mathf.Max(r, 1f));
+                        float lift = Mathf.Min(w0 * 14f * (1f - Mathf.Exp(-agePt / 30f)), 38f);
+                        Vector3 centre = pos + up * (0.3f * r + rise + lift);
+                        if (first)
+                        {
+                            activeOrderedPos.Add(centre); activeOrderedRadius.Add(0f); activeOrderedDensity.Add(1f);
+                            first = false;
+                        }
+                        activeOrderedPos.Add(centre); activeOrderedRadius.Add(r); activeOrderedDensity.Add(EncodeDensity(dens, 1f, heat));
+                        lastP = centre; any = true;
+                        if (sCur >= sEnd - 0.01f) break;
+                        float nextS = jj < c ? StreamSched[jj] : sEnd;
+                        if (jj < c && StreamSched[jj] <= sCur + 0.01f) { jj++; nextS = jj < c ? StreamSched[jj] : sEnd; }
+                        sCur = Mathf.Min(nextS, sEnd);
+                    }
+                    activeOrderedPos.Add(lastP); activeOrderedRadius.Add(0f); activeOrderedDensity.Add(1f);
+                }
+            }
+            if (any) needTrailSeparator = true;
+            DbgEmit = "calls " + dbgCalls + ": budget " + streamBudget + " (share " + shareBudget + "), rays/source " + nStreams + ", spine points added " + (activeOrderedPos.Count - dbgStart) + ", drawn " + any + ", this group " + (activeOrderedPos.Count) + " points, axes " + (streamSources[0].axesOk ? (streamSources[0].azA * Mathf.Rad2Deg).ToString("F0") + (streamSources[0].hasB ? "/" + (streamSources[0].azB * Mathf.Rad2Deg).ToString("F0") : " only") + " deg" : "none (a fan)");
+        }
+
         private const int WallSectors = 8;
-        private void MarkWallJet(ref Puff p, Vector3 up, Vector3 outward)
+        private void MarkWallJet(ref Puff p, Vector3 up, Vector3 outward, bool viaScene = false, bool surface = false)
         {
             if (p.isGround || !SmokeTuning.PhysWallChains) return;
+            // SURFACE STREAMS: the flow along the pad is not simulated parcel by parcel (that gave balls, loops and smoke through the walls): the
+            // jet that reaches the surface only says WHERE it lands, and the flow is traced along the height map from there (EmitStreams)
+            if (surface && SmokeTuning.PadStreams && !PadFluid.Drawing)
+            {
+                NoteStreamImpact(p.localPos, Mathf.Max(3f, p.pR * SmokeTuning.PhysRadiusScale * p.pScale), Vector3.ProjectOnPlane(p.velocity, up).magnitude);
+                p.markedForRemoval = true;
+                return;
+            }
+            // the pad cloud (billows on rails) draws the flow over the pad: the parcel that has reached it is done
+            if (PadCloud.Active || PadFluid.Active) { p.markedForRemoval = true; return; }
             int sector;
             if (padAxisValid)
             {
@@ -965,16 +1475,31 @@ namespace RaymarchedPlumeTrails
             // WATER DELUGE. A flame deflector is flooded with water to kill the sound; the flow turned along it is mostly
             // steam. The parcel takes on water here (condensation then decides how much of it is visible as a cloud),
             // and while it is still hot it glows (see WallHeat).
-            if (SmokeTuning.PadWater && (padAxisValid || SmokeTuning.PadWaterAlways))
+            if (SmokeTuning.PadWater && (padAxisValid || viaScene || SmokeTuning.PadWaterAlways))
             {
                 p.steam = 1f;
                 p.fw = Mathf.Max(p.fw, SmokeTuning.PadWaterFrac);
             }
+            p.hitLocal = p.localPos;
+            p.hitSpeed = Mathf.Max(5f, Vector3.ProjectOnPlane(p.velocity, up).magnitude);
+            p.hitR0 = Mathf.Max(10f, 3f * p.pR);
+            // A deluge-flooded pad turns ANY exhaust (hydrogen included, whose own plume is nearly invisible) into the white
+            // steam of a real launch: the cloud is the vapour and condensate of the water, not of the engine's own smoke.
+            if (SmokeTuning.PadWater && (padAxisValid || viaScene || SmokeTuning.PadWaterAlways))
+                p.emitDensity = Mathf.Max(p.emitDensity, 0.8f);
             p.isGround = true;
             p.bounced = true;
             p.groundRayId = sector;
             p.rayDir = outward;
             p.groundTick = groundSeqCounter++ / WallSectors;
+        }
+
+        private static void EaseShown(ref Puff p, float dt)
+        {
+            float a = 1f - Mathf.Exp(-dt * 5f);
+            if (p.pRs <= 0f) { p.pRs = p.pR; p.pVisS = p.pVis; return; }
+            p.pRs = Mathf.Lerp(p.pRs, p.pR, a);
+            p.pVisS = Mathf.Lerp(p.pVisS, p.pVis, a);
         }
 
         // One tick of a physical puff. Returns the new world position.
@@ -1007,14 +1532,45 @@ namespace RaymarchedPlumeTrails
             }
             float height = groundAlt > double.NegativeInfinity ? (float)(alt - groundAlt) : (float)alt;
 
-            int sub = Mathf.Clamp(Mathf.CeilToInt(dt / 0.04f), 1, 8);
+            // old parcels move slowly: a coarser sub-step is plenty (their dt is also longer, see the stride in Tick)
+            int sub = Mathf.Clamp(Mathf.CeilToInt(dt / (0.04f * Mathf.Clamp(p.age / 4f, 1f, 6f))), 1, 8);
             float h = dt / sub;
             Vector3 pos = worldPos;
             PuffPhysics.Ambient amb = default(PuffPhysics.Ambient);
             for (int k = 0; k < sub; k++)
             {
                 amb = SampleAmbient(pos, alt, up, Mathf.Max(height, 1f));
+                Vector3 velBefore = s.vel;
                 PuffPhysics.Step(ref s, h, amb, up, g, prm);
+                if (p.isGround && p.hitSpeed > 0f && SmokeTuning.PhysWallMomentum > 0f)
+                {
+                    // the sideways part of the flow is not slowed by the entrained air as a sphere would be (see PhysWallMomentum)
+                    float vbU = Vector3.Dot(velBefore, up), vaU = Vector3.Dot(s.vel, up);
+                    Vector3 hb = velBefore - up * vbU, ha = s.vel - up * vaU;
+                    s.vel = ha + (hb - ha) * SmokeTuning.PhysWallMomentum + up * vaU;
+                }
+                if (p.isGround && SmokeTuning.PhysWallLift > 0f && Time.time > p.liftFreeUntil)
+                {
+                    // A wall jet clings to the surface (Coanda): it can leave it only as fast as it entrains air, so its climb
+                    // is limited to a slope of ~PhysWallLift of its own sideways speed (plus a slow buoyant creep). Without it the
+                    // hot flow shot up as a vertical wall instead of spreading along the pad and the trench.
+                    float vUp = Vector3.Dot(s.vel, up);
+                    float hSpd = (s.vel - up * vUp).magnitude;
+                    float maxUp = SmokeTuning.PhysWallLift * hSpd + 1.5f;
+                    if (vUp > maxUp) s.vel -= up * (vUp - maxUp);
+                }
+                if (p.isGround && p.hitSpeed > 0f && SmokeTuning.PhysWallDecay > 0f)
+                {
+                    // Wall jet similarity (Glauert): the sideways speed falls as r^-1.1 with the distance r from the impact
+                    // (r0 = its length scale at the impact), so the flow is slow by ~100-150 m and the cloud billows up instead
+                    // of running on over the edge of the pad.
+                    float rr = Vector3.Distance(p.localPos, p.hitLocal);
+                    float cap = p.hitSpeed * Mathf.Pow(Mathf.Min(1f, p.hitR0 / Mathf.Max(rr, p.hitR0)), 1.1f * SmokeTuning.PhysWallDecay);
+                    float vU = Vector3.Dot(s.vel, up);
+                    Vector3 hv = s.vel - up * vU;
+                    float hs = hv.magnitude;
+                    if (hs > cap && hs > 0.01f) s.vel = hv * (cap / hs) + up * vU;
+                }
                 pos += s.vel * h;
             }
             PerfSteps++;
@@ -1022,13 +1578,29 @@ namespace RaymarchedPlumeTrails
             // Scene geometry first: the pad, a flame trench, buildings. The surface normal decides where the
             // flow goes (a slanted deflector turns it along the slope, walls confine it).
             bool hitScene = false;
-            if (SmokeTuning.PhysCollide && physRayBudget > 0 && groundAlt > double.NegativeInfinity && height < 12f + 1.3f * s.radius)
+            // SURFACE MODE owns the region of the pad grid: the colliders over a trench are a flat lid and the terrain under a mount is above
+            // the trench floor, so neither may decide where the flow goes there - the pre-rendered height map does (see below)
+            float aboveS = 1e9f;
+            bool surfIn = SmokeTuning.PadSurface && PadFluid.SurfaceAbove(pos, out aboveS);
+            // Near a pad whose real surface is a scenery mesh (not the analytic terrain): test the scene there too. Without
+            // this a puff above a raised pad is "far above the ground" and flew straight through it.
+            bool nearPadSurface = false;
+            if (padSurfValid && Time.time - padSurfTime < 2f)
+            {
+                Vector3 dxz = Vector3.ProjectOnPlane(worldPos - padSurfPos, up);
+                float dy = (float)(alt - padSurfAlt);
+                nearPadSurface = dxz.sqrMagnitude < 400f * 400f && dy < 12f + 1.3f * s.radius && dy > -80f;
+                // a flow already lying on the surface is tested every 2nd step only, and only while it still moves: a thousand
+                // wall-jet parcels testing the scene every step cost 60-130 ms a tick
+                if (nearPadSurface && p.isGround && (((p.spawnIndex + tickCounter) & 1) != 0 || p.age > 25f)) nearPadSurface = false;
+            }
+            if (!surfIn && SmokeTuning.PhysCollide && (physRayBudget > 0 || p.age < 1.5f) && ((groundAlt > double.NegativeInfinity && height < 12f + 1.3f * s.radius) || nearPadSurface))
             {
                 Vector3 move = pos - worldPos;
                 float dist = move.magnitude;
                 if (dist > 0.05f)
                 {
-                    physRayBudget--;
+                    if (p.age >= 1.5f) physRayBudget--;   // a fresh parcel (the one meeting the pad now) always gets its test
                     PerfRays++;
                     RaycastHit hit;
                     if (Physics.Raycast(worldPos, move / dist, out hit, dist + 0.5f * s.radius, GetSceneryCollisionMask(), QueryTriggerInteraction.Ignore))
@@ -1037,18 +1609,77 @@ namespace RaymarchedPlumeTrails
                         Vector3 tang = Vector3.ProjectOnPlane(s.vel, n);
                         Vector3 outward = tang.sqrMagnitude > 1f
                             ? tang.normalized
-                            : Vector3.ProjectOnPlane(hit.point - padCentre, n).normalized;
+                            : (PadFluid.SurfaceReady ? Vector3.ProjectOnPlane(Random.onUnitSphere, n).normalized : Vector3.ProjectOnPlane(hit.point - padCentre, n).normalized);
                         if (outward.sqrMagnitude < 0.5f) outward = Vector3.ProjectOnPlane(Random.onUnitSphere, n).normalized;
                         PuffPhysics.Collide(ref s, n, outward, dt, prm);
                         pos = hit.point + n * Mathf.Min(0.6f * s.radius, 2f);
                         hitScene = true;
-                        MarkWallJet(ref p, up, outward);
+                        // the wall jet starts from the speed AFTER the turn (p.velocity is still the one before it: a vertical jet then looked like 5 m/s and the decay cap held the whole flow at 5 m/s)
+                        p.velocity = s.vel;
+                        MarkWallJet(ref p, up, outward, true);   // pad / trench / deflector geometry, not bare terrain
                     }
                 }
             }
 
-            // terrain / sea level
-            if (!hitScene && groundAlt > double.NegativeInfinity)
+            // SURFACE MODE: the pad as the pre-rendered height map (the trench and the deflector have no colliders): the path of the parcel is
+            // walked in 30 cm steps; where it goes into the surface, it is turned along it, so the smoke follows the geometry
+            if (!hitScene && surfIn && p.age < 90f)
+            {
+                float above = aboveS;
+                if (above < 14f + 1.3f * s.radius && above > -80f)
+                {
+                    Vector3 shit, snh;
+                    if (PadFluid.SurfaceMarch(worldPos, pos, out shit, out snh))
+                    {
+                        Vector3 tang = Vector3.ProjectOnPlane(s.vel, snh);
+                        // a jet that hits head-on has no sideways direction of its own: it spreads RADIALLY, in every direction (the point
+                        // "away from the pad centre" was nearly the same for all the parcels of one jet, so they all went one way)
+                        Vector3 outward = tang.sqrMagnitude > 1f ? tang.normalized : Vector3.ProjectOnPlane(Random.onUnitSphere, snh).normalized;
+                        if (outward.sqrMagnitude < 0.5f) outward = Vector3.ProjectOnPlane(Random.onUnitSphere, snh).normalized;
+                        // A jet that hits a WALL (the side of the trench, the mount) stagnates and splits: part of it runs along the wall sideways,
+                        // and the part that the buoyancy of the hot gas lifts runs UP it. Without this a head-on hit only spread along the wall.
+                        float steep = 1f - Mathf.Abs(Vector3.Dot(snh, up));
+                        if (steep > 0.5f)
+                        {
+                            Vector3 upAlong = Vector3.ProjectOnPlane(up, snh).normalized;
+                            outward = (outward + upAlong * (steep - 0.5f) * 1.6f).normalized;
+                        }
+                        PuffPhysics.Collide(ref s, snh, outward, dt, prm);
+                        // a wall jet CLINGS to the surface: the small rebound of the ball model (restitution) threw the parcels up out of the
+                        // trench (upward share 0.15-0.3 in the log); only a sliver of the speed away from the surface is kept
+                        float vAway = Vector3.Dot(s.vel, snh);
+                        if (vAway > 0f) s.vel -= snh * (vAway * 0.85f);
+                        if (steep > 0.5f) p.liftFreeUntil = Time.time + 0.8f;       // running up a wall: not held down by the climb limit
+                        pos = shit + snh * Mathf.Min(0.6f * s.radius, 2f);
+                        hitScene = true;
+                        if (SmokeTuning.PadFluidDebug)
+                        {
+                            DbgHitCount++; DbgHitSpeedSum += s.vel.magnitude; DbgHitUpSum += Vector3.Dot(s.vel.normalized, up);
+                            if ((DbgHitCount & 3) == 0)
+                            {
+                                int di = DbgHitIdx++ % DbgHitMax;
+                                DbgHitPos[di] = shit; DbgHitNormal[di] = snh; DbgHitVel[di] = s.vel; DbgHitTime[di] = Time.time;
+                            }
+                        }
+                        p.velocity = s.vel;
+                        MarkWallJet(ref p, up, outward, true, true);
+                    }
+                }
+            }
+
+            // ATTACHMENT (Coanda): a wall-jet parcel lying close to the surface that did not cross it this tick keeps no speed away from it
+            if (!hitScene && surfIn && p.isGround && aboveS > 0f && aboveS < 2f * s.radius + 3f)
+            {
+                float a2; Vector3 n2;
+                if (PadFluid.SurfaceQuery(pos, out a2, out n2))
+                {
+                    float vAway = Vector3.Dot(s.vel, n2);
+                    if (vAway > 0f && Time.time > p.liftFreeUntil) s.vel -= n2 * (vAway * 0.6f);
+                }
+            }
+
+            // terrain / sea level (not inside the pad grid in surface mode: the height map is the floor there, trench included)
+            if (!hitScene && !surfIn && groundAlt > double.NegativeInfinity)
             {
                 float hNow = (float)(body.GetAltitude(pos) - groundAlt);
                 Vector3 outward = Vector3.ProjectOnPlane(pos - padCentre, up);
@@ -1056,7 +1687,7 @@ namespace RaymarchedPlumeTrails
                 if (outward.sqrMagnitude < 1e-4f) outward = Vector3.ProjectOnPlane(Random.onUnitSphere, up);
                 outward.Normalize();
                 float nh = PuffPhysics.Ground(ref s, hNow, up, outward, dt, prm);
-                if (nh > hNow) { pos += up * (nh - hNow); MarkWallJet(ref p, up, outward); }
+                if (nh > hNow) { pos += up * (nh - hNow); p.velocity = s.vel; MarkWallJet(ref p, up, outward); }
             }
 
             p.velocity = s.vel;
@@ -1080,11 +1711,70 @@ namespace RaymarchedPlumeTrails
             PerfTickMs += (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
         }
 
+        // debug: what the ground-hugging (wall jet) parcels look like right now, over all groups
+        public static string GroundStats()
+        {
+            int n = 0, nAll = 0, vis = 0; float r = 0f, rMax = 0f, pv = 0f, t = 0f, sp = 0f, mass = 0f;
+            for (int g = 0; g < all.Count; g++)
+            {
+                SmokeVolumeGroup sg = all[g];
+                if (sg == null) continue;
+                for (int i = 0; i < sg.puffs.Count; i++)
+                {
+                    Puff p = sg.puffs[i];
+                    if (!p.physical) continue;
+                    nAll++;
+                    if (!p.isGround) continue;
+                    n++;
+                    float rr = sg.SizeForPuff(p);
+                    r += rr; if (rr > rMax) rMax = rr;
+                    float v = p.pVisS > 0f ? p.pVisS : p.pVis; pv += v; if (v > 0.15f) vis++;
+                    t += p.pT; sp += p.velocity.magnitude; mass += p.pM;
+                }
+            }
+            string str = StreamStats();
+            if (n == 0) return str + "wall-jet parcels: none (of " + nAll + " physical)";
+            return str + "wall-jet parcels: " + n + " (of " + nAll + " physical), mean drawn radius " + (r / n).ToString("F1") + " m (max " + rMax.ToString("F1") + "), visible (>0.15) " + vis + ", mean visibility " + (pv / n).ToString("F2") + ", mean T " + (t / n).ToString("F0") + " K, mean speed " + (sp / n).ToString("F0") + " m/s, mean mass " + (mass / n).ToString("F0") + " kg";
+        }
+
+        public static readonly Dictionary<int, string> DbgGroupInfo = new Dictionary<int, string>();
+
+        private static string StreamStats()
+        {
+            string grp = "";
+            foreach (var kv in DbgGroupInfo) grp += " {" + kv.Value + "}";
+            int src = 0, rays = 0, pts = 0; string each = "";
+            for (int g = 0; g < all.Count; g++)
+            {
+                SmokeVolumeGroup sg = all[g];
+                if (sg == null) continue;
+                for (int i = 0; i < sg.streamSources.Count; i++)
+                {
+                    StreamSource q = sg.streamSources[i];
+                    src++;
+                    int rc = 0, pc = 0;
+                    if (q.count != null) for (int k = 0; k < q.count.Length; k++) { if (q.count[k] > 1) rc++; pc += q.count[k]; }
+                    rays += rc; pts += pc;
+                    if (src <= 4) each += " [r0 " + q.r0.ToString("F1") + " v0 " + q.v0.ToString("F0") + " seen " + (Time.time - q.lastSeen).ToString("F1") + "s ago, rays " + rc + "/" + (q.count != null ? q.count.Length : 0) + "]";
+                }
+            }
+            return "ENGINE GROUPS:" + grp + " | EMIT: " + DbgEmit + " | STREAMS: " + src + " sources," + each + " (rays with a path " + rays + ", points " + pts + ") | ";
+        }
+
+        // debug: the last parcels turned by the pad surface (position, surface normal, velocity after the turn) and a count
+        public const int DbgHitMax = 16;
+        public static readonly Vector3[] DbgHitPos = new Vector3[DbgHitMax], DbgHitNormal = new Vector3[DbgHitMax], DbgHitVel = new Vector3[DbgHitMax];
+        public static readonly float[] DbgHitTime = new float[DbgHitMax];
+        public static int DbgHitIdx, DbgHitCount;
+        public static float DbgHitSpeedSum, DbgHitUpSum;
+        private bool shockOn; private Vector3 shockC; private float shockR0, shockR1, shockAmp;
+
         private void TickInner(float dt)
         {
 
             PublishNoiseOffset();
             physRayBudget = Mathf.RoundToInt(SmokeTuning.PhysCollideBudget);
+            shockOn = PadFluid.ShockFront(out shockC, out shockR0, out shockR1, out shockAmp);
 
             for (int i = puffs.Count - 1; i >= 0; i--)
             {
@@ -1101,13 +1791,47 @@ namespace RaymarchedPlumeTrails
                 Vector3 worldPos = LocalToWorld(p.localPos);
                 Vector3 up = (worldPos - body.position).normalized;
 
+                // above the atmosphere (or on an airless body) the smoke is gone
+                if (!p.isGround && ((body.atmosphere && body.GetAltitude(worldPos) >= body.atmosphereDepth) || (!body.atmosphere && !SmokeTuning.AirlessBodyPlume)))
+                {
+                    p.markedForRemoval = true; puffs[i] = p; continue;
+                }
+
                 if (p.physical)
                 {
+                    // the ignition wave of the engines (surface mode): one outward kick when the front passes, shielded by the structure
+                    if (shockOn)
+                    {
+                        Vector3 sd = worldPos - shockC;
+                        float sr = sd.magnitude;
+                        if (sr > 4f && sr > shockR0 - 3f && sr < shockR1 + 3f)
+                        {
+                            Vector3 sh, snn;
+                            if (!PadFluid.SurfaceMarch(shockC, worldPos, out sh, out snn))
+                            {
+                                Vector3 sdir = (sd / sr + up * 0.25f).normalized;
+                                p.velocity += sdir * (shockAmp * 30f / Mathf.Max(sr, 30f)) / (1f + 0.04f * p.pR);
+                            }
+                        }
+                    }
+                    // a wall-jet puff lying on the pad: the fluid cloud draws that flow now, so the old ones are dropped
+                    if (p.isGround && PadFluid.Active) { p.markedForRemoval = true; puffs[i] = p; continue; }
                     // Old puffs move slowly and are far from the ground: they are stepped every 2nd / 4th tick with the
                     // matching longer dt (about 1100 puffs were being stepped every tick = 5 ms of every 7 ms tick).
-                    int stride = p.age > 30f ? 4 : p.age > 8f ? 2 : 1;
-                    if (stride > 1 && ((p.spawnIndex + tickCounter) % stride) != 0) { puffs[i] = p; continue; }
+                    int stride = p.age > 40f ? 8 : p.age > 10f ? 4 : p.age > 3f ? 2 : 1;
+                    if (stride > 1 && ((p.spawnIndex + tickCounter) % stride) != 0)
+                    {
+                        // between its physics steps a parcel is NOT frozen (it then jumped, at a different tick for each one): it drifts
+                        // with the velocity it has, every tick, so the spine moves smoothly
+                        p.localPos = WorldToLocal(worldPos + p.velocity * dt);
+                        EaseShown(ref p, dt);
+                        puffs[i] = p;
+                        continue;
+                    }
                     Vector3 newPos = StepPhysicalPuff(ref p, worldPos, up, dt * stride);
+                    // the step integrated the whole window; the other ticks of it have already moved the parcel, so only this tick's share is applied
+                    if (stride > 1) newPos = worldPos + (newPos - worldPos) / stride;
+                    EaseShown(ref p, dt);
                     if (!IsFinite(newPos) || !IsFinite(p.velocity) || float.IsNaN(p.pM) || float.IsNaN(p.pR))
                     {
                         p.markedForRemoval = true;
@@ -1669,7 +2393,7 @@ namespace RaymarchedPlumeTrails
         {
             if (p.physical)
                 return p.emitDensity * Mathf.Pow(Mathf.Clamp(p.pM0 / Mathf.Max(DilutedMass(p), 1e-3f), 1e-4f, 1f), SmokeTuning.PhysDensityExp)
-                    * (p.steam > 0.01f ? Mathf.Lerp(1f, p.pVis, p.steam) : 1f);
+                    * (p.steam > 0.01f ? Mathf.Lerp(1f, (p.pRs > 0f ? p.pVisS : p.pVis), p.steam) : 1f);
             if (SmokeTuning.SrbOnly && !p.isGround)
             {
                 // Mass conservation along a line. The smoke carried per metre of trail is
@@ -1711,7 +2435,7 @@ namespace RaymarchedPlumeTrails
             float d = p.pM / p.pMe;
             // Past the limit the visible radius almost stops growing (a constant-mass core would stop outright; real
             // plumes keep widening, only slowly) while the density keeps falling with the dilution.
-            return d <= lim ? 1f : Mathf.Pow(lim / d, 0.26f);
+            return d <= lim ? 1f : Mathf.Pow(lim / d, 0.33f);   // ~ entrainment: the radius keeps growing like a cone
         }
 
         // GROWTH CAP. A parcel's radius follows its entrained mass, so from the nozzle (a few metres) to old smoke (tens of
@@ -1719,11 +2443,22 @@ namespace RaymarchedPlumeTrails
         // "stretched". A visible plume widens by a few times, not ten. The ratio radius / release radius is limited softly
         // (asymptote = PhysMaxGrowth, the first part of the growth untouched), so the column keeps a similar width along its
         // length. 0 = off.
+        // FAR TAPER. With the growth capped, a tall column keeps one width from the engine to the sky - a tube. Smoke
+        // that is old (far behind the rocket) is drawn narrower, so the column is thickest by the engine and slims
+        // out along its length, as the user asked ("thick at the engine, thin further"). 0 = off.
+        private static float FarTaper(Puff p)
+        {
+            float k = SmokeTuning.PhysFarTaper;
+            if (k <= 0.001f) return 1f;
+            float x = Mathf.Clamp01(p.age / 45f);
+            return 1f - k * x * x * (3f - 2f * x);
+        }
+
         private static float GrowthCapFactor(Puff p)
         {
             float g = SmokeTuning.PhysMaxGrowth;
             if (g <= 1.01f || p.pR0 <= 0f) return 1f;
-            float x = p.pR / p.pR0;
+            float x = (p.pRs > 0f ? p.pRs : p.pR) / p.pR0;
             if (x <= 1f) return 1f;
             float capped = 1f + (g - 1f) * (1f - Mathf.Exp(-(x - 1f) / (g - 1f)));
             return capped / x;
@@ -1731,7 +2466,24 @@ namespace RaymarchedPlumeTrails
 
         private float SizeForPuff(Puff p)
         {
-            if (p.physical) return Mathf.Max(p.pR * SmokeTuning.PhysRadiusScale * p.pScale * VisibleRadiusFactor(p) * GrowthCapFactor(p), 0.05f);
+            if (p.physical)
+            {
+                float rr = (p.pRs > 0f ? p.pRs : p.pR) * SmokeTuning.PhysRadiusScale * p.pScale * VisibleRadiusFactor(p) * (p.isGround ? 1f : GrowthCapFactor(p) * FarTaper(p));   // the flow along the pad is NOT capped or tapered like a rising column: it has to grow to the size of a cloud
+                // WALL JET (Glauert 1956, radial jet along a wall): the layer thickens linearly with the distance from the
+                // impact, half-thickness ~ 0.1 x r. The parcel's own entrainment alone gives a tube of constant width.
+                if (p.isGround)
+                {
+                    float dHit = Vector3.Distance(p.localPos, p.hitLocal);
+                    float floorR = SmokeTuning.PhysWallSpread > 0.001f ? 1.3f * SmokeTuning.PhysWallSpread * dHit : 0f;   // steam-like: a little more than the textbook wall jet
+                    // The entrained mass of a parcel keeps growing and with it the radius (mean 30 m, max 61 m in the log: spheres wider than the
+                    // trench, piling up into clouds over the walls). A layer along the surface is thin: its half-thickness is a few metres plus
+                    // a fraction of the distance travelled, and it never exceeds 25 m.
+                    float capR = Mathf.Min(25f, 5f + 0.22f * dHit);
+                    rr = Mathf.Min(rr, Mathf.Max(capR, floorR));
+                    rr = Mathf.Max(rr, Mathf.Min(floorR, 25f));
+                }
+                return Mathf.Max(rr, 0.05f);
+            }
             // Growth is timed independently of lifeTime. Tying the two together means a
             // puff only reaches full size at the end of its life, by which point the
             // rocket is kilometres away and the visible trail is all young thin puffs.
@@ -1825,9 +2577,16 @@ namespace RaymarchedPlumeTrails
         {
             float floor = SmokeTuning.JellyfishEnabled ? SmokeTuning.JellyfishAlphaFloor : 0f;
             double altitude = body.GetAltitude(worldPos);
-            if (altitude <= fadeStartAltitude) return 1f;
-            if (altitude >= fadeEndAltitude) return floor;
-            float t = (float)((altitude - fadeStartAltitude) / (fadeEndAltitude - fadeStartAltitude));
+            // NO AIR, NO SMOKE: above the atmosphere of the body (or anywhere on a body that has none) there is nothing to hold it. The "thin-air alpha"
+            // floor of the jellyfish applied there too, and the trail stayed in space for ever (reported by other players).
+            if (!body.atmosphere) return SmokeTuning.AirlessBodyPlume ? floor : 0f;
+            double depth = body.atmosphereDepth;
+            if (altitude >= depth) return 0f;
+            // the fade follows the atmosphere of THIS body: it starts at 0.45 of its depth and ends at its top (the fixed 45 / 90 km were made for one planet)
+            float fEnd = (float)System.Math.Min(fadeEndAltitude, depth), fStart = Mathf.Min(fadeStartAltitude, 0.45f * fEnd);
+            if (altitude <= fStart) return 1f;
+            if (altitude >= fEnd) return floor * Mathf.Clamp01((float)((depth - altitude) / System.Math.Max(depth - fEnd, 1.0)));
+            float t = (float)((altitude - fStart) / System.Math.Max(fEnd - fStart, 1.0));
             return Mathf.Lerp(1f, floor, t);
         }
 
@@ -1843,6 +2602,12 @@ namespace RaymarchedPlumeTrails
         private readonly Dictionary<int, Vector3> wallLast = new Dictionary<int, Vector3>();
         private readonly Dictionary<int, float> wallLastR = new Dictionary<int, float>();
         private int committedGroundStride = 1;
+        private int committedWallStride = 1;
+        private readonly List<GroundSortEntry> wallKept = new List<GroundSortEntry>();
+        // static comparers: a lambda passed to Sort is re-created on every call that captures nothing only in newer compilers; this is explicit
+        private static readonly System.Comparison<GroundSortEntry> WallOrder = (x, y) => x.rayId != y.rayId ? x.rayId.CompareTo(y.rayId) : x.age.CompareTo(y.age);
+        private static readonly System.Comparison<GroundSortEntry> GroundOrder = (x, y) => x.key.CompareTo(y.key);
+        private float wallPrevR, wallPrevSpeed, wallPrevAge; private int wallPrevRay;
 
         private struct GroundSortEntry
         {
@@ -1850,7 +2615,7 @@ namespace RaymarchedPlumeTrails
             public float radius;
             public float density;
             public float key;
-            public int rayId;
+            public int rayId; public float age; public float speed;
         }
         private readonly List<GroundSortEntry> groundScratch = new List<GroundSortEntry>();
 
@@ -1922,7 +2687,7 @@ namespace RaymarchedPlumeTrails
                 Vector3 wp = LocalToWorld(puffs[i].localPos);
                 if (AlphaForAge(puffs[i].age) * AlphaForAltitude(wp) <= 0.01f) continue;
                 // side clouds: keep a puff only if it is clear of the last kept one in its branch
-                if (puffs[i].physical && puffs[i].groundRayId >= 0 && SmokeTuning.WallSpacing > 0.01f)
+                if (puffs[i].physical && puffs[i].groundRayId >= 0 && SmokeTuning.WallSpacing > 0.01f && puffs[i].velocity.sqrMagnitude < 144f)
                 {
                     float rr = SizeForPuff(puffs[i]);
                     Vector3 lastPos; float lastR;
@@ -1943,7 +2708,7 @@ namespace RaymarchedPlumeTrails
                     // each parcel's own flight path and drew it as a looping tube (spaghetti). Each is its own blob.
                     wallScratch.Add(new GroundSortEntry {
                         pos = wp, radius = SizeForPuff(puffs[i]), density = EncodeDensity(DensityForPuff(puffs[i]), puffs[i].steam, WallHeat(puffs[i])),
-                        key = puffs[i].spawnIndex, rayId = puffs[i].groundRayId });
+                        key = puffs[i].spawnIndex, rayId = puffs[i].groundRayId, age = puffs[i].age, speed = puffs[i].velocity.magnitude });
                     continue;
                 }
                 groundScratch.Add(new GroundSortEntry {
@@ -1951,30 +2716,64 @@ namespace RaymarchedPlumeTrails
                     key = key, rayId = puffs[i].groundRayId });
             }
 
+            if (streamSources.Count > 0 && SmokeTuning.PadStreams && !PadFluid.Drawing) EmitStreams(shareBudgetPts > 0 ? shareBudgetPts : MaxSpinePoints);
+
             // isolated blobs: three spine points each (zero-radius separator, then two coincident points of the blob's
             // radius - a segment with a zero-radius end is skipped by the shader, so nothing connects to anything)
             if (wallScratch.Count > 0)
             {
-                int blobStride = 1;
                 int cap = Mathf.Max(8, MaxGroundSpinePoints / 3);
-                while (wallScratch.Count / blobStride > cap && blobStride < 64) blobStride *= 2;
+                // The stride only goes UP while the count stays over the cap, and comes down only when the count has fallen well under it (it was
+                // recomputed every frame, and a count that hovered at the cap toggled it 1 <-> 2: half of the blobs appeared and vanished)
+                int wantedWall = 1;
+                while (wallScratch.Count / wantedWall > cap && wantedWall < 64) wantedWall *= 2;
+                if (wantedWall > committedWallStride) committedWallStride = wantedWall;
+                else if (committedWallStride > 1 && wallScratch.Count / (committedWallStride / 2) <= cap * 0.7f) committedWallStride /= 2;
+                int blobStride = committedWallStride;
+                // Blobs that lie NEAR each other are chained (nearest neighbour first), so a flow reads as one continuous body of smoke, not as
+                // separate balls; where the next blob is farther than the two radii allow, the chain is BROKEN (zero-radius separator), so
+                // nothing is ever joined across an empty gap (that was the spaghetti).
+                wallKept.Clear();
                 for (int b = 0; b < wallScratch.Count; b++)
+                    if (!(blobStride > 1 && ((long)wallScratch[b].key % blobStride) != 0)) wallKept.Add(wallScratch[b]);
+                int nk = wallKept.Count;
+                if (nk > 0)
                 {
-                    GroundSortEntry e = wallScratch[b];
-                    if (blobStride > 1 && ((long)e.key % blobStride) != 0) continue;
-                    float tiny = Mathf.Max(0.03f, e.radius * 0.02f);
-                    activeOrderedPos.Add(e.pos); activeOrderedRadius.Add(0f); activeOrderedDensity.Add(1f);
-                    activeOrderedPos.Add(e.pos); activeOrderedRadius.Add(e.radius); activeOrderedDensity.Add(e.density);
-                    activeOrderedPos.Add(e.pos + Vector3.up * tiny); activeOrderedRadius.Add(e.radius); activeOrderedDensity.Add(e.density);
+                    // each ray is a TRAIL: its parcels in order of age, the youngest (at the engine / the impact) first, so the chain runs
+                    // from the root outwards like the main trail does
+                    wallKept.Sort(WallOrder);
+                    int cur = 0;
+                    bool first = true;
+                    Vector3 lastPos = Vector3.zero;
+                    for (int done = 0; done < nk; done++)
+                    {
+                        GroundSortEntry e = wallKept[cur];
+                        float tiny = Mathf.Max(0.03f, e.radius * 0.02f);
+                        // link only if the previous blob is within reach: 1.3x the sum of the radii (the capsule between them is then thinner than the blobs)
+                        float gap = first ? 1e9f : Vector3.Distance(e.pos, lastPos);
+                        // the same ray, next in age: a coherent flow moved the parcel about speed x (age difference) between the two, so a gap of
+                        // that size is NOT a break (young fast parcels are far apart yet one stream); different rays link only when really close
+                        bool sameRay = !first && e.rayId == wallPrevRay;
+                        float reach = sameRay ? 1.6f * Mathf.Max(e.speed, wallPrevSpeed) * Mathf.Abs(e.age - wallPrevAge) + 2.2f * (e.radius + wallPrevR)
+                                              : 1.3f * (e.radius + wallPrevR);
+                        bool linked = !first && gap < reach;
+                        if (!linked) { activeOrderedPos.Add(e.pos); activeOrderedRadius.Add(0f); activeOrderedDensity.Add(1f); }
+                        activeOrderedPos.Add(e.pos); activeOrderedRadius.Add(e.radius); activeOrderedDensity.Add(e.density);
+                        activeOrderedPos.Add(e.pos + Vector3.up * tiny); activeOrderedRadius.Add(e.radius); activeOrderedDensity.Add(e.density);
+                        lastPos = e.pos; wallPrevR = e.radius; wallPrevRay = e.rayId; wallPrevSpeed = e.speed; wallPrevAge = e.age; first = false;
+                        if (done + 1 >= nk) break;
+                        cur = done + 1;
+                    }
+                    activeOrderedPos.Add(lastPos); activeOrderedRadius.Add(0f); activeOrderedDensity.Add(1f);
                 }
-                activeOrderedPos.Add(wallScratch[wallScratch.Count - 1].pos); activeOrderedRadius.Add(0f); activeOrderedDensity.Add(1f);
+                else { activeOrderedPos.Add(wallScratch[wallScratch.Count - 1].pos); activeOrderedRadius.Add(0f); activeOrderedDensity.Add(1f); }
                 needTrailSeparator = true;
                 wallScratch.Clear();
             }
 
             if (groundScratch.Count > 0)
             {
-                groundScratch.Sort((x, y) => x.key.CompareTo(y.key));
+                groundScratch.Sort(GroundOrder);
 
                 // Hard share of the spine. Both clouds use the same 200-point array, so an
                 // unbounded ground cloud starves the trail - its stride jumps and it comes
@@ -2175,6 +2974,7 @@ namespace RaymarchedPlumeTrails
                     activeOrderedRadius.Add(liveRootRadius[i]);
                     activeOrderedDensity.Add(EncodeDensity(liveRootDens[i], steamFrac));
                 }
+                EmitNozzleThreads(shareBudgetPts > 0 ? shareBudgetPts : MaxSpinePoints);
             }
         }
 
@@ -2229,7 +3029,12 @@ namespace RaymarchedPlumeTrails
         // repeated 1-2-1 passes into smoothedSpine, leaving the source list untouched.
         // Endpoints are pinned so the trail still starts exactly at the engine and ends
         // at the live tip.
-        private void SmoothSpine(List<Vector3> source, int count, int passes)
+        // A point of radius 0 is a BREAK of the chain (the separator between two bursts, and the two zero points that isolate every wall-jet
+        // blob): it is neither moved nor taken into the average of its neighbours. Averaged, it got a radius from them, the capsules to it
+        // became real, and blobs that were meant to stand alone were joined in the order they were born - for slow parcels that sat in a
+        // pile, for fast ones that flew apart it drew loops hundreds of metres long (the "spaghetti" over the pad).
+        private const float BreakRadius = 1e-4f;
+        private void SmoothSpine(List<Vector3> source, List<float> radii, int count, int passes)
         {
             for (int i = 0; i < count; i++) smoothedSpine[i] = source[i];
             if (count < 3) return;
@@ -2240,9 +3045,10 @@ namespace RaymarchedPlumeTrails
                 smoothScratch[count - 1] = smoothedSpine[count - 1];
                 for (int i = 1; i < count - 1; i++)
                 {
-                    smoothScratch[i] = smoothedSpine[i - 1] * 0.25f
-                        + smoothedSpine[i] * 0.5f
-                        + smoothedSpine[i + 1] * 0.25f;
+                    if (radii[i] <= BreakRadius) { smoothScratch[i] = smoothedSpine[i]; continue; }
+                    Vector3 l = radii[i - 1] <= BreakRadius ? smoothedSpine[i] : smoothedSpine[i - 1];
+                    Vector3 r = radii[i + 1] <= BreakRadius ? smoothedSpine[i] : smoothedSpine[i + 1];
+                    smoothScratch[i] = l * 0.25f + smoothedSpine[i] * 0.5f + r * 0.25f;
                 }
                 for (int i = 0; i < count; i++) smoothedSpine[i] = smoothScratch[i];
             }
@@ -2263,9 +3069,10 @@ namespace RaymarchedPlumeTrails
                 radiiScratch[count - 1] = smoothedRadii[count - 1];
                 for (int i = 1; i < count - 1; i++)
                 {
-                    radiiScratch[i] = smoothedRadii[i - 1] * 0.25f
-                        + smoothedRadii[i] * 0.5f
-                        + smoothedRadii[i + 1] * 0.25f;
+                    if (source[i] <= BreakRadius) { radiiScratch[i] = 0f; continue; }          // a break stays a break (see SmoothSpine)
+                    float l = source[i - 1] <= BreakRadius ? smoothedRadii[i] : smoothedRadii[i - 1];
+                    float r = source[i + 1] <= BreakRadius ? smoothedRadii[i] : smoothedRadii[i + 1];
+                    radiiScratch[i] = l * 0.25f + smoothedRadii[i] * 0.5f + r * 0.25f;
                 }
                 for (int i = 0; i < count; i++) smoothedRadii[i] = radiiScratch[i];
             }
@@ -2342,6 +3149,9 @@ namespace RaymarchedPlumeTrails
         // Once merged, stay merged until the bounds separate by this much more, so a pair
         // hovering at the touching distance does not flip between the two modes every frame.
         private const float MergeHysteresis = 1.3f;
+        private const float MergeHoldSeconds = 4f;
+        private static float lastMergeLog;
+        private float mergeHoldUntil;
 
         private Vector3 spineMin, spineMax;
         private bool hasSpineBounds;
@@ -2395,6 +3205,12 @@ namespace RaymarchedPlumeTrails
         // Called once a frame, after every group has had its FixedUpdate tick.
         public static void RenderAll()
         {
+            if (SmokeTuning.HideOldTrail)
+            {
+                for (int h = 0; h < all.Count; h++) if (all[h] != null) all[h].HideAll();
+                freshGroups.Clear();
+                return;
+            }
             freshGroups.Clear();
             float now = Time.time;
             for (int i = all.Count - 1; i >= 0; i--)
@@ -2424,18 +3240,23 @@ namespace RaymarchedPlumeTrails
             for (int i = 0; i < n; i++)
             {
                 SmokeVolumeGroup a = freshGroups[i];
-                if (!a.hasSpineBounds) continue;
                 for (int j = i + 1; j < n; j++)
                 {
                     SmokeVolumeGroup b = freshGroups[j];
-                    if (!b.hasSpineBounds || a.body != b.body) continue;
+                    if (a.body != b.body) continue;
 
                     int ra = FindRoot(i), rb = FindRoot(j);
                     if (ra == rb) continue;
                     if (clusterSize[ra] + clusterSize[rb] > MaxMergedGroups) continue;
 
+                    // Merged pairs are HELD: once two trails are drawn as one they stay one for a few seconds after their bounds stop
+                    // touching, and a frame in which one of them has no bounds (it had no points for an instant) does not split them.
+                    // Distance hysteresis alone let a pair that hovers at the touching distance, or a trail that flickered in and out of
+                    // existence, switch between one volume and two - and every switch re-builds the spine (the twitch).
                     bool wereMerged = a.lastLeaderId != 0 && a.lastLeaderId == b.lastLeaderId;
-                    if (!BoundsTouch(a, b, wereMerged ? MergeHysteresis : 1f)) continue;
+                    bool touch = a.hasSpineBounds && b.hasSpineBounds && BoundsTouch(a, b, wereMerged ? MergeHysteresis : 1f);
+                    if (touch) { a.mergeHoldUntil = now + MergeHoldSeconds; b.mergeHoldUntil = now + MergeHoldSeconds; }
+                    else if (!(wereMerged && now < a.mergeHoldUntil && now < b.mergeHoldUntil)) continue;
 
                     clusterParent[rb] = ra;
                     clusterSize[ra] += clusterSize[rb];
@@ -2455,9 +3276,19 @@ namespace RaymarchedPlumeTrails
                     if (FindRoot(j) == i) members.Add(freshGroups[j]);
                 }
 
+                // the leader is the one that led this cluster last frame (if it is still in it): the volume that is drawn - its noise
+                // offset, its history for the temporal upscaling - must not change hands just because the list order did
                 SmokeVolumeGroup leader = members[0];
+                for (int m = 1; m < members.Count; m++)
+                    if (members[m].instanceId != 0 && members[m].instanceId == members[m].lastLeaderId) { leader = members[m]; break; }
+                if (leader != members[0]) { members.Remove(leader); members.Insert(0, leader); }
                 for (int m = 0; m < members.Count; m++)
                 {
+                    if (members[m].MergedCount != members.Count && Time.time - lastMergeLog > 0.2f)
+                    {
+                        lastMergeLog = Time.time;
+                        Debug.Log("[PlumeTrails] trail merge: group " + members[m].instanceId + " now in a cluster of " + members.Count + " (was " + members[m].MergedCount + "), leader " + leader.instanceId);
+                    }
                     members[m].lastLeaderId = leader.instanceId;
                     members[m].MergedCount = members.Count;
                     if (m > 0) SmokeRenderRegistry.SetActive(members[m].polylineRenderer, false);
@@ -2495,6 +3326,15 @@ namespace RaymarchedPlumeTrails
                 if (!wfDone[k]) open++;
             }
             int remaining = budget;
+            // The groups that are the SOURCE of the pad flow (a booster over the trench) get a reserved share first: with seven groups of a launch vehicle in
+            // one cluster the equal share was 44 points, a third of it (15) went to the streams, under their minimum, and the pad cloud was not drawn at all
+            // (the log: "stream budget 15 < 20 (share 44)"). The rest is water-filled among the others.
+            for (int k = 0; k < n; k++)
+            {
+                if (wfDone[k] || !members[k].HasLiveStreams(12f)) continue;
+                int res = Mathf.Min(StreamReserve, Mathf.Max(remaining / 2, 0));
+                wfShare[k] = res; remaining -= res; wfDone[k] = true; open--;
+            }
             bool changed = true;
             while (open > 0 && changed)
             {
@@ -2579,18 +3419,33 @@ namespace RaymarchedPlumeTrails
                     m.polylineThinnedPos.Clear();
                     m.polylineThinnedRadius.Clear();
                     m.polylineThinnedDensity.Clear();
+                    int prevSrc = -1;
                     for (int i = 0; i < take; i++)
                     {
                         // last point pinned to the newest one (tip/root), never stranded short of it
                         int src = i == take - 1 ? n - 1 : Mathf.Min(n - 1, i * intStride);
+                        // A BREAK (a radius-0 point) that falls between two kept points is kept as a break: otherwise the thinning joined the
+                        // two blobs / bursts it separated with a capsule across the gap
+                        if (prevSrc >= 0 && src > prevSrc + 1 && m.polylineThinnedPos.Count + 3 <= room
+                            && m.activeOrderedRadius[prevSrc] > BreakRadius && m.activeOrderedRadius[src] > BreakRadius)
+                        {
+                            bool brk = false;
+                            for (int q = prevSrc + 1; q < src; q++) if (m.activeOrderedRadius[q] <= BreakRadius) { brk = true; break; }
+                            if (brk)
+                            {
+                                m.polylineThinnedPos.Add(m.activeOrderedPos[prevSrc]); m.polylineThinnedRadius.Add(0f); m.polylineThinnedDensity.Add(1f);
+                                m.polylineThinnedPos.Add(m.activeOrderedPos[src]); m.polylineThinnedRadius.Add(0f); m.polylineThinnedDensity.Add(1f);
+                            }
+                        }
                         m.polylineThinnedPos.Add(m.activeOrderedPos[src]);
                         m.polylineThinnedRadius.Add(m.activeOrderedRadius[src]);
                         m.polylineThinnedDensity.Add(m.activeOrderedDensity[src]);
+                        prevSrc = src;
                     }
                     pos = m.polylineThinnedPos;
                     rad = m.polylineThinnedRadius;
                     den = m.polylineThinnedDensity;
-                    n = take;
+                    n = take = m.polylineThinnedPos.Count;
                 }
 
                 // The chain joins spine points with exact straight capsules - no blur pass
@@ -2602,7 +3457,7 @@ namespace RaymarchedPlumeTrails
                 // now metres apart stops hiding the jitter - the sawtooth comes back after
                 // a change that never touched positions. Extra passes are free at <=200
                 // points.
-                m.SmoothSpine(pos, n, SpineSmoothPasses);
+                m.SmoothSpine(pos, rad, n, SpineSmoothPasses);
                 m.SmoothRadii(rad, n, SpineSmoothPasses);
 
                 if (total > 0)
@@ -2644,11 +3499,32 @@ namespace RaymarchedPlumeTrails
             Vector3 boxMax = Vector3.negativeInfinity;
             float radiusSum = 0f;
 
+            // A thin trail seen from far away: its radius falls under one pixel of the (reduced) render buffer and the temporal filter blends it into the
+            // pixels around it, so it fades out. The radius is kept at a minimum on the screen, and the density falls with (r / rMin), so the optical depth through the middle stays the same:
+            // it still reads as the same line, not a fainter one that the filter loses (the mass is conserved only to first order: a distant trail is meant to be SEEN).
+            float pxRad = 0f;
+            Camera fcam = FlightCamera.fetch != null ? FlightCamera.fetch.mainCamera : Camera.main;
+            if (fcam != null && SmokeTuning.MinTrailPixels > 0.01f)
+                pxRad = SmokeTuning.MinTrailPixels * 2f * Mathf.Tan(0.5f * fcam.fieldOfView * Mathf.Deg2Rad) / Mathf.Max(fcam.pixelHeight * SmokeQuality.Current.renderScale, 100f);
+            Vector3 camPos = fcam != null ? fcam.transform.position : Vector3.zero;
+
             for (int i = 0; i < totalPoints; i++)
             {
                 float r = smoothedRadii[i];
                 Vector3 p = smoothedSpine[i];
-                spinePointsBuffer[i] = new Vector4(p.x, p.y, p.z, mergeDensity[i]);
+                float wDens = mergeDensity[i];
+                if (pxRad > 0f && r > 0.01f)
+                {
+                    float rMin = pxRad * (p - camPos).magnitude;
+                    if (r < rMin)
+                    {
+                        float hh = Mathf.Floor(wDens / 16f), rem = wDens - 16f * hh, ss = Mathf.Floor(rem / 2f), dd = rem - 2f * ss;
+                        float k = r / rMin;
+                        wDens = dd * k + 2f * ss + 16f * hh;
+                        r = rMin;
+                    }
+                }
+                spinePointsBuffer[i] = new Vector4(p.x, p.y, p.z, wDens);
                 spineRadiiBuffer[i] = r;
                 radiusSum += r;
 
@@ -2701,17 +3577,19 @@ namespace RaymarchedPlumeTrails
             }
             polylinePropertyBlock.SetFloat("_MaxSpineRadius", maxSpineRadius);
             // strongest flame among the merged members; a member with no live tip is not burning
-            Vector3 fPos = Vector3.zero; float fStr = 0f, fRange = 25f; Color fCol = flameCol;
+            Vector3 fPos = Vector3.zero, fEnd = Vector3.zero; float fStr = 0f, fRange = 25f; bool fSeg = false; Color fCol = flameCol;
             for (int fi = 0; fi < members.Count; fi++)
             {
                 SmokeVolumeGroup fm = members[fi];
-                if (fm.hasLiveTip && fm.flameStrength > fStr) { fStr = fm.flameStrength; fPos = fm.flamePos; fRange = fm.flameRange; fCol = fm.flameCol; }
+                if (fm.hasLiveTip && fm.flameStrength > fStr) { fStr = fm.flameStrength; fPos = fm.flamePos; fRange = fm.flameRange; fCol = fm.flameCol; fEnd = fm.flameEnd; fSeg = fm.flameSegment; }
             }
+            polylinePropertyBlock.SetVector("_FlameEnd", new Vector4(fEnd.x, fEnd.y, fEnd.z, fSeg ? 1f : 0f));
             polylinePropertyBlock.SetVector("_FlameLight", new Vector4(fPos.x, fPos.y, fPos.z, fStr * SmokeTuning.FlameLightStrength));
             polylinePropertyBlock.SetVector("_FlameColor", new Vector4(fCol.r * SmokeTuning.FlameColorR / 1.0f, fCol.g * SmokeTuning.FlameColorG / 0.52f, fCol.b * SmokeTuning.FlameColorB / 0.16f, fRange));
             polylinePropertyBlock.SetFloat("_DepthBiasDistance", ActiveDepthBiasDistance);
             polylinePropertyBlock.SetFloat("_DepthBiasFraction", ActiveDepthBiasFraction);
             SmokeTuning.Apply(polylinePropertyBlock);
+            ScattererSun.ApplyAt(polylinePropertyBlock, boxCenter);
             polylinePropertyBlock.SetFloat("_FireEmission", SmokeTuning.DeflectorFire * 2.4f);
             // After Apply, so it overrides the shared value. Thinning is per-VOLUME (it
             // follows the vessel's ambient pressure), which SmokeTuning cannot express.
@@ -3134,6 +4012,11 @@ namespace RaymarchedPlumeTrails
                 float targetStepSize = Mathf.Max(avgRadius / TargetStepsPerAvgRadius, 0.5f);
                 int sizeAdaptiveSteps = Mathf.CeilToInt(boxDiagonal / targetStepSize);
                 marchSteps = Mathf.Min(Mathf.Max(marchSteps, sizeAdaptiveSteps), nearMarch * 2);
+                // CLOSE = EXPENSIVE: with the camera in or at the smoke the volume fills the screen, and the cost is (pixels x steps x light steps).
+                // The steps are cut by up to 45% as the camera gets close (full count at 120 m from the surface, 55% inside); the dither of the
+                // march offset and the temporal accumulation hide the coarser sampling, which is what made the fps fall to 2 close to the smoke.
+                float closeness = cameraInside ? 1f : Mathf.Clamp01(1f - distToSurface / 120f);
+                marchSteps = Mathf.Max(16, Mathf.RoundToInt(marchSteps * Mathf.Lerp(1f, 0.55f, closeness)));
             }
 
             // Detail LOD. Noise frequency is fixed in world space, so as the volume
