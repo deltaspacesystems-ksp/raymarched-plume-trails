@@ -18,7 +18,7 @@ Download the zip and extract it. Open your KSP install folder. Copy the GameData
 # Discord Server
 https://discord.gg/mrWnhRyV3u
 
-
+ai assisted, learning c# on it and i made it for fun!
 <details>
 <summary>Images, Click here to expand</summary>
 <img width="1419" height="1015" alt="Screenshot 2026-09-25 201218" src="https://github.com/user-attachments/assets/37501225-4683-42ff-b289-c9957ddebda1" />
