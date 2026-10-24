@@ -12,6 +12,5 @@
         { "name": "ModuleManager" },
         { "name": "Waterfall" },
         { "name": "Avalanche" },
-        { "name": "SmokeScreen" }
     ]
 }
