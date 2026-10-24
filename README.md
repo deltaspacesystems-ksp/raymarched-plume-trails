@@ -4,7 +4,7 @@
 
 Volumetric exhaust plume smoke for rockets, uses Henyey-Greenstein phase scattering for realistic shadowed look, it's fully raymarched too
 # Features 
- - Smoke expansion based on the height, velocity and pressure of the rocket
+ - Smoke expansion based on the height, velocity and pressure of the rocket(future, not in v1 rc yet)
  - Simple SRB "configs" with a simple fade out when the engine shuts off (more fuel types coming soon)
  - It's raymarched(not particles!)
  - In game config editor
