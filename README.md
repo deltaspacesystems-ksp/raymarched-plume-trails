@@ -9,7 +9,7 @@ Volumetric exhaust plume smoke for rockets, uses Henyey-Greenstein phase scatter
  - It's raymarched(not particles!)
  - In game config editor
  - Quality selector in the mods ui with auto adjusting
- - Optional temporal upscaling on lower quality presets (experimental(very!))
+ - Optional temporal upscaling on lower quality presets (mot experimental anymore!!1!)
  - Right now it works best with Avalanche plumes(peak plume mod btw)
 # Windows only(linux and mac shaders coming soon)
 # Installation
