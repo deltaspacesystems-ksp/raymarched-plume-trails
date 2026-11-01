@@ -21,8 +21,7 @@ https://discord.gg/mrWnhRyV3u
 ai assisted, learning c# on it and i made it for fun!
 <details>
 <summary>Images, Click here to expand</summary>
-<img width="1419" height="1015" alt="Screenshot 2026-09-25 201218" src="https://github.com/user-attachments/assets/37501225-4683-42ff-b289-c9957ddebda1" />
-<img width="2092" height="1180" alt="Screenshot 2026-09-25 200859" src="https://github.com/user-attachments/assets/5d9295d9-7f16-4b63-9961-cb8c99771e50" />
+
 
 </details>
 
