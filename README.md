@@ -1,4 +1,4 @@
-# Volumetric Plume Trails mod for KSP!
+# Raymarched Plume Trails mod for KSP!
 [![SpaceDock](https://img.shields.io/badge/SpaceDock-download-2f6f9f)](https://spacedock.info/mod/4618)
 [![KSP 1.12.5](https://img.shields.io/badge/KSP-1.12.5-2f6f9f)](https://www.kerbalspaceprogram.com/)
 
