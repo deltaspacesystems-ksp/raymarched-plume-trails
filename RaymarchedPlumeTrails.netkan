@@ -6,7 +6,7 @@
     "resources": {
         "homepage": "https://github.com/deltaspacesystems-ksp/raymarched-plume-trails",
         "repository": "https://github.com/deltaspacesystems-ksp/raymarched-plume-trails",
-        "x_screenshot": "https://raw.githubusercontent.com/deltaspacesystems-ksp/raymarched-plume-trails/main/README_screenshot.png"
+        "x_screenshot": "https://raw.githubusercontent.com/deltaspacesystems-ksp/raymarched-plume-trails/main/Icons/banner_1280x640.png"
     },
     "recommends": [
         { "name": "ModuleManager" },
