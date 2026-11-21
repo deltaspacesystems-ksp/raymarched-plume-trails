@@ -53,7 +53,7 @@ Shader "RaymarchedPlumeTrails/SmokeComposite"
                 float2 texel = _MainTex_TexelSize.xy;
 
                 // depth this full-res pixel actually belongs to
-                float targetDepth = LinearEyeDepth(SAMPLE_DEPTH_TEXTURE(_CameraDepthTexture, i.uv));
+                float targetDepth = min(LinearEyeDepth(SAMPLE_DEPTH_TEXTURE(_CameraDepthTexture, i.uv)), 15000.0);
 
                 // the four half-res texels around it, and the scene depth each of them
                 // was rendered against
@@ -67,7 +67,7 @@ Shader "RaymarchedPlumeTrails/SmokeComposite"
                 int best = 0;
                 for (int s = 0; s < 4; s++)
                 {
-                    float d = LinearEyeDepth(SAMPLE_DEPTH_TEXTURE(_CameraDepthTexture, uvs[s]));
+                    float d = min(LinearEyeDepth(SAMPLE_DEPTH_TEXTURE(_CameraDepthTexture, uvs[s])), 15000.0);
                     float diff = abs(d - targetDepth);
                     if (diff < bestDiff) { bestDiff = diff; best = s; }
                 }
@@ -138,7 +138,7 @@ Shader "RaymarchedPlumeTrails/SmokeComposite"
             float4 CurrentSample(float2 uv)
             {
                 float2 texel = _MainTex_TexelSize.xy;
-                float targetDepth = LinearEyeDepth(SAMPLE_DEPTH_TEXTURE(_CameraDepthTexture, uv));
+                float targetDepth = min(LinearEyeDepth(SAMPLE_DEPTH_TEXTURE(_CameraDepthTexture, uv)), 15000.0);
 
                 float2 uvs[4];
                 uvs[0] = uv + float2(-0.5, -0.5) * texel;
@@ -150,7 +150,7 @@ Shader "RaymarchedPlumeTrails/SmokeComposite"
                 int best = 0;
                 for (int s = 0; s < 4; s++)
                 {
-                    float d = LinearEyeDepth(SAMPLE_DEPTH_TEXTURE(_CameraDepthTexture, uvs[s]));
+                    float d = min(LinearEyeDepth(SAMPLE_DEPTH_TEXTURE(_CameraDepthTexture, uvs[s])), 15000.0);
                     float diff = abs(d - targetDepth);
                     if (diff < bestDiff) { bestDiff = diff; best = s; }
                 }

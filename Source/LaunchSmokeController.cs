@@ -3,208 +3,42 @@ using UnityEngine;
 
 namespace RaymarchedPlumeTrails
 {
-    // launch smoke as one raymarched volume per engine cluster
+    // The emitter of the volumetric trail. One tracked group per engine cluster; every physics tick each running group says where its smoke starts, how wide and
+    // how dense it is, and the trail (CapsuleTrail) lays the nodes. Also reports the heat haze and the scene light of the flame.
+    // (The pre-1.0 puff renderer that used to live here is in old/legacy_renderer.)
     public class LaunchSmokeController : VesselModule
     {
         public float clusterDistanceThreshold = 3.5f;
-
-        // moved to SmokeTuning.SpawnOffset so it can be tuned in flight
-        // Was 15km, which is below where the plume gets interesting - the bloom lives
-        // between roughly 40km and the edge of the atmosphere.
         public float spawnMaxAltitude = 120000f;
         public float minThrottle = 0.15f;
-        // Target spacing in time; gaps between frames are filled by interpolation.
-        // Closest a new puff may sit to the last one, as a fraction of its radius. Below
-        // this it lies entirely inside its predecessor and adds nothing but overlap.
-        private static float MinSpawnSpacingFraction { get { return 0.35f * SmokeTuning.SpawnSpacingScale; } }
-        // hard cap so a lag spike or a very fast vessel cannot emit hundreds in one frame
-        public int maxPuffsPerFrame = 12;
-        // how far back in time a gap may reach before it stops being treated as continuous
-        private const float MaxBridgeSeconds = 0.5f;
-
-        // Real launch smoke hangs around for minutes. Decimation thins old puffs as they
-        // grow, so a long life costs much less than linearly.
-        public float lifeTime = 150f;
-        public int maxPuffsPerGroup = 8000;
-
-        // Wider than the old 1.8 - a Shuttle-style SRB plume is already a proper billow
-        // within the first metre off the nozzle, not a thin needle that thickens later.
-        // KSA-style (30 IX): the smoke leaves the nozzle NARROW (about the nozzle's own width) and
-        // widens slowly into a teardrop, instead of starting as a blunt billow behind the rocket.
-        // Box volume scales cubically with radius, so this is a big lever on shader cost.
-        // moved to SmokeTuning.MaxPuffSize so it can be tuned in flight
-        // 1-(1-t)^n. The exponent is the growth rate at t=0, so above 1 grows fast right
-        // after spawn (closing gaps) then eases off. Too high and puffs reach full size in
-        // half their life, which reads as a fixed-width column rather than billowing.
-        // Time to reach maxSize, independent of lifeTime.
-        // Raised back up from 5 (27 IX): both screenshots this session showed the same
-        // symptom at two different points on the trail - a sudden swell right below the
-        // vehicle AND a sudden knee further down - and it is the same cause both times.
-        // r^2 = r0^2 + K*t^2/(t+t0) is smooth but STEEP: at SmokeTuning.GrowthTime=5 it was already
-        // at 60% of max width by 2 seconds of age, which at any real ascent speed is a
-        // short stretch of trail, so the "fast growth, then barely widening" shape reads
-        // as an abrupt jump rather than a taper. Stretched to 14s so the same curve
-        // spreads over roughly 3x the distance instead of changing its shape.
-
-        // Sideways kick near the pad, random per puff - exhaust hitting the ground and
-        // spreading out. Deliberately not axial: pushing the whole chain one way stretches
-        // it open, since puffs of different ages decay at different rates.
-        public float groundImpingementSpeed = 16f;
-
-        // --- ground cloud, emitted where the exhaust hits the pad ---
-        // Shares the trail's volume rather than having its own renderer: ground puffs go
-        // first in the spine array, spatially sorted, with a zero-radius separator before
-        // the trail. One draw, one density field, no compositing seam.
-        //
-        // OFF for now - it flickers worse than anything else, being the biggest, slowest
-        // thing on screen and sitting right where new puffs keep appearing. A hold, not a
-        // decision; leaving it on made judging everything else harder.
-        public bool groundCloudEnabled = false;
-        // how far down the thrust axis to look for the deflector/deck
-        public float groundCloudMaxReach = 120f;
-        // Outward speed along the pad axis - near exhaust speed, not a gentle push.
-        // GroundVelocityConvergeRate brakes it hard, so reach is roughly speed/rate.
-        public float groundCloudOutwardSpeed = 230f;
-        // Kept low: the 200-point spine is shared with the trail, so a big cloud has to
-        // come from puff SIZE, not from thousands of small puffs crowding the trail out.
-        public int groundCloudPuffsPerTick = 5;
-        public float groundCloudSizeScale = 3.2f;
-        public float groundImpingementRange = 80f;
-
-        // Real exhaust jets DOWN the thrust axis and only spreads after hitting the pad.
-        // Without this nothing ever had downward velocity, so the bounce code never ran.
-        // Scoped to the same altitude ramp as the impingement kick.
-        public float exhaustDownwardSpeed = 38f;
-
-
-        public float buoyancySpeed = 2.2f;
-        public Vector3 windDrift = new Vector3(1f, 0f, 0f);
-
-        // These no longer delete the smoke, they thin it - see AlphaForAltitude.
-        public float fadeStartAltitude = 45000f;
-        public float fadeEndAltitude = 90000f;
-
-        private float debugLogTimer;
 
         private class TrackedGroup
         {
             public int id;
             public HashSet<uint> partIds;
-            public Vector3 centroid;
-            public SmokeVolumeGroup smokeMesh;
-            public float spawnTimer;
             public float smoothFactor;      // nozzle-size factor, smoothed
             public float smoothFlame;       // flame length reported by Waterfall, smoothed (m)
             public float smoothFlameW;      // flame width reported by Waterfall, smoothed (m)
             public float lastLoggedFactor;
-            // Bumped whenever emission resumes after a pause, so the renderer can break
-            // the capsule chain between bursts without guessing from geometry.
-            public int burnId;
-            public float lastSpawnTime;
-            public Vector3? lastSpawnPos;
             public Vector3? smoothedForward;
-            // The jet's offset from the nozzle, low-passed. Reset whenever emission stops so
-            // the next burn starts from where the jet actually is, not from a stale vector.
+            // The jet's offset from the nozzle, low-passed; reset when emission stops so the next burn starts from where the jet is, not from a stale vector.
             public Vector3? smoothedJetOffset;
-
-            // --- post-burnout tail: see TailTick ---
-            // The nozzle point at the last tick a real engine sample existed, in VESSEL
-            // space, so it keeps tracking the airframe as it coasts after flameout instead
-            // of being left behind at a world-space point.
-            public Vector3? tailLocalPos;
-            public float tailLastDensity;
-            public float tailLastSizeMul;
-            public float tailTimer;
         }
 
-        // spawn trigger: distance since last puff, timer as a fallback
-        private static float MaxSpawnSpacingFraction { get { return 0.5f * SmokeTuning.SpawnSpacingScale; } }
-        private const float MinSpawnSpacing = 1.0f;
-
-        // Thrust transforms carry SAS's constant gimbal corrections. spawnPos sits 15m
-        // along that vector, so a tiny angle becomes a metre of lateral swing - and it is
-        // coherent across frames, so the spine's smoothing does not touch it. Damping the
-        // direction itself filters the wobble while still tracking a gravity turn.
+        // Thrust transforms carry SAS's constant gimbal corrections. The spawn point sits metres along that vector, so a tiny angle becomes a metre of lateral swing:
+        // damping the direction filters the wobble while still tracking a gravity turn.
         private const float SpawnForwardSmoothRate = 1.2f;
-
-        // Speed window over which the spawn offset hands over from the thrust axis to the
-        // surface-velocity direction - see the lasso note at the spawn site.
-        private const float LassoVelocityMinSpeed = 15f;
-        private const float LassoVelocityFullSpeed = 60f;
-
-        // --- retropropulsion detection ---
-        // How closely the exhaust has to point along the flight path to count as a retro
-        // burn. Ascending, the exhaust points BACKWARD, so this dot is near -1; firing
-        // retrograde it is near +1. The two cases are as far apart as the measure allows,
-        // which is why one dot product is enough to tell them apart.
-        private const float RetroDotThreshold = 0.25f;
-        // The umbrella is aerodynamic, so it is driven by dynamic pressure rather than by
-        // speed alone - no air, no canopy, however fast the vessel is going.
-        private const float RetroMinPressure = 1500f;    // Pa
-        private const float RetroFullPressure = 25000f;
 
         private readonly List<TrackedGroup> trackedGroups = new List<TrackedGroup>();
         private int nextGroupId;
         private int lastPartCount = -1;
-        // Tracks the landing-cloud state across ticks so a transition (not just a part
-        // count change) can trigger RecomputeGroups - a liquid engine's TrackedGroup would
-        // otherwise not exist yet the moment landing starts, since structural grouping is
-        // normally keyed off part count alone.
-        private bool wasLanding;
+        private bool hiddenWhenOff;
+        private float debugLogTimer;
+        // a line in the log every few seconds while engines fire, so a report from a player says what the emitter did (not only that the shader ran)
+        private float emitLogTimer;
+        private int trailsPushed, trailsSkippedByType, groupsEmitting;
 
-        // Descending, low, throttled up - independent of engine type or SrbOnly. See
-        // SmokeTuning's landing-cloud block for why this exists as a bypass rather than
-        // touching the ascent trail's own SRB-only scoping.
-        //
-        // Hysteresis against wasLanding (28 IX fix). A flat threshold flickered hard right
-        // at liftoff: low altitude and a vertical speed sitting near zero (or briefly
-        // negative from settling/clamp release) crossed the boundary every physics tick,
-        // and each crossing calls RecomputeGroups - which tears down and rebuilds the
-        // engine group structure, visible as the trail cycling through several broken
-        // intermediate looks in a loop. Entering landing needs the configured thresholds;
-        // staying in it only needs roughly a third of the margin, so noise near the
-        // boundary cannot flip the state every frame.
-        // Distance along a ray to the first scenery / terrain surface that is not a part of any vessel; -1 if none.
-        private static readonly RaycastHit[] surfHits = new RaycastHit[24];
-        private static float SurfaceAlong(Vector3 origin, Vector3 dir, float maxDist)
-        {
-            // surface mode: the pre-rendered height map (the trench floor, the deflector; the colliders only see a lid over them)
-            if (PadFluid.SurfaceReady)
-            {
-                float md; Vector3 mn;
-                if (PadFluid.SurfaceAlong(origin, dir, maxDist, out md, out mn) && md > 0.5f)
-                {
-                    SmokeVolumeGroup.NotePadSurface(origin + dir * md);
-                    return md;
-                }
-            }
-            int n = Physics.RaycastNonAlloc(origin, dir, surfHits, maxDist, SmokeVolumeGroup.GetSceneryCollisionMaskPublic(), QueryTriggerInteraction.Ignore);
-            float best = -1f; int bi = -1;
-            for (int i = 0; i < n; i++)
-            {
-                Collider c = surfHits[i].collider;
-                if (c == null || c.GetComponentInParent<Part>() != null) continue;
-                float d = surfHits[i].distance;
-                if (d > 0.5f && (best < 0f || d < best)) { best = d; bi = i; }
-            }
-            // Remember where the real surface is (scenery meshes such as a Mirage pad plateau sit above the analytic terrain
-            // height the puff physics uses for its ground) so puffs near it test the scene instead of passing through it.
-            if (bi >= 0) SmokeVolumeGroup.NotePadSurface(surfHits[bi].point);
-            return best;
-        }
-
-        private static bool IsLanding(Vessel v, bool wasLanding)
-        {
-            if (!SmokeTuning.LandingCloudEnabled) return false;
-            float altitudeLimit = wasLanding
-                ? SmokeTuning.LandingCloudAltitude * 1.5f
-                : SmokeTuning.LandingCloudAltitude;
-            if (v.altitude > altitudeLimit) return false;
-            float speedLimit = wasLanding
-                ? SmokeTuning.LandingCloudVerticalSpeed * 0.35f
-                : SmokeTuning.LandingCloudVerticalSpeed;
-            return v.verticalSpeed < speedLimit;
-        }
+        private int EmitterKey(TrackedGroup g) { return g.id + 1000 * vessel.GetInstanceID(); }
 
         private float SizeMultiplierForSpeed(float speed)
         {
@@ -214,42 +48,8 @@ namespace RaymarchedPlumeTrails
             return Mathf.Lerp(1f, SmokeTuning.ThinTrailSizeMult, t);
         }
 
-        // Physically grounded, replacing the old hand-tuned log-ramp-then-power-law.
-        //
-        // An underexpanded jet's characteristic plume radius scales with the SQUARE ROOT
-        // of the pressure ratio between the exhaust and the surrounding air - the same
-        // relation used for the Mach-disk distance of a free supersonic jet (Ashkenas &
-        // Sherman, 1966; it is why a fixed-geometry bell nozzle only reaches its design
-        // efficiency at one altitude and visibly over/under-expands everywhere else). The
-        // exit condition is fixed by the motor, so only the ambient pressure changes as
-        // the vehicle climbs - the whole altitude-driven widening reduces to one real
-        // number: how much thinner the air has gotten since the pad, square-rooted.
-        //
-        // GetPressure(0.0) is the body's OWN sea-level pressure, not a hardcoded Earth
-        // value - this is what makes the curve correct on any real-scale body without a
-        // planet-specific constant.
-        //
-        // JellyfishSizeBoost is now a pure ARTISTIC dial on the excess over 1x, not a
-        // target the curve is stretched to reach: 1 reproduces the physical relation
-        // exactly, higher exaggerates it if the honest version still reads too subtle
-        // next to a reference photo.
-        private static float PlumeBloomWidth(Vessel v)
-        {
-            if (!SmokeTuning.JellyfishEnabled) return 1f;
-            if (v.mainBody == null || !v.mainBody.atmosphere) return 1f;
-            float pSeaLevel = (float)v.mainBody.GetPressure(0.0);
-            if (pSeaLevel <= 0.0001f) return 1f;
-            float pAmbient = Mathf.Max((float)v.staticPressurekPa, SmokeTuning.PlumeBloomPressureFloor);
-            float physical = Mathf.Sqrt(pSeaLevel / pAmbient);
-            return 1f + (physical - 1f) * Mathf.Max(SmokeTuning.JellyfishSizeBoost, 0f);
-        }
-
-        // How much smoke a motor puts out for the thrust it is actually delivering.
-        //
-        // Shape taken from Avalanche's SolidSmoke emission curve (power: 1 -> 1,
-        // 0.01 -> 0.2, 0 -> 0) so the two agree on where a motor goes quiet. The step up
-        // to 0.2 at the bottom is deliberate: a motor still coughing out its last few
-        // percent of thrust is still visibly smoking.
+        // How much smoke a motor puts out for the thrust it is delivering. Shape from Avalanche's SolidSmoke emission curve (power: 1 -> 1, 0.01 -> 0.2, 0 -> 0): a
+        // motor still coughing out its last few percent of thrust is still visibly smoking.
         private static float EmissionForThrust(float thrustFraction)
         {
             if (thrustFraction <= 0f) return 0f;
@@ -257,10 +57,6 @@ namespace RaymarchedPlumeTrails
             return Mathf.Lerp(0.2f, 1f, (thrustFraction - 0.01f) / 0.99f);
         }
 
-        // And for the air it is emitted into, relative to sea level. Again Avalanche's
-        // curve (density: 1 -> 2.5, 0.05 -> 2, 0 -> 0, normalised): nearly flat through
-        // the lower atmosphere, then falling to nothing in vacuum, where there is no air
-        // left to hold the particles in a visible column.
         // Air density at the vessel as a fraction of the body's sea level, 0..1.
         private static float RelativeAirDensity(Vessel v)
         {
@@ -270,30 +66,21 @@ namespace RaymarchedPlumeTrails
             return Mathf.Clamp01((float)(v.atmDensity / asl));
         }
 
-        // Where a solid motor's exhaust comes to rest in the air, measured from the nozzle.
-        //
-        // This is the whole of the SRB emission model, and it replaces every hand-tuned
-        // offset and velocity term the old path carried.
-        //
-        // Exhaust leaves the nozzle at ve = Isp * g0 relative to the ROCKET. Relative to
-        // the AIR it therefore moves at u = vRocket + ve * exhaustDir, and it travels along
-        // u until drag stops it. That single vector does what the lasso fix, the retro
-        // detector and the offset smoothing were each approximating:
-        //
-        //  - At liftoff vRocket is ~0, so u is the full jet pointing out of the nozzle and
-        //    the smoke is thrown well clear of it - down onto the pad.
-        //  - Climbing, u = (ve - v) backwards along the path. As the rocket accelerates
-        //    toward ve the jet slows in the air frame and the smoke is laid down closer
-        //    and closer to the nozzle, until it is left hanging where the nozzle WAS.
-        //    That is why a real trail traces the flight path instead of the rocket's
-        //    attitude: turning the vehicle barely moves u once v is a sizeable part of ve.
-        //
-        // The stop distance scales with |u| (a slower jet travels less far) and grows as
-        // the air thins (less to stop it with), which is the plume flaring at altitude.
+        // Avalanche's density curve (1 -> 2.5, 0.05 -> 2, 0 -> 0, normalised): nearly flat through the lower atmosphere, then falling to nothing in vacuum.
+        private static float EmissionForAtmosphere(Vessel v)
+        {
+            if (v.mainBody == null || !v.mainBody.atmosphere) return 0f;
+            float rel = RelativeAirDensity(v);
+            if (rel < 0.05f) return Mathf.Lerp(0f, 0.8f, rel / 0.05f);
+            return Mathf.Lerp(0.8f, 1f, (rel - 0.05f) / 0.95f);
+        }
+
+        // Where a solid motor's exhaust comes to rest in the air, measured from the nozzle. Exhaust leaves the nozzle at ve = Isp * g0 relative to the ROCKET; relative to
+        // the AIR it moves at u = vRocket + ve * exhaustDir and travels along u until drag stops it. At liftoff vRocket is ~0, so the smoke is thrown well clear of the
+        // nozzle; climbing, the jet slows in the air frame and the smoke is laid closer and closer to the nozzle, until it is left hanging where the nozzle WAS. That is
+        // why a real trail traces the flight path instead of the rocket's attitude. The stop distance scales with |u| and grows as the air thins (the plume flaring).
         private const float MinJetLength = 3f;
         private const float MaxThinAirStretch = 8f;
-
-        private Vector3 lastVesselPos; private bool haveVesselPos;
 
         private static void SolidJet(Vessel v, List<EngineSample> samples, Vector3 exhaustDir,
                                      out Vector3 jetDir, out float jetLength, out float airSpeed)
@@ -301,63 +88,41 @@ namespace RaymarchedPlumeTrails
             float ispSum = 0f;
             for (int i = 0; i < samples.Count; i++) ispSum += samples[i].isp;
             float isp = samples.Count > 0 ? ispSum / samples.Count : 0f;
-            // An SRB in KSP sits around 250-270s; if a part reports nothing usable, assume
-            // a typical one rather than collapsing the jet to zero.
+            // An SRB in KSP sits around 250-270 s; if a part reports nothing usable, assume a typical one rather than collapsing the jet to zero.
             float ve = isp > 1f ? isp * 9.80665f : 2500f;
 
             Vector3 vel = v.srf_velocity;
             float speed = vel.magnitude;
 
-            // How far the jet carries before the air stops it depends on how fast it is
-            // moving through the AIR, which is the exhaust velocity plus the rocket's own.
             Vector3 u = vel + exhaustDir * ve;
             airSpeed = u.magnitude;
 
-            // DIRECTION is a different question, and the one that matters in a turn.
-            //
-            // In the rocket's frame the exhaust leaves straight down the nozzle axis and
-            // the relative wind then bends it round to run along the wind, which blows
-            // against the velocity. How much of that bending happens near the nozzle is set
-            // by how much of the wind CROSSES the axis: flying straight, the wind runs down
-            // the axis and nothing bends; in a hard turn the nozzle is pointing well off the
-            // flight path and the smoke is swept sideways almost immediately.
-            //
-            // The first version of this scaled the rocket's lateral velocity into the exit
-            // velocity. That pushed the smoke AWAY from the flight path - the exhaust is
-            // faster than the rocket, so the sum stays close to the axis and the small
-            // lateral term only tilts it the wrong way. Bending toward the wind is the
-            // physically right sign, and it is the one that makes the plume leave through
-            // the flame and then go sideways.
+            // DIRECTION: in the rocket's frame the exhaust leaves straight down the nozzle axis and the relative wind then bends it round to run along the wind. How
+            // much of that happens near the nozzle is set by how much of the wind CROSSES the axis: flying straight nothing bends, in a hard turn the smoke is swept
+            // sideways almost immediately. Bending toward the wind is the physically right sign.
             Vector3 windDir = speed > 1f ? -vel / speed : exhaustDir;
             Vector3 cross = vel - exhaustDir * Vector3.Dot(vel, exhaustDir);
             float crossSpeed = cross.magnitude;
-            // Saturating in crossSpeed: a fraction of the way from the axis to the wind.
             float bend = Mathf.Clamp01(SmokeTuning.SrbCrossflowBend * crossSpeed / (crossSpeed + 0.25f * ve));
-            // Slerp is undefined for opposite vectors. That only happens flying tail-first,
-            // where there is no crossflow to speak of anyway.
-            jetDir = Vector3.Dot(exhaustDir, windDir) > -0.9f
-                ? Vector3.Slerp(exhaustDir, windDir, bend)
-                : exhaustDir;
+            // Slerp is undefined for opposite vectors; that only happens flying tail-first, where there is no crossflow anyway.
+            jetDir = Vector3.Dot(exhaustDir, windDir) > -0.9f ? Vector3.Slerp(exhaustDir, windDir, bend) : exhaustDir;
 
             float speedFraction = Mathf.Clamp01(airSpeed / ve);
             float rel = RelativeAirDensity(v);
             float thinAir = rel > 1e-4f ? Mathf.Clamp(1f / Mathf.Sqrt(rel), 1f, MaxThinAirStretch) : MaxThinAirStretch;
             jetLength = Mathf.Max(SmokeTuning.SpawnOffset * speedFraction * thinAir, MinJetLength);
 
-            // THE BENT PLUME, from the motion of the gas. In the frame of the air the gas leaves at u0 = v + ve * e and flies straight on in that direction,
-            // slowing down as it takes in air (a jet's momentum is kept while its radius grows, u ~ r0 / (r0 + 0.1 s)); the time it needs for a path s is
-            //     tau(s) = integral of ds / u = (s + 0.05 s^2 / r0) / u0
-            // and the rocket has moved on by v * tau in that time. In the frame of the rocket the gas is therefore at
-            //     X(s) = u0_hat * s - v * tau(s)
-            // along the axis first (the gas is fast), then turning over towards the wake (the rocket goes on, the gas stays): a turning rocket leaves a plume
-            // that curls into its own track. The chord of this curve, as long as the jet is, sets the direction of the smoke's start.
+            // THE BENT PLUME, from the motion of the gas. In the frame of the air the gas leaves at u0 = v + ve * e and flies straight on in that direction, slowing down
+            // as it takes in air (u ~ r0 / (r0 + 0.1 s)); the time it needs for a path s is tau(s) = (s + 0.05 s^2 / r0) / u0 and the rocket has moved on by v * tau. In the
+            // frame of the rocket the gas is at X(s) = u0_hat * s - v * tau(s): along the axis first, then turning over towards the wake. The chord of this curve, as long
+            // as the jet is, sets the direction of the smoke's start.
             if (SmokeTuning.PhysicalJetBend && speed > 3f && airSpeed > 10f)
             {
                 float sumD2 = 0f;
                 for (int i = 0; i < samples.Count; i++) { float rd = 0.5f * Mathf.Max(samples[i].nozzleDiameter, 0.3f); sumD2 += rd * rd; }
                 float r0 = Mathf.Clamp(Mathf.Sqrt(sumD2), 0.6f, 8f);
                 Vector3 uHat = u / airSpeed;
-                float k = Mathf.Max(SmokeTuning.SrbCrossflowBend, 0f) * 0.5f;       // the old slider: 2 = the physical curve, less = a straighter plume
+                float k = Mathf.Max(SmokeTuning.SrbCrossflowBend, 0f) * 0.5f;       // 2 = the physical curve, less = a straighter plume
                 float lo = 0f, hi = Mathf.Min(jetLength * 40f, 4000f);
                 Vector3 xe = uHat * hi - vel * k * (hi + 0.05f * hi * hi / r0) / airSpeed;
                 if (xe.magnitude > jetLength)
@@ -374,10 +139,9 @@ namespace RaymarchedPlumeTrails
             }
         }
 
-        // THE SHAPE OF THE JET from the nozzle to the emission point, for the root of the new trail: it leaves the nozzle along the exhaust axis and arrives at the
-        // emission point already running along the trail (against the flight path: the gas has stopped in the air and the rocket flies on). A cubic Hermite curve
-        // with these two tangents: flying straight it is a straight line, in a hard turn the exhaust leaves sideways and curls round into the track of the rocket
-        // (the physical bend of SolidJet put the emission point on the chord of this curl; the curve between was missing, the smoke started with a kink).
+        // THE SHAPE OF THE JET from the nozzle to the emission point, for the root of the trail: it leaves the nozzle along the exhaust axis and arrives at the emission
+        // point already running along the trail (against the flight path). A cubic Hermite curve with these two tangents: flying straight it is a straight line, in a hard
+        // turn the exhaust leaves sideways and curls round into the track of the rocket.
         private static void JetCurve(Vessel v, Vector3 exhaustDir, Vector3 nozzle, Vector3 emission, int n, List<Vector3> pts)
         {
             pts.Clear();
@@ -394,939 +158,317 @@ namespace RaymarchedPlumeTrails
         }
         private readonly List<Vector3> jetPts = new List<Vector3>();
 
-        private static float EmissionForAtmosphere(Vessel v)
+        // The radius the smoke is released with: the jet entrains air on its way to the release point (Ricou & Spalding), which dilutes and cools it; the mass of one
+        // slice of it at the resulting density gives the radius. The equivalent nozzle exit comes from mass continuity (mdot = rho_e pi d^2 / 4 ve), so it follows the
+        // thrust and Isp KSP reports, whatever size the part model has. The atmosphere depends only on altitude: cached on a 4 m grid, flushed twice a second.
+        private readonly Dictionary<int, Vector2> ambCache = new Dictionary<int, Vector2>();
+        private float ambCacheFlush;
+
+        private float PhysicalJetRadius(Vector3 releasePos, float ve, float xs, float mdot0, float lookScale)
         {
-            if (v.mainBody == null || !v.mainBody.atmosphere) return 0f;
-            float rel = RelativeAirDensity(v);
-            if (rel < 0.05f) return Mathf.Lerp(0f, 0.8f, rel / 0.05f);
-            return Mathf.Lerp(0.8f, 1f, (rel - 0.05f) / 0.95f);
-        }
-
-        private static bool HasEngine(Vessel v)
-        {
-            return EngineClusterUtils.HasEngine(v);
-        }
-
-        // A few seconds of thinning, decaying smoke after a solid motor goes quiet,
-        // before the trail is frozen and left to drift - see StopEmission.
-        //
-        // A real SRB does not stop smoking the instant thrust reads zero: the nozzle and
-        // the last unburnt grain keep shedding a little exhaust as they cool, tapering off
-        // over a few seconds rather than cutting off in one frame. Without this the trail
-        // ended abruptly right where the last puff under real thrust had been laid, which
-        // reads as the smoke being switched off rather than the motor running out.
-        //
-        // Puffs are placed at the CACHED nozzle position (see where tailLocalPos is set),
-        // carried in the vessel's own frame so it keeps riding along as the stage coasts,
-        // with no jet velocity of its own - by now there is nothing left to eject it.
-        private void SrbTail(TrackedGroup g)
-        {
-            if (!SmokeTuning.SrbOnly || SmokeTuning.SrbTailTime <= 0.01f || !g.tailLocalPos.HasValue)
+            CelestialBody body = vessel.mainBody;
+            if (body == null) return 0f;
+            if (Time.time - ambCacheFlush > 0.5f) { ambCache.Clear(); ambCacheFlush = Time.time; }
+            double alt = body.GetAltitude(releasePos);
+            int key = (int)System.Math.Floor(alt * 0.25);
+            Vector2 pt;
+            if (!ambCache.TryGetValue(key, out pt))
             {
-                StopEmission(g);
-                return;
+                double aq = key * 4.0 + 2.0;
+                double pKpa = body.atmosphere ? body.GetPressure(aq) : 0.0;
+                double tK = body.atmosphere ? body.GetTemperature(aq) : 3.0;
+                pt = new Vector2(Mathf.Max((float)(pKpa * 1000.0), 0.5f), Mathf.Max((float)tK, 3f));
+                ambCache[key] = pt;
             }
-
-            // First silent tick: arm the taper instead of spending it immediately, so a
-            // single dropped frame of engine samples (there have been none observed, but
-            // nothing guarantees KSP never produces one) does not truncate the tail.
-            if (g.tailTimer <= 0f)
-            {
-                g.tailTimer = SmokeTuning.SrbTailTime;
-
-                // Freeze the live tip and its root NOW, not when the tail finishes.
-                //
-                // Both are still sitting at whatever position they last had under real
-                // thrust. Leaving them live until the tail's StopEmission would commit them
-                // AFTER every tail puff instead of before - CommitLiveTip stamps whatever it
-                // freezes with the newest spawnIndex, so the chain would jump from the
-                // tail's newest puff back to this stale point and then out along the old
-                // root, a visible kink at the exact moment the motor died. Committing it
-                // here puts it in its correct place in time: right before the tail begins.
-                g.smokeMesh.CommitLiveTip();
-            }
-
-            g.tailTimer -= TimeWarp.fixedDeltaTime;
-            if (g.tailTimer <= 0f)
-            {
-                g.tailLocalPos = null;
-                StopEmission(g);
-                return;
-            }
-
-            g.spawnTimer -= TimeWarp.fixedDeltaTime;
-            if (g.spawnTimer > 0f) return;
-            g.spawnTimer = SmokeTuning.SpawnInterval;
-
-            // Smoothstep, not linear: a linear taper still ends at a visible non-zero puff
-            // on its last tick, which pops out of existence the frame after. Smoothstep
-            // eases into zero, so the very last puffs are already too faint to notice going.
-            float frac = Mathf.Clamp01(g.tailTimer / SmokeTuning.SrbTailTime);
-            float eased = frac * frac * (3f - 2f * frac);
-            float density = g.tailLastDensity * eased;
-            if (density <= 0.005f)
-            {
-                g.tailLocalPos = null;
-                StopEmission(g);
-                return;
-            }
-
-            Vector3 worldPos = vessel.transform.TransformPoint(g.tailLocalPos.Value);
-            if (g.lastSpawnTime > 0f && Time.time - g.lastSpawnTime > MaxBridgeSeconds)
-            {
-                g.burnId++;
-                g.lastSpawnPos = null;
-            }
-            g.lastSpawnTime = Time.time;
-            g.smokeMesh.AddPuff(worldPos, Vector3.zero, g.tailLastSizeMul, g.burnId, 1f, density);
-            g.lastSpawnPos = worldPos;
-        }
-
-        // Emission has stopped for this group. Freeze what the plume was doing into real
-        // puffs so it ages and spreads on its own, instead of deleting its live end - see
-        // CommitLiveTip. A no-op after the first call, so it is safe to run every tick.
-        private static void StopEmission(TrackedGroup g)
-        {
-            g.smokeMesh.CommitLiveTip();
-            g.smoothedJetOffset = null;
+            float P = pt.x, T = pt.y;
+            float rhoAir = Mathf.Max(P / (PuffPhysics.RAir * T), 1e-6f);
+            float Te = SmokeTuning.PhysExhaustTemp;
+            float rhoE = P / (PuffPhysics.RExhaust * Te);
+            float dEff = Mathf.Sqrt(4f * Mathf.Max(mdot0, 1f) / (Mathf.PI * rhoE * Mathf.Max(ve, 100f)));
+            float D0 = PuffPhysics.JetDilution(xs, dEff, rhoAir, rhoE, SmokeTuning.PhysMaxDilution);
+            float T0 = (Te + (D0 - 1f) * T) / D0;
+            float M0 = Mathf.Max(D0 * mdot0 * SmokeTuning.SpawnInterval, 1f);
+            float Me = M0 / D0;
+            float rho0 = PuffPhysics.Density(P, T0, Me, M0);
+            return PuffPhysics.RadiusFromMass(M0, rho0) * SmokeTuning.PhysRadiusScale * lookScale;
         }
 
         private void FixedUpdate()
         {
-#if EXPLOSIONS_ONLY
-            return;      // the explosions edition: no trail, no pad smoke
-#endif
             // the mod is off: the smoke is hidden once and nothing else is done (no timer, no log, no walk over the parts)
             if (!ModSettings.Enabled)
             {
-                if (!hiddenWhenOff) { foreach (TrackedGroup g in trackedGroups) g.smokeMesh.HideAll(); hiddenWhenOff = true; }
+                if (!hiddenWhenOff) { CapsuleTrail.Instance.HideWhenOff(); hiddenWhenOff = true; }
                 return;
             }
             hiddenWhenOff = false;
-            var perfSw = System.Diagnostics.Stopwatch.StartNew();
-            try
-            {
-                FixedUpdateBody();
-            }
-            finally
-            {
-                LogTickPerf(perfSw);
-            }
-        }
-
-        private bool hiddenWhenOff;
-        private float perfLogTimer;
-
-        // Wall-clock CPU cost of this vessel's whole tick, independent of the "laguje mimo
-        // ze rakieta jest 4km od dymu" report - that could be OUR cost (this) or the
-        // render side (see HalfResSmokeRenderer's own perf log). Unconditional, throttled
-        // to 1s like the other always-on diagnostics, so it is there on the very first
-        // repro instead of needing DebugLogging pre-armed and the bug reproduced twice.
-        private void LogTickPerf(System.Diagnostics.Stopwatch sw)
-        {
-            perfLogTimer -= Time.unscaledDeltaTime;
-            if (perfLogTimer > 0f) return;
-            perfLogTimer = 1f;
-            double ms = sw.Elapsed.TotalMilliseconds;
-            if (ms < 0.5 || !SmokeTuning.DebugLogging) return; // not worth a line every second while idle/cheap (and the log is for "Verbose log")
-            Debug.Log(string.Format(
-                "[PlumeTrails] tick: vessel={0} cpuMs={1:F2} groups={2} | puff ticks: ms={3:F2} steps={4} terrainQueries={5} raycasts={6}",
-                vessel != null ? vessel.vesselName : "(none)", ms, trackedGroups.Count,
-                SmokeVolumeGroup.PerfTickMs, SmokeVolumeGroup.PerfSteps, SmokeVolumeGroup.PerfPqs, SmokeVolumeGroup.PerfRays));
-            SmokeVolumeGroup.PerfTickMs = 0; SmokeVolumeGroup.PerfSteps = 0; SmokeVolumeGroup.PerfPqs = 0; SmokeVolumeGroup.PerfRays = 0;
-        }
-
-        private void FixedUpdateBody()
-        {
             if (!HighLogic.LoadedSceneIsFlight) return;
             if (vessel == null || !vessel.loaded) return;
-            // Debris is skipped only when it has no engines. A jettisoned booster becomes
-            // VesselType.Debris the moment it separates - so a blanket skip here is exactly
-            // why a still-burning booster left no trail. Emission is already gated on a
-            // running engine further down, so letting debris through costs one list walk
-            // on the tumbling tanks and nothing else.
-            if (vessel.vesselType == VesselType.Debris && !HasEngine(vessel)) return;
+            // Debris is skipped only when it has no engines: a jettisoned booster becomes VesselType.Debris the moment it separates, and a blanket skip is why a
+            // still-burning booster left no trail.
+            if (vessel.vesselType == VesselType.Debris && !EngineClusterUtils.HasEngine(vessel)) return;
 
-            if (!ModSettings.Enabled)
+            if (vessel.Parts.Count != lastPartCount)
             {
-                foreach (TrackedGroup g in trackedGroups) g.smokeMesh.HideAll();
-                return;
-            }
-
-            bool isLanding = IsLanding(vessel, wasLanding);
-
-            if (vessel.Parts.Count != lastPartCount || isLanding != wasLanding)
-            {
-                RecomputeGroups(isLanding);
+                RecomputeGroups();
                 lastPartCount = vessel.Parts.Count;
-                wasLanding = isLanding;
             }
 
-            bool hasAir = SmokeTuning.AirlessBodyPlume
-                || (vessel.mainBody != null && vessel.mainBody.atmosphere);
-            // Landing altitude (default 150m) is always well under spawnMaxAltitude, so
-            // this ceiling never actually excludes it - hasAir still applies. A landing
-            // dust cloud on an airless body is real and worth doing, but it needs its own
-            // look (dust, not white smoke), which is exactly the "configs for other
-            // engines/materials" work being deferred, not folded in blind here.
+            bool hasAir = SmokeTuning.AirlessBodyPlume || (vessel.mainBody != null && vessel.mainBody.atmosphere);
             // and not above the atmosphere of the body (spawnMaxAltitude is one fixed number; bodies differ)
             bool inAir = vessel.mainBody != null && (vessel.mainBody.atmosphere ? vessel.altitude < vessel.mainBody.atmosphereDepth : SmokeTuning.AirlessBodyPlume);
             bool canSpawn = hasAir && inAir && vessel.altitude <= spawnMaxAltitude;
 
+            float dt0 = TimeWarp.fixedDeltaTime;
             bool logThisFrame = false;
             if (SmokeTuning.DebugLogging)
             {
                 debugLogTimer -= TimeWarp.fixedDeltaTime;
-                if (debugLogTimer <= 0f)
-                {
-                    logThisFrame = true;
-                    debugLogTimer = 1f;
-                }
+                if (debugLogTimer <= 0f) { logThisFrame = true; debugLogTimer = 1f; }
             }
 
-            List<EngineSample> liveSamples = canSpawn
-                ? EngineClusterUtils.GatherEngineSamples(vessel, isLanding)
-                : new List<EngineSample>();
-
-            float currentSpeed = (float)vessel.srfSpeed;
-            float bloomWidth = PlumeBloomWidth(vessel);
-            // Bloom is NOT folded in here: sizeMultiplier scales the puff from birth, and
-            // the nozzle end of a bloomed plume is still narrow. It travels as a separate
-            // expansion factor that SizeForPuff eases in over the puff's growth.
-            float sizeMultiplier = SizeMultiplierForSpeed(currentSpeed);
-            float bloomExpansion = bloomWidth;
-            // Thinning is NOT computed here any more. It used to scale the whole volume,
-            // which meant the current altitude's bloom was applied to every puff in the
-            // trail including the ones sitting on the pad - so past ~24km the entire
-            // column faded out at once while detached stages, whose groups are no longer
-            // updated, kept their density and stayed visible. Each puff now carries its
-            // own factor from the air it was born into; see DensityForPuff.
-
+            List<EngineSample> liveSamples = canSpawn ? EngineClusterUtils.GatherEngineSamples(vessel, false) : new List<EngineSample>();
+            float sizeMultiplier = SizeMultiplierForSpeed((float)vessel.srfSpeed);
             if (logThisFrame)
-            {
-                Debug.Log(string.Format(
-                    "[PlumeTrails] vessel={0} alt={1:F0} speed={2:F0} sizeMult={3:F2} canSpawn={4} engines={5} groups={6}",
-                    vessel.vesselName, vessel.altitude, currentSpeed, sizeMultiplier, canSpawn, liveSamples.Count, trackedGroups.Count));
-            }
-
-            // THE FLOATING ORIGIN. When the vessel gets far from the origin KSP brings it back (the whole world is shifted by a few kilometres in one frame). The live tip
-            // and the last spawn point are raw world space: compared with the new emission point they looked like a jump of kilometres and the trail was CUT and,
-            // over a kilometre, ERASED (the log said: emission point jumped 2343 m, the trail went from 160 points to 14, starting at the altitude of the jump). The
-            // vessel itself is carried by the shift, so how far IT moved in one tick (a few tens of metres in flight) tells the shift; it is added to the stored points.
-            {
-                Vector3 vp = vessel.transform.position;
-                if (haveVesselPos)
-                {
-                    Vector3 dvp = vp - lastVesselPos;
-                    if (dvp.sqrMagnitude > 400f * 400f)
-                    {
-                        Debug.Log("[PlumeTrails] the world was shifted by " + dvp.magnitude.ToString("F0") + " m (floating origin): the live tips and the last spawn points are shifted with it");
-                        foreach (TrackedGroup tg in trackedGroups)
-                        {
-                            tg.smokeMesh.ShiftLiveTip(dvp);
-                            if (tg.lastSpawnPos.HasValue) tg.lastSpawnPos = tg.lastSpawnPos.Value + dvp;
-                        }
-                    }
-                }
-                lastVesselPos = vp; haveVesselPos = true;
-            }
+                Debug.Log(string.Format("[PlumeTrails] vessel={0} alt={1:F0} speed={2:F0} sizeMult={3:F2} canSpawn={4} engines={5} groups={6}",
+                    vessel.vesselName, vessel.altitude, vessel.srfSpeed, sizeMultiplier, canSpawn, liveSamples.Count, trackedGroups.Count));
 
             foreach (TrackedGroup g in trackedGroups)
             {
-                if (canSpawn)
-                {
-                    List<EngineSample> groupSamples = EngineClusterUtils.FilterSamplesByPartIds(liveSamples, g.partIds);
+                if (!canSpawn) { g.smoothedJetOffset = null; continue; }
+                List<EngineSample> groupSamples = EngineClusterUtils.FilterSamplesByPartIds(liveSamples, g.partIds);
+                if (groupSamples.Count == 0) { g.smoothedJetOffset = null; continue; }
+                float aggThrottle = EngineClusterUtils.ComputeMaxThrottle(groupSamples);
+                if (aggThrottle < minThrottle) { g.smoothedJetOffset = null; continue; }      // the chain closes by itself half a second later
+                groupsEmitting++;
+                EmitGroup(g, groupSamples, aggThrottle, sizeMultiplier);
+            }
 
-                    if (groupSamples.Count > 0)
-                    {
-                        float aggThrottle = EngineClusterUtils.ComputeMaxThrottle(groupSamples);
-                        g.centroid = EngineClusterUtils.ComputeCentroid(groupSamples);
-
-                        if (aggThrottle >= minThrottle)
-                        {
-                            Vector3 centroid = EngineClusterUtils.ComputeCentroid(groupSamples);
-
-                            float thrustSum = 0f;
-                            for (int si = 0; si < groupSamples.Count; si++) thrustSum += groupSamples[si].thrustFraction;
-                            float groupThrust = groupSamples.Count > 0 ? thrustSum / groupSamples.Count : 0f;
-                            // Fixed onto each puff at birth, so a trail laid down during the
-                            // tail-off stays thin behind the vessel instead of thickening
-                            // retroactively when the next stage lights.
-                            float lookSize, lookDensity, steamShare, exhaustWater, visDilution;
-                            EngineClusterUtils.GroupLook(groupSamples, out lookSize, out lookDensity, out steamShare, out exhaustWater, out visDilution);
-                            float emitDensity = EmissionForThrust(groupThrust) * EmissionForAtmosphere(vessel) * lookDensity;
-                            emitDensity *= PadFluid.TrailHandover(centroid, (Vector3)vessel.upAxis);
-                            // NOT boosted here any more for isLanding - LandingCloudDensityBoost
-                            // now sets the GROUND-SPLASH puffs' density (see the raycast block
-                            // below), not the live tip's. Boosting it here is what grew a dense
-                            // sphere in place instead of a cloud spreading along the ground.
-                            Vector3 rawForward = EngineClusterUtils.ComputeAverageForward(groupSamples);
-                            Vector3 avgForward = g.smoothedForward.HasValue
-                                ? Vector3.Slerp(g.smoothedForward.Value, rawForward, Mathf.Clamp01(TimeWarp.fixedDeltaTime * SpawnForwardSmoothRate))
-                                : rawForward;
-                            g.smoothedForward = avgForward;
-
-                            // LASSO FIX. The offset direction is a 15m lever, so a
-                            // 1-degree gimbal twitch throws the spawn point ~26cm sideways
-                            // and damping alone cannot remove it.
-                            //
-                            // The column marks where the rocket HAS BEEN, and that path is
-                            // smooth by construction. Surface velocity is its tangent, and
-                            // gimballing barely moves it - it changes attitude, not
-                            // instantaneous velocity. So once moving, steer by where the
-                            // vessel came from, not by where the nozzle points. On the pad
-                            // velocity is noise, and the two agree there anyway.
-                            Vector3 offsetDir = avgForward;
-                            Vector3 srfVel = vessel.srf_velocity;
-                            float srfSpeed = srfVel.magnitude;
-                            Vector3 flightDir = srfSpeed > 0.01f ? srfVel / srfSpeed : Vector3.zero;
-
-                            // How much this looks like a retro burn: exhaust pointing along
-                            // the flight path rather than against it, with enough dynamic
-                            // pressure for the air to actually stop it.
-                            float retro = 0f;
-                            if (SmokeTuning.UmbrellaEnabled && srfSpeed > LassoVelocityMinSpeed)
-                            {
-                                float alignment = Vector3.Dot(avgForward, flightDir);
-                                float q = 0.5f * (float)vessel.atmDensity * srfSpeed * srfSpeed;
-                                retro = Mathf.Clamp01((alignment - RetroDotThreshold) / (1f - RetroDotThreshold))
-                                      * Mathf.Clamp01((q - RetroMinPressure) / (RetroFullPressure - RetroMinPressure));
-                            }
-
-                            if (srfSpeed > LassoVelocityMinSpeed)
-                            {
-                                float blend = Mathf.Clamp01(
-                                    (srfSpeed - LassoVelocityMinSpeed)
-                                    / (LassoVelocityFullSpeed - LassoVelocityMinSpeed));
-                                // Ascending, exhaust trails the vessel, so "back along the
-                                // path" is where the offset goes. Retro-burning that is
-                                // exactly false - the exhaust goes AHEAD, into the
-                                // airstream - so the lasso correction has to be backed off
-                                // in proportion, or the plume is laid on the wrong side of
-                                // the vehicle entirely.
-                                blend *= 1f - retro;
-                                offsetDir = Vector3.Slerp(avgForward, -srfVel / srfSpeed, blend);
-                            }
-
-                            float standoff = SmokeTuning.SpawnOffset + SmokeTuning.UmbrellaStandoff * retro;
-                            float jetAirSpeed = 0f;
-                            if (SmokeTuning.SrbOnly)
-                            {
-                                // Replaces the lasso blend and the retro standoff outright;
-                                // see SolidJet.
-                                Vector3 rawDir;
-                                float rawLen;
-                                SolidJet(vessel, groupSamples, avgForward,
-                                         out rawDir, out rawLen, out jetAirSpeed);
-
-                                // Low-pass the OFFSET VECTOR, not direction and length
-                                // apart. Steering an attitude change straight into the spawn
-                                // point makes the newest smoke whip round the nozzle while
-                                // the older smoke stays where it was, and the seam between
-                                // them reads as a kink. Filtering the vector handles
-                                // direction and length together, has no singularity when
-                                // the jet swings a long way, and - with the time constant in
-                                // seconds - behaves the same at any physics rate.
-                                Vector3 target = rawDir * rawLen;
-                                float alpha = 1f - Mathf.Exp(-TimeWarp.fixedDeltaTime
-                                                              / Mathf.Max(SmokeTuning.SrbTurnSmoothing, 0.01f));
-                                g.smoothedJetOffset = g.smoothedJetOffset.HasValue
-                                    ? Vector3.Lerp(g.smoothedJetOffset.Value, target, alpha)
-                                    : target;
-                                Vector3 smoothed = g.smoothedJetOffset.Value;
-                                standoff = Mathf.Max(smoothed.magnitude, MinJetLength);
-                                offsetDir = smoothed.sqrMagnitude > 1e-6f ? smoothed.normalized : rawDir;
-                            }
-
-                            // WATERFALL: the smoke continues from where the flame ends. The flame's own length (read from the
-                            // engine's Waterfall effect) sets the earliest point the smoke may start, and what the heat haze and
-                            // the flame light wrap around. Smoothed, because the flame follows the throttle.
-                            float flameLen = 0f, flameWid = 0f;
-                            if (SmokeTuning.WaterfallIntegration) EngineClusterUtils.GroupFlame(groupSamples, out flameLen, out flameWid);
-                            g.smoothFlame += (flameLen - g.smoothFlame) * (1f - Mathf.Exp(-TimeWarp.fixedDeltaTime / 0.5f));
-                            if (g.smoothFlame < 0.05f) g.smoothFlame = 0f;
-                            g.smoothFlameW += (flameWid - g.smoothFlameW) * (1f - Mathf.Exp(-TimeWarp.fixedDeltaTime / 0.5f));
-                            if (g.smoothFlameW < 0.05f) g.smoothFlameW = 0f;
-                            float flameHandoff = g.smoothFlame * SmokeTuning.WaterfallHandoff;
-                            if (flameHandoff > standoff) standoff = flameHandoff;
-
-                            // The smoke cannot start BELOW the surface the exhaust hits. On a pad the flame (180 m for an SLS) ends
-                            // in the trench, so the smoke is released where the jet meets the pad - there it meets the deflector and
-                            // is turned along it. Without this it started 127 m down, below the whole pad.
-                            bool surfaceClamped = false;
-                            float surfDist = -1f;       // distance from the nozzle to the surface the exhaust hits (independent of the flame length)
-                            if (SmokeTuning.WaterfallIntegration || SmokeTuning.PadWater || PadFluid.Wanted)
-                            {
-                                float surf = SurfaceAlong(centroid, offsetDir, 500f);
-                                if (surf > 0f) surfDist = surf;
-                                if (surf > 0f && surf - 1f < standoff) { standoff = Mathf.Max(surf - 1f, 3f); surfaceClamped = true; }
-                            }
-                            if (SmokeTuning.PadFluidDebug)
-                            {
-                                float dbgKN = 0f; bool dbgSolid = false;
-                                for (int di = 0; di < groupSamples.Count; di++) { dbgKN += groupSamples[di].thrustKN; if (groupSamples[di].isSolid) dbgSolid = true; }
-                                SmokeVolumeGroup.DbgGroupInfo[g.id] = "g" + g.id + ": " + groupSamples.Count + " nozzles, " + dbgKN.ToString("F0") + " kN, " + (dbgSolid ? "solid" : "liquid")
-                                    + ", surface " + (surfDist > 0f ? surfDist.ToString("F0") + " m" : "NOT FOUND") + ", standoff " + standoff.ToString("F0")
-                                    + ", reports to the pad " + (PadFluid.Wanted && surfDist > 0f && surfDist < 300f ? "yes" : "NO");
-                            }
-
-                            // Which of the velocity terms is actually firing.
-                            //
-                            // "Looks like the rocket is burning when you turn hard" can come
-                            // from the retro umbrella triggering on a steep manoeuvre, from
-                            // the jellyfish bell spraying sideways off the nozzle axis, or
-                            // from the offset still steering by attitude instead of by the
-                            // flight path. All three look the same from outside and only
-                            // these numbers tell them apart.
-                            if (logThisFrame)
-                            {
-                                Debug.Log(string.Format(
-                                    "[PlumeTrails] emit: group={0} align={1:F2} retro={2:F2} lassoBlend={3:F2} "
-                                    + "bloom={4:F2} bellSpread={5:F0} standoff={6:F1}m spawnOff={7:F1}deg thrust={8:F2} emit={9:F2} jetAirSpeed={10:F0} bend={11:F1}deg",
-                                    g.id,
-                                    srfSpeed > 0.01f ? Vector3.Dot(avgForward, flightDir) : 0f,
-                                    retro,
-                                    srfSpeed > LassoVelocityMinSpeed
-                                        ? Mathf.Clamp01((srfSpeed - LassoVelocityMinSpeed)
-                                            / (LassoVelocityFullSpeed - LassoVelocityMinSpeed)) * (1f - retro)
-                                        : 0f,
-                                    bloomWidth,
-                                    SmokeTuning.SrbOnly ? 0f : SmokeTuning.JellyfishSpread * bloomWidth,
-                                    standoff,
-                                    Vector3.Angle(offsetDir, -flightDir),
-                                    groupThrust, emitDensity, jetAirSpeed,
-                                    Vector3.Angle(offsetDir, avgForward)));
-                            }
-
-                            Vector3 spawnPos = centroid + offsetDir * standoff;
-
-                            // A liquid engine is only let in during a landing so it can throw the
-                            // ground splash. It must NOT also run the SRB-style trail (live tip,
-                            // root, puff chain) - that is the white column that reappeared on an
-                            // LF engine right after the splash, which is not what a landing burn
-                            // does. Only meaningful under SrbOnly; with it off every engine
-                            // trails anyway.
-                            bool splashOnly = false;
-                            if (isLanding && SmokeTuning.SrbOnly && !SmokeTuning.LiquidPlumes)
-                            {
-                                splashOnly = true;
-                                for (int si = 0; si < groupSamples.Count; si++)
-                                {
-                                    if (groupSamples[si].isSolid) { splashOnly = false; break; }
-                                }
-                            }
-
-                            // The nozzle-size factor follows the engines that are firing right now, so it jumps whenever
-                            // one stops, throttles below the cut-off or a booster burns out. It used to rescale the group's
-                            // sizes live, which resized the WHOLE existing trail at once (a twitch, and the smoke got
-                            // thinner). Now each puff takes the factor at its own birth (see AddPuff below), and the
-                            // factor itself is eased so the tip does not pop either.
-                            float targetFactor = EngineClusterUtils.NozzleSizeFactor(groupSamples, g.partIds.Count)
-                                * lookSize;
-                            if (g.smoothFactor <= 0f) { g.smoothFactor = targetFactor; g.lastLoggedFactor = targetFactor; }
-                            if (Mathf.Abs(targetFactor - g.lastLoggedFactor) > 0.05f * Mathf.Max(g.lastLoggedFactor, 0.01f))
-                            {
-                                Debug.Log(string.Format("[PlumeTrails] nozzle size factor {0:F2} -> {1:F2} (firing engines={2}, group parts={3}, throttle={4:F2})",
-                                    g.lastLoggedFactor, targetFactor, groupSamples.Count, g.partIds.Count, aggThrottle));
-                                g.lastLoggedFactor = targetFactor;
-                            }
-                            g.smoothFactor += (targetFactor - g.smoothFactor) * (1f - Mathf.Exp(-TimeWarp.fixedDeltaTime / Mathf.Max(SmokeTuning.NozzleFactorEase, 0.05f)));
-                            float sizeFactor = g.smoothFactor;
-                            // Landing cloud no longer touches the live tip's own size - see
-                            // the ground-splash raycast block below for where the "flame
-                            // diverter" look actually comes from now. Inflating the tip in
-                            // place looked right for a vessel still descending fast (there
-                            // was somewhere for the size to go, along the trail behind it),
-                            // but for the last, nearly-stationary metres before touchdown -
-                            // exactly when this kicks in - it just grew a sphere sitting on
-                            // one point, reported as a mushroom/balloon.
-                            // Push the live sizes every tick; Initialize only ran once.
-                            g.smokeMesh.SetSizes(SmokeTuning.StartSize, SmokeTuning.MaxPuffSize);
-                            g.smokeMesh.SetGrowth(SmokeTuning.GrowthSharpness, SmokeTuning.GrowthTime);
-                            // The smoke starts as wide as the END of the flame it continues (Waterfall), instead of at the
-                            // physical release radius: a thin pencil after a fat flame read as a stretched, shrinking plume.
-                            float startScale = lookSize;
-                            if (SmokeTuning.PhysicsMode && SmokeTuning.SrbOnly && SmokeTuning.WaterfallMatchStart
-                                && g.smoothFlame > 0.5f && g.smoothFlameW > 0.2f && g.smokeMesh.LastPhysR0Raw > 0.05f)
-                            {
-                                float wantR = g.smoothFlameW * 0.5f * SmokeTuning.WaterfallStartWidth;
-                                startScale = Mathf.Clamp(wantR / (g.smokeMesh.LastPhysR0Raw * Mathf.Max(SmokeTuning.PhysRadiusScale, 0.05f)), 0.3f, 3.5f);
-                            }
-                            g.smokeMesh.SetSteam(steamShare, exhaustWater, visDilution, startScale);
-                            if (SmokeTuning.HeatHaze && !splashOnly)
-                            {
-                                // the hot region is a cone from the nozzle: as wide as the nozzle at the exit, widening as it
-                                // mixes; fades out in thin air (no air, no refraction) and with throttle
-                                float hazeD = Mathf.Max(EngineClusterUtils.NozzleSizeFactor(groupSamples, g.partIds.Count) * SmokeTuning.NozzleReferenceDiameter, 0.3f);
-                                float hazeAir = Mathf.Sqrt(Mathf.Clamp01((float)vessel.atmDensity));
-                                float hazeLen = Mathf.Clamp(hazeD * SmokeTuning.HeatHazeLengthDiameters, 4f, 150f);
-                                float hazeR0 = hazeD * 0.5f, hazeR1 = hazeD * 1.3f;
-                                if (g.smoothFlame > 0.5f)
-                                {
-                                    // wrap the flame that is actually on screen
-                                    hazeLen = Mathf.Clamp(g.smoothFlame * SmokeTuning.WaterfallHazeLength, hazeD * 3f, 80f);   // a shimmer over the flame, not over the whole column
-                                    hazeR0 = Mathf.Clamp(flameWid * 0.2f, hazeD * 0.4f, 4f);
-                                    hazeR1 = Mathf.Clamp(flameWid * 0.4f, hazeR0 * 1.6f, 9f);
-                                }
-                                HeatHazeRegistry.Report(unchecked((int)vessel.persistentId * 31 + g.id), centroid, avgForward, hazeLen,
-                                    hazeR0, hazeR1, aggThrottle * hazeAir * SmokeTuning.HeatHazeStrength);
-                            }
-                            if ((SmokeTuning.PadFlowRays || SmokeTuning.PadCloud) && surfaceClamped)
-                                PadFlow.Report(unchecked((int)vessel.persistentId * 31 + g.id), centroid, avgForward,
-                                    Mathf.Max(sizeFactor * SmokeTuning.NozzleReferenceDiameter, 0.3f) * 0.5f, (Vector3)vessel.upAxis);
-
-                            // the colour of what is burning, for the smoke's glow and for a real light in the scene
-                            Color flameRgb; float lightMul;
-                            EngineClusterUtils.GroupFlameColor(groupSamples, out flameRgb, out lightMul);
-                            g.smokeMesh.SetFlameColor(flameRgb);
-                            {
-                                float lightRange = Mathf.Clamp(Mathf.Max(SmokeTuning.FlameLightRange * Mathf.Max(sizeFactor, 0.3f) * 2.5f, g.smoothFlame * 6f), 30f, 500f);
-                                float airDim = Mathf.Lerp(0.5f, 1f, Mathf.Clamp01((float)vessel.atmDensity * 2f));
-                                float lightPower = 2.1f * Mathf.Sqrt(Mathf.Clamp01(aggThrottle) * Mathf.Max(sizeFactor, 0.2f)) * lightMul * airDim;
-                                Vector3 lightPos = centroid + avgForward * Mathf.Max(g.smoothFlame * 0.4f, 2f);
-                                EngineLights.Report(unchecked((int)vessel.persistentId * 31 + g.id), lightPos, flameRgb, lightRange, lightPower);
-                                // Where the jet meets the pad (the trench, the deflector) the flame is spread over the structure: a second, white-orange
-                                // light there lights the walls, the mount, the lower stage from below, and the ground around - the glare of a launch
-                                if (surfaceClamped && surfDist > 2f)
-                                {
-                                    Vector3 hitL = centroid + offsetDir * Mathf.Max(surfDist - 1.5f, 1f);
-                                    float impactRange = Mathf.Clamp(Mathf.Max(lightRange * 0.85f, 16f * Mathf.Max(sizeFactor, 0.3f)), 45f, 360f);
-                                    Color hot = Color.Lerp(flameRgb, new Color(1f, 0.92f, 0.78f), 0.4f);
-                                    EngineLights.Report(unchecked((int)vessel.persistentId * 31 + g.id) + 100003, hitL, hot, impactRange, lightPower * 1.5f);
-                                }
-                            }
-                            {
-                                float fRange = Mathf.Max(SmokeTuning.FlameLightRange * Mathf.Max(sizeFactor, 0.3f), g.smoothFlame * 0.7f);
-                                float fStr = aggThrottle * sizeFactor;
-                                Vector3 fPos = centroid;
-                                if (surfaceClamped)
-                                {
-                                    // The flame runs from the nozzle down to the trench: the whole column lights the fog (a line of light), brightest where it
-                                    // hits and spreads.
-                                    float colLen = surfDist > 0f ? surfDist : standoff;
-                                    fPos = centroid + offsetDir * 0.5f;
-                                    fRange = Mathf.Max(fRange, 45f); fStr *= 2.2f;
-                                    g.smokeMesh.SetFlameLight(fPos, fStr, fRange, centroid + offsetDir * colLen);
-                                }
-                                else if (g.smoothFlame > 1f)
-                                    g.smokeMesh.SetFlameLight(fPos, fStr, fRange, centroid + avgForward * g.smoothFlame);      // a flame of a known length is a column
-                                else
-                                    g.smokeMesh.SetFlameLight(fPos, fStr, fRange);
-                                if (PadFluid.Wanted && surfDist > 0f && surfDist < 300f)
-                                {
-                                    // the GPU pad solver: the jet that reaches the pad, with the pad itself as the obstacle
-                                    float thrF = 0f;
-                                    for (int ti = 0; ti < groupSamples.Count; ti++) thrF += groupSamples[ti].thrustKN;
-                                    Vector3 impactPos = centroid + offsetDir * surfDist;
-                                    PadFluid.Report(unchecked((int)vessel.persistentId * 31 + g.id), centroid, impactPos, (Vector3)vessel.upAxis, thrF,
-                                        Mathf.Max(6f, 0.12f * Mathf.Sqrt(thrF)),
-                                        SmokeTuning.PadWater ? SmokeTuning.PadWaterFrac : 0.3f, flameRgb, fStr, fRange, Mathf.Clamp01(aggThrottle),
-                                        Mathf.Clamp01((1f - steamShare) * 0.6f), surfDist);
-                                }
-                                if ((!PadFluid.Usable || !PadFluid.Drawing) && !PadFluid.SurfaceActive && SmokeTuning.PadCloud && surfaceClamped && standoff < 300f)
-                                {
-                                    // the cloud that rolls out over the pad (billows on the PadFlow rails), fed by this group
-                                    float thrKN = 0f;
-                                    for (int ti = 0; ti < groupSamples.Count; ti++) thrKN += groupSamples[ti].thrustKN;
-                                    PadCloud.Report(unchecked((int)vessel.persistentId * 31 + g.id), thrKN,
-                                        Mathf.Max(sizeFactor * SmokeTuning.NozzleReferenceDiameter, 0.3f) * 0.5f,
-                                        SmokeTuning.PadWater ? SmokeTuning.PadWaterFrac : 0.3f, flameRgb, fStr, fRange, Mathf.Clamp01(aggThrottle),
-                                        Mathf.Clamp01((1f - steamShare) * 0.6f));   // the share of dark exhaust smoke (SRB, kerosene)
-                                }
-                            }
-                            float currentRadius = SmokeTuning.StartSize * sizeFactor * sizeMultiplier;
-                            // REAL PHYSICS: the jet parameters of this emission, and the tip takes the radius the
-                            // parcels are actually being released with, so the chain starts continuous.
-                            bool physMode = SmokeTuning.PhysicsMode && SmokeTuning.SrbOnly;
-                            float physVe = 2500f, physMdot0 = 0f;
-                            Vector3 physU0 = Vector3.zero;
-                            float physD = 1f, physXs = 3f;
-                            if (physMode)
-                            {
-                                float ispS = 0f, thrustN = 0f;
-                                for (int si = 0; si < groupSamples.Count; si++) { ispS += groupSamples[si].isp; thrustN += groupSamples[si].thrustKN * 1000f; }
-                                float ispAvg = groupSamples.Count > 0 ? ispS / groupSamples.Count : 0f;
-                                physVe = ispAvg > 1f ? ispAvg * 9.80665f : 2500f;
-                                // The momentum the parcels start with. Near the pad it is the full jet (the wall jet in the trench needs it); in flight the parcels start
-                                // (almost) at rest in the air: with the full momentum a tilted thrust threw the parcels sideways and the trail leaned (confirmed: at 0
-                                // it does not). The change comes in between 40 and 160 m above the ground.
-                                float flightK = Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(40f, 160f, (float)vessel.radarAltitude));
-                                physU0 = (vessel.srf_velocity + avgForward * physVe) * Mathf.Lerp(1f, SmokeTuning.PhysJetMomentum, flightK);
-                                physMdot0 = thrustN / physVe;
-                                physD = Mathf.Max(sizeFactor * SmokeTuning.NozzleReferenceDiameter, 0.3f);
-                                physXs = Mathf.Max(standoff, 3f);
-                                if (g.smokeMesh.LastPhysR0 > 0.05f) currentRadius = g.smokeMesh.LastPhysR0;
-                            }
-
-                            if (splashOnly)
-                            {
-                                // end any trail this group had going, so it freezes cleanly
-                                // instead of the stale-tip watchdog tripping half a second on
-                                if (g.smokeMesh.HasLiveTip) g.smokeMesh.CommitLiveTip();
-                            }
-                            else
-                            {
-                                // The emission point JUMPED (a booster left and the centroid of the group's engines moved by hundreds of metres, or a stage
-                                // changed): the old tip is frozen where it was and a NEW chain starts. Left as it was, the new puffs joined the old chain
-                                // and a straight thin line was drawn across the jump (the trails that followed the rocket).
-                                if (g.smokeMesh.HasLiveTip && Vector3.Distance(g.smokeMesh.LiveTipPosition, spawnPos) > 120f)
-                                {
-                                    Debug.Log("[PlumeTrails] emission point jumped " + Vector3.Distance(g.smokeMesh.LiveTipPosition, spawnPos).ToString("F0") + " m (group " + g.id + "): the trail is cut there");
-                                    g.smokeMesh.CommitLiveTip();
-                                    if (Vector3.Distance(g.smokeMesh.LiveTipPosition, spawnPos) > 1000f) g.smokeMesh.ClearPuffs();      // 1 km at once is no flight: the vessel was put somewhere else
-                                    g.burnId++;
-                                    CapsuleTrail.Instance.EndChain(g.id + 1000 * vessel.GetInstanceID());
-                                    g.lastSpawnPos = null;
-                                }
-                                g.smokeMesh.SetLiveTip(spawnPos, currentRadius);
-                                if (SmokeTuning.NewTrail)
-                                {
-                                    int emitterKey = g.id + 1000 * vessel.GetInstanceID();
-                                    // by engine type: a solid motor leaves the full trail, the others what the type table says (hydrogen: nothing); thrust-weighted over the group
-                                    float trailDens = 0f, trailSize = 0f, trailW = 0f;
-                                    for (int ki = 0; ki < groupSamples.Count; ki++)
-                                    {
-                                        float kw = Mathf.Max(groupSamples[ki].thrustKN, 0.01f);
-                                        trailDens += kw * SmokeTuning.TrailDensity(groupSamples[ki].kind);
-                                        trailSize += kw * SmokeTuning.TrailSize(groupSamples[ki].kind);
-                                        trailW += kw;
-                                    }
-                                    if (trailW > 0f) { trailDens /= trailW; trailSize /= trailW; } else { trailDens = 1f; trailSize = 1f; }
-                                    if (trailDens < 0.02f) { CapsuleTrail.Instance.EndChain(emitterKey); goto noTrail; }
-                                    float capR = Mathf.Max(currentRadius * trailSize, 0.5f), capD = Mathf.Clamp(emitDensity, 0.9f, 1.5f) * trailDens;
-                                    CapsuleTrail.Instance.Push(emitterKey, vessel.mainBody, spawnPos, capR, capD, false);
-                                    // the root: the jet from the nozzle to the emission point, bent by the motion of the rocket (see JetCurve), as wide as the nozzle at the start;
-                                    // the hot exhaust in it glows in the colour of the flame
-                                    float nozR = Mathf.Max(sizeFactor * SmokeTuning.NozzleReferenceDiameter * 0.5f, 0.3f);
-                                    if (SmokeTuning.NewTrailRoot && !surfaceClamped)
-                                        JetCurve(vessel, avgForward, centroid, spawnPos, CapsuleTrail.HeadPoints, jetPts);
-                                    else { jetPts.Clear(); jetPts.Add(spawnPos); }
-                                    float glowK = Mathf.Clamp01(aggThrottle) * Mathf.Lerp(0.4f, 1f, Mathf.Clamp01((float)vessel.atmDensity * 3f));
-                                    CapsuleTrail.Instance.SetHead(emitterKey, jetPts, nozR, capR, capD, flameRgb * glowK);
-                                    noTrail:;
-                                }
-                            }
-
-                            // Cache where this is, every tick a real engine fired - not
-                            // just on ticks a puff was actually placed - so the tail below
-                            // starts from the truest last position rather than possibly a
-                            // SmokeTuning.SpawnInterval's worth behind it.
-                            g.tailLocalPos = vessel.transform.InverseTransformPoint(spawnPos);
-                            g.tailLastDensity = emitDensity;
-                            g.tailLastSizeMul = sizeMultiplier;
-                            // The root runs from the nozzle itself through the flame to the
-                            // tip. A radius of 0 (or SRB mode off) leaves the tip alone.
-                            g.smokeMesh.SetNozzles(groupSamples, centroid, avgForward);
-                            if (!splashOnly)
-                            g.smokeMesh.SetLiveRoot(centroid, avgForward,
-                                SmokeTuning.SrbOnly && SmokeTuning.SrbRootEnabled && !surfaceClamped   // no tube from the nozzle down to the pad
-                                    ? SmokeTuning.StartSize * sizeFactor * SmokeTuning.SrbRootRadius : 0f,
-                                emitDensity);
-
-                            float maxSpacing = Mathf.Max(currentRadius * MaxSpawnSpacingFraction, MinSpawnSpacing);
-                            g.spawnTimer -= TimeWarp.fixedDeltaTime;
-                            bool outranSpacing = !g.lastSpawnPos.HasValue
-                                || Vector3.Distance(spawnPos, g.lastSpawnPos.Value) >= maxSpacing;
-
-                            // MINIMUM spacing, against the maximum above. The timer path
-                            // fires on time alone, so creeping at 1 m/s lays a puff every
-                            // 8cm - dozens stacked inside one radius, which is what made
-                            // the big overlapping shells. Measured against the live radius,
-                            // since that is what decides what counts as too close.
-                            float minSpacing = currentRadius * MinSpawnSpacingFraction;
-                            // A rocket held on the pad does not move, but its jet keeps hitting the trench: in surface mode the jet parcels are
-                            // released by the clock then (the spacing rule is for a vessel that moves), so the pad smoke flows while it stands
-                            bool jetOnPad = physMode && surfaceClamped && PadFluid.SurfaceActive;
-                            bool movedEnough = jetOnPad || !g.lastSpawnPos.HasValue
-                                || Vector3.Distance(spawnPos, g.lastSpawnPos.Value) >= minSpacing;
-
-                            if ((outranSpacing || g.spawnTimer <= 0f) && movedEnough)
-                            {
-                                Vector3 initialVelocity = Vector3.zero;
-
-                                // Bloom. Underexpanded exhaust pushes outward from the
-                                // nozzle axis, which is what opens the bell. Perpendicular
-                                // to the EXHAUST here, where the umbrella below works off
-                                // the flight path - they are different axes and both can
-                                // apply at once during a high retro burn.
-                                // SRB mode: nothing here. The puff is placed where the jet
-                                // has already stopped, so it starts at rest in the air.
-                                // Legacy path (liquid-engine jellyfish), off by default under
-                                // SrbOnly. bloomWidth is now a width MULTIPLIER (>=1), not a
-                                // 0..1 fraction, so approximate one here rather than carry two
-                                // different bloom representations through the rest of the file.
-                                float legacyBloomFraction = Mathf.Clamp01(bloomWidth - 1f);
-                                if (legacyBloomFraction > 0.001f && !SmokeTuning.SrbOnly)
-                                {
-                                    Vector3 bell = Vector3.ProjectOnPlane(
-                                        Random.onUnitSphere, avgForward).normalized;
-                                    initialVelocity += bell * SmokeTuning.JellyfishSpread * legacyBloomFraction;
-                                }
-
-                                // Umbrella. The puff stagnates against the freestream and
-                                // turns outward, then gets swept back past the vehicle.
-                                // Azimuth is random per puff, so the canopy fills in as a
-                                // cone rather than as a single sheet.
-                                if (retro > 0.001f)
-                                {
-                                    Vector3 radial = Vector3.ProjectOnPlane(
-                                        Random.onUnitSphere, flightDir).normalized;
-
-                                    // Three parts, and they happen in this order along the
-                                    // plume rather than all at the nozzle:
-                                    //
-                                    // 1. A jet straight out of the nozzle, into the
-                                    //    airstream. Without it the canopy floats detached
-                                    //    with nothing connecting it to the engine.
-                                    initialVelocity += avgForward * SmokeTuning.UmbrellaJet * retro;
-
-                                    // 2. Turning outward as it stagnates - the canopy.
-                                    initialVelocity += radial * SmokeTuning.UmbrellaSpread * retro;
-
-                                    // 3. Swept back. This one has to be a FRACTION OF THE
-                                    //    VESSEL'S OWN SPEED, not a fixed number of m/s:
-                                    //    once the air has stopped the exhaust, that gas is
-                                    //    at rest in the AIR, so in the vehicle's frame it
-                                    //    streams past at whatever the vehicle is doing.
-                                    //    A constant 25 m/s against a vessel falling at 400
-                                    //    leaves the canopy hanging where it was born while
-                                    //    the rocket drops away from it - which is exactly
-                                    //    the detached blob with a gap under it.
-                                    initialVelocity -= flightDir * srfSpeed
-                                                     * SmokeTuning.UmbrellaBackflowFraction * retro;
-                                }
-
-                                // (not while the pad fluid draws the pad: its flow does this; the random sideways kicks bent the root of the trail)
-                                if (SmokeTuning.GroundImpingementEnabled && !PadFluid.Drawing && vessel.altitude < groundImpingementRange)
-                                {
-                                    // Independent random direction per puff. A smoothly
-                                    // rotating one barely turns within the impingement
-                                    // window, so every puff got pushed the same way and it
-                                    // compounded into one coherent drift.
-                                    Vector3 up = (spawnPos - vessel.mainBody.position).normalized;
-                                    Vector3 lateral = Vector3.ProjectOnPlane(Random.onUnitSphere, up).normalized;
-                                    float t = (float)(vessel.altitude / groundImpingementRange);
-                                    initialVelocity = lateral * Mathf.Lerp(groundImpingementSpeed, 0f, t) * aggThrottle
-                                        + avgForward * Mathf.Lerp(exhaustDownwardSpeed, 0f, t) * aggThrottle;
-                                }
-                                if (SmokeTuning.DebugLogging)
-                                {
-                                    float actualDist = g.lastSpawnPos.HasValue ? Vector3.Distance(spawnPos, g.lastSpawnPos.Value) : -1f;
-                                    Debug.Log(string.Format(
-                                        "[PlumeTrails] spawn: group={0} t={1:F3} dist={2:F2} maxSpacing={3:F2} speed={4:F0} pos={5} vel={6} |vel|={7:F2}",
-                                        g.id, Time.time, actualDist, maxSpacing, currentSpeed, spawnPos, initialVelocity, initialVelocity.magnitude));
-                                }
-                                // Fill the whole distance covered since the last spawn.
-                                // One puff per physics frame meant the faster the vessel
-                                // flew the coarser the trail got.
-                                int fill = 1;
-                                if (g.lastSpawnPos.HasValue)
-                                {
-                                    float gap = Vector3.Distance(spawnPos, g.lastSpawnPos.Value);
-
-                                    // Only bridge a gap the vessel plausibly just flew.
-                                    // After a restart or a scene change lastSpawnPos can be
-                                    // stale, and interpolating to it lays a line of puffs
-                                    // across empty space.
-                                    float plausible = Mathf.Max(currentSpeed * MaxBridgeSeconds, 25f);
-                                    if (gap > plausible)
-                                    {
-                                        g.lastSpawnPos = null;
-                                        g.burnId++;          // a new chain: the puffs on the two sides of a jump must not be joined by a line
-                                    }
-                                    else
-                                    {
-                                        float wanted = Mathf.Max(currentSpeed * SmokeTuning.SpawnInterval, maxSpacing);
-                                        fill = Mathf.Clamp(Mathf.CeilToInt(gap / Mathf.Max(wanted, 0.5f)),
-                                                           1, maxPuffsPerFrame);
-                                    }
-                                }
-
-                                // A pause in emission starts a new burst. Same threshold
-                                // as the stale-gap guard, so the two stay consistent.
-                                if (g.lastSpawnTime > 0f
-                                    && Time.time - g.lastSpawnTime > MaxBridgeSeconds)
-                                {
-                                    g.burnId++;
-                                    g.lastSpawnPos = null;
-                                }
-                                float physSliceDt = g.lastSpawnTime > 0f
-                                    ? Mathf.Clamp(Time.time - g.lastSpawnTime, 0.005f, 0.25f) / Mathf.Max(fill, 1)
-                                    : SmokeTuning.SpawnInterval;
-                                g.lastSpawnTime = Time.time;
-
-                                for (int f = 1; f <= fill; f++)
-                                {
-                                    Vector3 p = g.lastSpawnPos.HasValue
-                                        ? Vector3.Lerp(g.lastSpawnPos.Value, spawnPos, f / (float)fill)
-                                        : spawnPos;
-                                    if (!splashOnly)
-                                    {
-                                        if (physMode)
-                                            g.smokeMesh.AddPhysicalJetPuff(p, physU0, physVe, physXs, physMdot0, physSliceDt, g.burnId, emitDensity);
-                                        else
-                                            g.smokeMesh.AddPuff(p, initialVelocity, sizeMultiplier * sizeFactor, g.burnId, bloomExpansion, emitDensity);
-                                    }
-                                }
-
-                                // Ground cloud: trace the exhaust down to whatever it is
-                                // hitting and emit there. Raw thrust axis, not the
-                                // lasso-damped one - this is about where the plume lands.
-                                if (groundCloudEnabled && !PadFluid.Drawing && !PadFluid.SurfaceActive)      // the fluid cloud IS the ground cloud while it runs; in surface mode the jet parcels are
-                                {
-                                    RaycastHit gHit;
-                                    if (Physics.Raycast(centroid, avgForward, out gHit,
-                                            groundCloudMaxReach,
-                                            SmokeVolumeGroup.GetSceneryCollisionMaskPublic(),
-                                            QueryTriggerInteraction.Ignore)
-                                        && gHit.collider.GetComponentInParent<Part>() == null)
-                                    {
-                                        Vector3 gUp = (gHit.point - vessel.mainBody.position).normalized;
-                                        for (int gp = 0; gp < groundCloudPuffsPerTick; gp++)
-                                        {
-                                            g.smokeMesh.AddGroundPuff(gHit.point, gUp,
-                                                groundCloudOutwardSpeed * aggThrottle,
-                                                groundCloudSizeScale * sizeMultiplier * sizeFactor);
-                                        }
-                                    }
-                                }
-
-                                // Landing cloud, second pass: reuses the same
-                                // raycast-then-radial-puffs primitive as the pad-deflector
-                                // ground cloud above (that mechanic itself was never the
-                                // problem; what was rejected earlier was gating the LANDING
-                                // feature on that system's own flaky pad-survey trigger).
-                                // isLanding is already a clean altitude+vspeed detector, so
-                                // this fires independently of groundCloudEnabled.
-                                //
-                                // Same reasoning as SolidJet's raw thrust axis: this is
-                                // about where the plume physically lands, not where the
-                                // lasso-damped trail offset points.
-                                if (isLanding)
-                                {
-                                    RaycastHit lHit;
-                                    // Ground effect only happens CLOSE to the ground, in units
-                                    // of how big the nozzle is - not at any height the raycast
-                                    // can see. A 0.8 m engine throwing a splash from 115 m up
-                                    // was the "worms appearing 100 m above the ground".
-                                    // Reach modelled on KerbalFX ImpactPuffs (Unlicense, bimo1d):
-                                    // 10 m at low thrust up to 28 m at full thrust, in metres,
-                                    // grown for engines bigger than the reference so a large
-                                    // booster is not stuck with a micro lander's reach.
-                                    float splashReach = Mathf.Clamp(
-                                        Mathf.Lerp(10f, 28f, aggThrottle) * Mathf.Max(1f, sizeFactor)
-                                            * SmokeTuning.LandingSplashReachScale,
-                                        5f, SmokeTuning.LandingCloudRaycastReach);
-                                    if (Physics.Raycast(centroid, avgForward, out lHit,
-                                            splashReach,
-                                            SmokeVolumeGroup.GetSceneryCollisionMaskPublic(),
-                                            QueryTriggerInteraction.Ignore)
-                                        && lHit.collider.GetComponentInParent<Part>() == null
-                                        // Also as in KerbalFX: the exhaust has to actually point
-                                        // into the surface (not skim it), and the surface must
-                                        // not be a near-vertical wall.
-                                        && Vector3.Dot(avgForward, -lHit.normal) >= 0.18f
-                                        && Vector3.Dot(lHit.normal,
-                                               (lHit.point - vessel.mainBody.position).normalized) > 0.3f)
-                                    {
-                                        Vector3 lUp = (lHit.point - vessel.mainBody.position).normalized;
-                                        // Cubic falloff with height, KerbalFX's distanceFactor
-                                        // (1 - d/reach)^3, and nothing at all below its 0.04
-                                        // emit threshold. Much sharper than the linear fade it
-                                        // replaces: strong only in the last few metres.
-                                        float distFactor = Mathf.Pow(1f - Mathf.Clamp01(lHit.distance / splashReach), 3f);
-                                        if (distFactor > 0.04f)
-                                        {
-                                        // One puff added to EACH ray, every tick - not
-                                        // LandingCloudPuffsPerTick random directions. A
-                                        // fixed rayId keeps extending the same line (see
-                                        // AddGroundPuff), which is what makes it chain into
-                                        // a "jet stream" streak instead of a scatter of
-                                        // independent blobs with no two puffs ever sharing
-                                        // a heading to connect along.
-                                        int rayCount = Mathf.Max(1, SmokeTuning.LandingCloudPuffsPerTick);
-                                        for (int lp = 0; lp < rayCount; lp++)
-                                        {
-                                            // Fades with height: full strength on touchdown,
-                                            // a third of it at the edge of the reach.
-                                            float splashIntensity = Mathf.Lerp(0.25f, 1f, distFactor);
-                                            g.smokeMesh.AddGroundPuff(lHit.point, lUp,
-                                                SmokeTuning.LandingCloudSpreadSpeed * aggThrottle * Mathf.Sqrt(sizeFactor) * splashIntensity,
-                                                SmokeTuning.LandingCloudSizeBoost * sizeMultiplier * sizeFactor * sizeFactor,
-                                                SmokeTuning.LandingCloudDensityBoost * splashIntensity,
-                                                lp, rayCount);
-                                        }
-                                        if (logThisFrame)
-                                        {
-                                            Debug.Log(string.Format(
-                                                "[PlumeTrails] landing splash: group={0} impact={1} dist={2:F0}m "
-                                                + "speed={3:F0} density={4:F2} puffs={5}",
-                                                g.id, lHit.point, lHit.distance,
-                                                SmokeTuning.LandingCloudSpreadSpeed * aggThrottle,
-                                                SmokeTuning.LandingCloudDensityBoost,
-                                                SmokeTuning.LandingCloudPuffsPerTick));
-                                        }
-                                        }
-                                    }
-                                    else if (logThisFrame)
-                                    {
-                                        Debug.Log(string.Format(
-                                            "[PlumeTrails] landing splash: group={0} raycast missed "
-                                            + "(reach {1:F0}m) - no ground puffs this tick",
-                                            g.id, splashReach));
-                                    }
-                                }
-
-                                g.lastSpawnPos = spawnPos;
-                                // Below ~50 m/s the distance test never fires, so this
-                                // timer is the only trigger - at 1f that meant one burst
-                                // per second, filled by a dozen puffs at once.
-                                g.spawnTimer = SmokeTuning.SpawnInterval;
-                            }
-                        }
-                        else
-                        {
-                            SrbTail(g);
-                        }
-                    }
-                    else
-                    {
-                        // Zero live samples has two different causes that must NOT be
-                        // treated the same. partIds still non-empty means the engine is
-                        // still physically part of THIS vessel and simply produced no
-                        // sample this tick (flamed out, not yet ignited) - that is our own
-                        // motor going quiet, and it gets the tail. partIds EMPTY means the
-                        // structural regroup above just found that this group's parts left
-                        // the vessel entirely (staging separation) - there is no motor here
-                        // to taper, and tailing it anyway drew a few seconds of ghost smoke
-                        // out of the bare interstage where the booster used to be.
-                        if (g.partIds.Count > 0) SrbTail(g);
-                        else StopEmission(g);
-                    }
-                }
-                else
-                {
-                    StopEmission(g);
-                }
-
-                g.smokeMesh.Tick(TimeWarp.fixedDeltaTime);
+            emitLogTimer -= dt0;
+            if (emitLogTimer <= 0f && liveSamples.Count > 0)
+            {
+                emitLogTimer = 5f;
+                int solid = 0;
+                for (int i = 0; i < liveSamples.Count; i++) if (liveSamples[i].kind == PlumeKind.Solid) solid++;
+                Debug.Log(string.Format("[PlumeTrails] emit: {0} firing nozzles ({1} solid), {2} groups, {3} emitting, trails pushed {4}, skipped by engine type {5} (trail only from solids: {6})",
+                    liveSamples.Count, solid, trackedGroups.Count, groupsEmitting, trailsPushed, trailsSkippedByType, SmokeTuning.TrailOnlySolid));
+                trailsPushed = 0; trailsSkippedByType = 0; groupsEmitting = 0;
             }
 
             for (int i = trackedGroups.Count - 1; i >= 0; i--)
+                if (trackedGroups[i].partIds.Count == 0) { CapsuleTrail.Instance.EndChain(EmitterKey(trackedGroups[i])); trackedGroups.RemoveAt(i); }
+        }
+
+        private void EmitGroup(TrackedGroup g, List<EngineSample> groupSamples, float aggThrottle, float sizeMultiplier)
+        {
+            Vector3 centroid = EngineClusterUtils.ComputeCentroid(groupSamples);
+            float dt = TimeWarp.fixedDeltaTime;
+
+            float thrustSum = 0f;
+            for (int si = 0; si < groupSamples.Count; si++) thrustSum += groupSamples[si].thrustFraction;
+            float groupThrust = thrustSum / groupSamples.Count;
+            float lookSize, lookDensity, steamShare, exhaustWater, visDilution;
+            EngineClusterUtils.GroupLook(groupSamples, out lookSize, out lookDensity, out steamShare, out exhaustWater, out visDilution);
+            float emitDensity = EmissionForThrust(groupThrust) * EmissionForAtmosphere(vessel) * lookDensity;
+
+            Vector3 rawForward = EngineClusterUtils.ComputeAverageForward(groupSamples);
+            Vector3 avgForward = g.smoothedForward.HasValue
+                ? Vector3.Slerp(g.smoothedForward.Value, rawForward, Mathf.Clamp01(dt * SpawnForwardSmoothRate))
+                : rawForward;
+            g.smoothedForward = avgForward;
+
+            // where the smoke starts: the jet stops in the air (SolidJet), the offset VECTOR low-passed (steering an attitude change straight into the spawn point makes the
+            // newest smoke whip round the nozzle while the older smoke stays; filtering the vector handles direction and length together)
+            Vector3 rawDir; float rawLen, jetAirSpeed;
+            SolidJet(vessel, groupSamples, avgForward, out rawDir, out rawLen, out jetAirSpeed);
+            Vector3 target = rawDir * rawLen;
+            float alpha = 1f - Mathf.Exp(-dt / Mathf.Max(SmokeTuning.SrbTurnSmoothing, 0.01f));
+            g.smoothedJetOffset = g.smoothedJetOffset.HasValue ? Vector3.Lerp(g.smoothedJetOffset.Value, target, alpha) : target;
+            Vector3 smoothed = g.smoothedJetOffset.Value;
+            float standoff = Mathf.Max(smoothed.magnitude, MinJetLength);
+            Vector3 offsetDir = smoothed.sqrMagnitude > 1e-6f ? smoothed.normalized : rawDir;
+
+            // WATERFALL: the smoke continues from where the flame ends. The flame's own length (read from the engine's Waterfall effect) sets the earliest point the smoke may
+            // start, and what the heat haze and the flame light wrap around. Smoothed, because the flame follows the throttle.
+            float flameLen = 0f, flameWid = 0f;
+            if (SmokeTuning.WaterfallIntegration) EngineClusterUtils.GroupFlame(groupSamples, out flameLen, out flameWid);
+            g.smoothFlame += (flameLen - g.smoothFlame) * (1f - Mathf.Exp(-dt / 0.5f));
+            if (g.smoothFlame < 0.05f) g.smoothFlame = 0f;
+            g.smoothFlameW += (flameWid - g.smoothFlameW) * (1f - Mathf.Exp(-dt / 0.5f));
+            if (g.smoothFlameW < 0.05f) g.smoothFlameW = 0f;
+            float flameHandoff = g.smoothFlame * SmokeTuning.WaterfallHandoff;
+            if (flameHandoff > standoff) standoff = flameHandoff;
+
+            // The smoke cannot start BELOW the surface the exhaust hits (the flame of a big rocket ends in the trench): it is released where the jet meets the ground.
+            bool surfaceClamped = false;
+            float surfDist = -1f;
+            if (SmokeTuning.WaterfallIntegration)
             {
-                TrackedGroup g = trackedGroups[i];
-                if (g.partIds.Count == 0 && !g.smokeMesh.HasActivePuffs)
+                float surf = SurfaceProbe.Along(centroid, offsetDir, 500f);
+                if (surf > 0f) surfDist = surf;
+                if (surf > 0f && surf - 1f < standoff) { standoff = Mathf.Max(surf - 1f, 3f); surfaceClamped = true; }
+            }
+            Vector3 spawnPos = centroid + offsetDir * standoff;
+
+            // The nozzle-size factor follows the engines that are firing right now, so it jumps whenever one stops or a booster burns out; it is eased so the tip does not pop.
+            float targetFactor = EngineClusterUtils.NozzleSizeFactor(groupSamples, g.partIds.Count) * lookSize;
+            if (g.smoothFactor <= 0f) { g.smoothFactor = targetFactor; g.lastLoggedFactor = targetFactor; }
+            if (Mathf.Abs(targetFactor - g.lastLoggedFactor) > 0.05f * Mathf.Max(g.lastLoggedFactor, 0.01f))
+            {
+                if (SmokeTuning.DebugLogging)
+                    Debug.Log(string.Format("[PlumeTrails] nozzle size factor {0:F2} -> {1:F2} (firing engines={2}, group parts={3}, throttle={4:F2})",
+                        g.lastLoggedFactor, targetFactor, groupSamples.Count, g.partIds.Count, aggThrottle));
+                g.lastLoggedFactor = targetFactor;
+            }
+            g.smoothFactor += (targetFactor - g.smoothFactor) * (1f - Mathf.Exp(-dt / Mathf.Max(SmokeTuning.NozzleFactorEase, 0.05f)));
+            float sizeFactor = g.smoothFactor;
+
+            if (SmokeTuning.HeatHaze)
+            {
+                // the hot region is a cone from the nozzle: as wide as the nozzle at the exit, widening as it mixes; fades out in thin air (no air, no refraction) and with throttle
+                float hazeD = Mathf.Max(EngineClusterUtils.NozzleSizeFactor(groupSamples, g.partIds.Count) * SmokeTuning.NozzleReferenceDiameter, 0.3f);
+                float hazeAir = Mathf.Sqrt(Mathf.Clamp01((float)vessel.atmDensity));
+                float hazeLen = Mathf.Clamp(hazeD * SmokeTuning.HeatHazeLengthDiameters, 4f, 150f);
+                float hazeR0 = hazeD * 0.5f, hazeR1 = hazeD * 1.3f;
+                if (g.smoothFlame > 0.5f)
                 {
-                    Object.Destroy(g.smokeMesh.gameObject);
-                    trackedGroups.RemoveAt(i);
+                    // wrap the flame that is actually on screen: a shimmer over the flame, not over the whole column
+                    hazeLen = Mathf.Clamp(g.smoothFlame * SmokeTuning.WaterfallHazeLength, hazeD * 3f, 80f);
+                    hazeR0 = Mathf.Clamp(flameWid * 0.2f, hazeD * 0.4f, 4f);
+                    hazeR1 = Mathf.Clamp(flameWid * 0.4f, hazeR0 * 1.6f, 9f);
                 }
+                HeatHazeRegistry.Report(unchecked((int)vessel.persistentId * 31 + g.id), centroid, avgForward, hazeLen, hazeR0, hazeR1, aggThrottle * hazeAir * SmokeTuning.HeatHazeStrength);
+            }
+
+            // the colour of what is burning, for the glow of the trail's root and for a real light in the scene
+            Color flameRgb; float lightMul;
+            EngineClusterUtils.GroupFlameColor(groupSamples, out flameRgb, out lightMul);
+            ReportLight(g, groupSamples, aggThrottle, ref flameRgb, centroid, avgForward, offsetDir, surfaceClamped, surfDist, sizeFactor);
+
+            // The radius the smoke is released with: from the jet physics (see PhysicalJetRadius), else a fixed fraction of the nozzle size.
+            float currentRadius = SmokeTuning.StartSize * sizeFactor * sizeMultiplier;
+            if (SmokeTuning.PhysicsMode)
+            {
+                float ispS = 0f, thrustN = 0f;
+                for (int si = 0; si < groupSamples.Count; si++) { ispS += groupSamples[si].isp; thrustN += groupSamples[si].thrustKN * 1000f; }
+                float ispAvg = ispS / groupSamples.Count;
+                float ve = ispAvg > 1f ? ispAvg * 9.80665f : 2500f;
+                float r = PhysicalJetRadius(spawnPos, ve, Mathf.Max(standoff, 3f), thrustN / ve, lookSize);
+                if (r > 0.05f) currentRadius = r;
+            }
+
+            if (!SmokeTuning.NewTrail) return;
+            EmitTrail(g, groupSamples, aggThrottle, emitDensity, currentRadius, sizeFactor, centroid, avgForward, spawnPos, flameRgb, surfaceClamped);
+        }
+
+        // The scene light of the flame: with Waterfall it follows Waterfall's own flame light (read, not guessed from the thrust), without it a physical estimate;
+        // where the jet meets the ground a second light lights the structure around it.
+        private void ReportLight(TrackedGroup g, List<EngineSample> groupSamples, float aggThrottle, ref Color flameRgb, Vector3 centroid, Vector3 avgForward,
+                                 Vector3 offsetDir, bool surfaceClamped, float surfDist, float sizeFactor)
+        {
+            // the luminous power of the flame from the jet power of the engines (F * ve / 2) times the share that leaves as visible light (the hot alumina of a solid
+            // motor glows brightly, hydrogen hardly at all), inverse-square physics: the intensity is the illuminance at 10 m, the range is where the light drops below
+            // what the eye notices
+            float lumW = 0f;
+            for (int li = 0; li < groupSamples.Count; li++)
+            {
+                PlumeKind lk = groupSamples[li].kind;
+                float radFrac = lk == PlumeKind.Solid ? 0.06f : lk == PlumeKind.Kerolox ? 0.025f : lk == PlumeKind.Methalox ? 0.012f : lk == PlumeKind.Hypergolic ? 0.02f : 0.003f;
+                float jetW = 0.5f * groupSamples[li].thrustKN * 1000f * Mathf.Max(groupSamples[li].isp, 150f) * 9.80665f;
+                lumW += jetW * radFrac * Mathf.Clamp01(groupSamples[li].thrustFraction > 0f ? groupSamples[li].thrustFraction : aggThrottle);
+            }
+            float airDim = Mathf.Lerp(0.5f, 1f, Mathf.Clamp01((float)vessel.atmDensity * 2f));       // in thin air the flame is bigger but fainter
+            float lightRange = Mathf.Clamp(Mathf.Sqrt(lumW / (4f * Mathf.PI * 0.35f)), 25f, 1500f);
+            float lightPower = Mathf.Clamp(lumW / (4f * Mathf.PI * 100f) / 1.1e4f, 0f, 10f) * airDim;
+            if (SmokeTuning.WaterfallLight && SmokeTuning.EngineLights && WaterfallBridge.Available)
+            {
+                Color wc = Color.black; float wi = 0f, wr = 0f; int wn = 0; HashSet<uint> seen = new HashSet<uint>();
+                for (int li = 0; li < groupSamples.Count; li++)
+                {
+                    uint pid = groupSamples[li].partId;
+                    if (!seen.Add(pid)) continue;
+                    Part wp = null;
+                    for (int pi = 0; pi < vessel.parts.Count; pi++) if (vessel.parts[pi].flightID == pid) { wp = vessel.parts[pi]; break; }
+                    Color c1; float i1, r1;
+                    if (WaterfallBridge.ReadLight(wp, true, out c1, out i1, out r1) && i1 > 0f) { wc += c1 * i1; wi += i1; wr = Mathf.Max(wr, r1); wn++; }
+                }
+                if (wn > 0)
+                {
+                    flameRgb = wc / wi;
+                    lightPower = Mathf.Clamp(wi * SmokeTuning.WaterfallLightGain, 0f, 10f);
+                    lightRange = Mathf.Clamp(wr, 25f, 1500f);
+                }
+            }
+            int key = unchecked((int)vessel.persistentId * 31 + g.id);
+            EngineLights.Report(key, centroid + avgForward * Mathf.Max(g.smoothFlame * 0.4f, 2f), flameRgb, lightRange, lightPower);
+            if (surfaceClamped && surfDist > 2f)
+            {
+                Vector3 hitL = centroid + offsetDir * Mathf.Max(surfDist - 1.5f, 1f);
+                float impactRange = Mathf.Clamp(Mathf.Max(lightRange * 0.85f, 16f * Mathf.Max(sizeFactor, 0.3f)), 45f, 360f);
+                Color hot = Color.Lerp(flameRgb, new Color(1f, 0.92f, 0.78f), 0.4f);
+                EngineLights.Report(key + 100003, hitL, hot, impactRange, lightPower * 1.5f);
             }
         }
 
-        private void RecomputeGroups(bool forceAllEngines = false)
+        // The trail: by engine type a solid motor leaves the full trail, the others what the type table says (thrust-weighted over the group); engines far apart (side
+        // boosters) each leave their own trail from their own nozzle, not one from the middle of the rocket.
+        private void EmitTrail(TrackedGroup g, List<EngineSample> groupSamples, float aggThrottle, float emitDensity, float currentRadius, float sizeFactor,
+                               Vector3 centroid, Vector3 avgForward, Vector3 spawnPos, Color flameRgb, bool surfaceClamped)
         {
-            List<HashSet<uint>> newGroups = EngineClusterUtils.GroupEnginePartsStructurally(
-                vessel, clusterDistanceThreshold, forceAllEngines);
+            int emitterKey = EmitterKey(g);
+            float trailDens = 0f, trailSize = 0f, trailW = 0f;
+            for (int ki = 0; ki < groupSamples.Count; ki++)
+            {
+                float kw = Mathf.Max(groupSamples[ki].thrustKN, 0.01f);
+                trailDens += kw * SmokeTuning.TrailDensity(groupSamples[ki].kind);
+                trailSize += kw * SmokeTuning.TrailSize(groupSamples[ki].kind);
+                trailW += kw;
+            }
+            if (trailW > 0f) { trailDens /= trailW; trailSize /= trailW; } else { trailDens = 1f; trailSize = 1f; }
+            if (trailDens < 0.02f) { CapsuleTrail.Instance.EndChain(emitterKey); trailsSkippedByType++; return; }
+            trailsPushed++;
+            float capR = Mathf.Max(currentRadius * trailSize, 0.5f), capD = Mathf.Clamp(emitDensity, 0.9f, 1.5f) * trailDens;
+            float glowK = Mathf.Clamp01(aggThrottle) * Mathf.Lerp(0.4f, 1f, Mathf.Clamp01((float)vessel.atmDensity * 3f));
+            bool root = SmokeTuning.NewTrailRoot && !surfaceClamped;      // no tube from the nozzle down to the pad
+
+            float spread = 0f;
+            for (int si = 0; si < groupSamples.Count; si++) spread = Mathf.Max(spread, Vector3.Distance(groupSamples[si].position, centroid));
+            if (groupSamples.Count > 1 && spread > 0.8f && groupSamples.Count < 16)
+            {
+                float capBase = Mathf.Max(currentRadius / Mathf.Sqrt(groupSamples.Count), 0.5f);
+                float nozR1 = Mathf.Max(sizeFactor * SmokeTuning.NozzleReferenceDiameter * 0.5f / Mathf.Sqrt(groupSamples.Count), 0.3f);
+                float baseD = Mathf.Clamp(emitDensity, 0.9f, 1.5f);
+                for (int si = 0; si < groupSamples.Count; si++)
+                {
+                    int key1 = emitterKey + (si + 1) * 100003;
+                    // each engine by ITS type: a liquid core between two boosters leaves no trail when only solids do
+                    float dens1 = SmokeTuning.TrailDensity(groupSamples[si].kind);
+                    if (dens1 < 0.02f) { CapsuleTrail.Instance.EndChain(key1); trailsSkippedByType++; continue; }
+                    trailsPushed++;
+                    float capR1 = Mathf.Max(capBase * SmokeTuning.TrailSize(groupSamples[si].kind), 0.5f), capD1 = baseD * dens1;
+                    Vector3 off = groupSamples[si].position - centroid;
+                    // the start radius of a trail from one nozzle is its own, not the 5 m minimum of the group trail: boosters a few metres apart would overlap into one
+                    // column from the first metre (the trails still merge as they widen, like the real plumes)
+                    CapsuleTrail.Instance.Push(key1, vessel.mainBody, spawnPos + off, capR1, capD1, false, Mathf.Max(capR1 * 1.6f, 1.2f));
+                    if (root) JetCurve(vessel, avgForward, centroid + off, spawnPos + off, CapsuleTrail.HeadPoints, jetPts);
+                    else { jetPts.Clear(); jetPts.Add(spawnPos + off); }
+                    CapsuleTrail.Instance.SetHead(key1, jetPts, nozR1, capR1, capD1, flameRgb * glowK);
+                }
+                CapsuleTrail.Instance.EndChain(emitterKey);
+                return;
+            }
+            CapsuleTrail.Instance.Push(emitterKey, vessel.mainBody, spawnPos, capR, capD, false);
+            // the root: the jet from the nozzle to the emission point, bent by the motion of the rocket (see JetCurve), as wide as the nozzle at the start; the hot exhaust in
+            // it glows in the colour of the flame
+            float nozR = Mathf.Max(sizeFactor * SmokeTuning.NozzleReferenceDiameter * 0.5f, 0.3f);
+            if (root) JetCurve(vessel, avgForward, centroid, spawnPos, CapsuleTrail.HeadPoints, jetPts);
+            else { jetPts.Clear(); jetPts.Add(spawnPos); }
+            CapsuleTrail.Instance.SetHead(emitterKey, jetPts, nozR, capR, capD, flameRgb * glowK);
+        }
+
+        private void RecomputeGroups()
+        {
+            List<HashSet<uint>> newGroups = EngineClusterUtils.GroupEnginePartsStructurally(vessel, clusterDistanceThreshold, false);
 
             // snapshot count before the loop, trackedGroups grows inside it
             int originalGroupCount = trackedGroups.Count;
@@ -1334,26 +476,14 @@ namespace RaymarchedPlumeTrails
 
             foreach (HashSet<uint> newPartIds in newGroups)
             {
-                int bestIndex = -1;
-                int bestOverlap = 0;
-
+                int bestIndex = -1, bestOverlap = 0;
                 for (int i = 0; i < originalGroupCount; i++)
                 {
                     if (claimed[i]) continue;
-
                     int overlap = 0;
-                    foreach (uint id in newPartIds)
-                    {
-                        if (trackedGroups[i].partIds.Contains(id)) overlap++;
-                    }
-
-                    if (overlap > bestOverlap)
-                    {
-                        bestOverlap = overlap;
-                        bestIndex = i;
-                    }
+                    foreach (uint id in newPartIds) if (trackedGroups[i].partIds.Contains(id)) overlap++;
+                    if (overlap > bestOverlap) { bestOverlap = overlap; bestIndex = i; }
                 }
-
                 if (bestIndex >= 0)
                 {
                     trackedGroups[bestIndex].partIds = newPartIds;
@@ -1361,69 +491,14 @@ namespace RaymarchedPlumeTrails
                 }
                 else
                 {
-                    TrackedGroup g = new TrackedGroup
-                    {
-                        id = nextGroupId++,
-                        partIds = newPartIds
-                    };
-
-                    GameObject smokeObj = new GameObject("SmokeBillboardGroup_" + g.id);
-                    g.smokeMesh = smokeObj.AddComponent<SmokeVolumeGroup>();
-
-                    float sizeFactor = EngineClusterUtils.ClusterSizeFactor(newPartIds.Count);
-
-                    g.smokeMesh.Initialize(
-                        SmokeTuning.StartSize,
-                        SmokeTuning.MaxPuffSize,
-                        SmokeTuning.GrowthSharpness,
-                        SmokeTuning.GrowthTime,
-                        lifeTime,
-                        maxPuffsPerGroup,
-                        buoyancySpeed,
-                        windDrift,
-                        vessel.mainBody,
-                        fadeStartAltitude,
-                        fadeEndAltitude);
-
+                    TrackedGroup g = new TrackedGroup { id = nextGroupId++, partIds = newPartIds };
                     trackedGroups.Add(g);
-
-                    if (SmokeTuning.DebugLogging)
-                    {
-                        Debug.Log(string.Format(
-                            "[PlumeTrails] new engine group id={0} with {1} parts",
-                            g.id, newPartIds.Count));
-                    }
+                    if (SmokeTuning.DebugLogging) Debug.Log(string.Format("[PlumeTrails] new engine group id={0} with {1} parts", g.id, newPartIds.Count));
                 }
             }
-
+            // a group whose parts left the vessel (staging) has no motor to taper: it is dropped by FixedUpdate and its chain ends
             for (int i = 0; i < originalGroupCount; i++)
-            {
-                if (!claimed[i])
-                {
-                    trackedGroups[i].partIds = new HashSet<uint>();
-                }
-            }
-        }
-
-        // Smoke outlives the thing that made it.
-        //
-        // Destroying the volumes here killed the trail the instant its vessel went away -
-        // most visibly when a booster explodes, taking a perfectly good kilometres-long
-        // trail with it. The puffs already expire on their own timer, so handing the
-        // volume over and letting it finish is both simpler and correct: it fades exactly
-        // as it would have.
-        private void ReleaseOrphanedTrails()
-        {
-            foreach (TrackedGroup g in trackedGroups)
-            {
-                if (g.smokeMesh != null) g.smokeMesh.Orphan();
-            }
-            trackedGroups.Clear();
-        }
-
-        private void OnDestroy()
-        {
-            ReleaseOrphanedTrails();
+                if (!claimed[i]) trackedGroups[i].partIds = new HashSet<uint>();
         }
     }
 }

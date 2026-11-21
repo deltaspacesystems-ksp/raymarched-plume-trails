@@ -343,7 +343,7 @@ Shader "RaymarchedPlumeTrails/TrailCapsules"
 
                 int iters = 0, denseN = 0;
                 [loop]
-                for (int k = 0; k < 400; k++)
+                for (int k = 0; k < 500; k++)
                 {
                     if (tt >= tmax || T < 0.02) break;
                     iters++;
@@ -358,14 +358,14 @@ Shader "RaymarchedPlumeTrails/TrailCapsules"
                         // In the eroded shell of a capsule the shape is 0 but the point is INSIDE the capsule (gap 0): a normal step there - the jump by the distance
                         // to the other bounds went straight through the smoke (cuts and holes at every joint of the capsules)
                         // (inside a capsule: never shorter than what still reaches the end of the ray with the steps left - see below)
-                        ds = gap > 0.0 ? clamp(gap * 0.85, 0.4, 400.0) : max(clamp(0.09 * rad + tt * 0.0015, 0.25, 60.0), (tmax - tt) / float(400 - k));
+                        ds = gap > 0.0 ? clamp(gap * 0.85, 0.4, 400.0) : max(clamp(0.09 * rad + tt * 0.0015, 0.25, 60.0), min((tmax - tt) / float(500 - k), 25.0));
                         tt += ds;
                         continue;
                     }
                     // the step follows the radius, but never shorter than what still reaches the end of the ray with the steps left: a ray along the axis of the
                     // trail (camera above the rocket, looking down) went through the thin jet at the nozzle in steps of a fraction of a metre and ran out of
                     // steps there - the rest of the column was missing until the camera moved a little
-                    ds = max(clamp(0.09 * rad + tt * 0.0015, 0.25, 60.0), (tmax - tt) / float(400 - k));
+                    ds = max(clamp(0.09 * rad + tt * 0.0015, 0.25, 60.0), min((tmax - tt) / float(500 - k), 25.0));
                     if (den > 0.0005)
                     {
                         denseN++;
@@ -421,7 +421,7 @@ Shader "RaymarchedPlumeTrails/TrailCapsules"
                             skyAmb = lerp(float3(skyL, skyL, skyL), skyAmb, 0.6);
                             // the clouds of EVE above the smoke: the sun through them (the sky light dims a little under a cloud deck too)
                             float cloudT = EveCloudLight(mul(transpose(R), p) + _TrAnchorW.xyz, normalize(mul(transpose(R), sunL)));
-                            lit = _TrSunRaw.rgb * (sc * _TrKsa.y * day * cloudT) + skyAmb * (BeerMS(prof * 3.0) * _TrKsa.z * lerp(0.6, 1.0, cloudT));
+                            lit = _TrSunRaw.rgb * (sc * _TrKsa.y * day * cloudT) + skyAmb * (BeerMS(prof * 3.0) * _TrKsa.z * lerp(0.15, 1.0, cloudT));
                         }
                         lit *= _TrTint.rgb;
                         litCache = lit; dlCache = dl;

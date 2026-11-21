@@ -67,9 +67,8 @@ namespace RaymarchedPlumeTrails
         // liquid engines too, without reopening the ascent trail to them.
         private static bool Emits(EnginePlumeProfile prof, bool forceAllEngines)
         {
-            if (forceAllEngines || !SmokeTuning.SrbOnly) return true;
-            if (prof.IsSolid) return true;
-            return SmokeTuning.LiquidPlumes && prof.enabled;
+            // every engine is sampled (heat haze, the flame light); whether it leaves a TRAIL is decided per engine by SmokeTuning.TrailDensity (trail only from solid boosters)
+            return true;
         }
 
         // Thrust-weighted look of a group from its engines' profiles: size / density multipliers for the liquid
@@ -178,24 +177,18 @@ namespace RaymarchedPlumeTrails
             return maxThrust;
         }
 
-        // The launch pad phase: the vehicle is on the pad or just off it. The exhaust of every engine meets the pad then, and a hydrolox engine's (hot
-        // steam, cooled and condensed by the deluge) makes a cloud like any other; in flight only the solids / the liquid engines with a plume profile emit.
-        private static bool PadPhase(Vessel vessel)
-        {
-            return SmokeTuning.PadAllEngines && vessel != null && vessel.mainBody != null && vessel.mainBody.atmosphere && vessel.radarAltitude < 250.0 && vessel.srfSpeed < 150.0;
-        }
-
         public static List<EngineSample> GatherEngineSamples(Vessel vessel, bool forceAllEngines = false)
         {
-            if (!forceAllEngines && PadPhase(vessel)) forceAllEngines = true;
             List<EngineSample> samples = new List<EngineSample>();
             VesselEngines c = EnginesOf(vessel);
-            float maxThrust = 0f;
+            // verniers below a fraction of the strongest engine are ignored - of the strongest engine of the SAME KIND: side boosters are small next to a liquid core,
+            // and compared with it they were dropped as verniers, so a rocket with strong liquid engines and solid boosters left no trail from the boosters
+            float[] maxByKind = new float[8];
             for (int i = 0; i < c.engines.Count; i++)
             {
-                if (c.engines[i].maxThrust > maxThrust) maxThrust = c.engines[i].maxThrust;
+                int k = (int)c.profiles[i].kind;
+                if (k >= 0 && k < maxByKind.Length && c.engines[i].maxThrust > maxByKind[k]) maxByKind[k] = c.engines[i].maxThrust;
             }
-            float minThrust = maxThrust * RelativeThrustThreshold;
 
             if (c.fLen.Length != c.engines.Count)
             {
@@ -207,7 +200,10 @@ namespace RaymarchedPlumeTrails
                 Part part = c.parts[ei];
                 if (!engine.EngineIgnited || engine.flameout) continue;
                 if (engine.currentThrottle <= 0.001f) continue;
-                if (engine.maxThrust < minThrust) continue;
+                // a burnt-out motor that was staged away: its throttle still reads 1 (a solid motor has no throttle) but it delivers no thrust, so it emits nothing
+                if (engine.finalThrust <= 0.002f * Mathf.Max(engine.maxThrust, 0.001f)) continue;
+                int kindIdx = (int)c.profiles[ei].kind;
+                if (kindIdx >= 0 && kindIdx < maxByKind.Length && engine.maxThrust < maxByKind[kindIdx] * RelativeThrustThreshold) continue;
                 EnginePlumeProfile prof = c.profiles[ei];
                 if (!Emits(prof, forceAllEngines)) continue;
                 bool liquidLook = SmokeTuning.SrbOnly && SmokeTuning.LiquidPlumes && !prof.IsSolid;
@@ -432,7 +428,6 @@ namespace RaymarchedPlumeTrails
 
         public static List<EnginePartInfo> GatherAllEngineParts(Vessel vessel, bool forceAllEngines = false)
         {
-            if (!forceAllEngines && PadPhase(vessel)) forceAllEngines = true;
             List<EnginePartInfo> result = new List<EnginePartInfo>();
             float minThrust = GetVesselMaxEngineThrust(vessel) * RelativeThrustThreshold;
             VesselEngines c = EnginesOf(vessel);

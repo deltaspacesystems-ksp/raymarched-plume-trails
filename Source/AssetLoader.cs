@@ -3,21 +3,13 @@ using UnityEngine;
 
 namespace RaymarchedPlumeTrails
 {
-    // static shader cache, read by SmokeVolumeGroup since Shader.Find won't find a
+    // static shader cache: Shader.Find won't find a
     // custom shader until the asset bundle loads
     public static class ShaderCache
     {
-        public static Shader SmokeVolumeShader;
         public static Shader SmokeCompositeShader;
         public static Shader HeatHazeShader;
         public static Shader PlumeCoreShader;
-        public static Shader PadFluidShader;
-        public static Shader PadHeightShader;
-        public static Shader PadLayerShader;
-        public static Shader ShockLensShader;
-        public static Shader DebrisShader;
-        public static ComputeShader PadFluidCompute;
-        public static ComputeShader BlastFluidCompute;
         public static ComputeShader SmokeVolumeSplatCompute;
         public static RenderTexture NoiseTexture;
         public static RenderTexture WorleyTexture;          // the noise of the new trail (inverted worley fbm)
@@ -33,7 +25,6 @@ namespace RaymarchedPlumeTrails
         // the UI appears while the bundle lookup goes nowhere - "installed, UI works,
         // nothing renders". ResolveBundlePath derives the folder from the assembly.
         private const string BundleRelativePath = "RaymarchedPlumeTrails/Bundles/" + BundleFileName;
-        private const string SmokeVolumeMaterialAssetName = "SmokeVolumeMat";
         private const string SmokeVolumeSplatComputeAssetName = "SmokeVolumeSplat";
         private const string SmokeCompositeShaderAssetName = "SmokeComposite";
 
@@ -77,8 +68,10 @@ namespace RaymarchedPlumeTrails
 
         private static bool assetsLoaded;
 
+        private static bool sceneHooked;
         private void Awake()
         {
+            if (!sceneHooked) { sceneHooked = true; CapsuleTrail.HookSceneChange(); }
             SmokeTuningConfig.Load();
             if (!ModSettings.Enabled) { Debug.Log("[PlumeTrails] switched off: no assets are loaded, nothing hooks into the game (switch it on in the settings window: the assets are loaded then)"); return; }
             LoadAssets();
@@ -132,8 +125,6 @@ namespace RaymarchedPlumeTrails
                 return;
             }
 
-            LoadShaderFromMaterial(bundle, SmokeVolumeMaterialAssetName, ref ShaderCache.SmokeVolumeShader);
-
             // the composite shader has no material of its own, so it is loaded directly
             ShaderCache.SmokeCompositeShader = bundle.LoadAsset<Shader>(SmokeCompositeShaderAssetName);
             if (ShaderCache.SmokeCompositeShader == null)
@@ -145,20 +136,8 @@ namespace RaymarchedPlumeTrails
 ShaderCache.PlumeCoreShader = bundle.LoadAsset<Shader>("PlumeCore");
             if (ShaderCache.PlumeCoreShader == null)
                 Debug.LogWarning("[PlumeTrails] plume shader missing from the bundle (rebuild it) - no physical plumes");
-            ShaderCache.PadHeightShader = bundle.LoadAsset<Shader>("PadHeight");
-            ShaderCache.PadLayerShader = bundle.LoadAsset<Shader>("PadLayer");
-            ShaderCache.ShockLensShader = bundle.LoadAsset<Shader>("ShockLens");
-            ShaderCache.DebrisShader = bundle.LoadAsset<Shader>("BlastDebris");
-            if (ShaderCache.ShockLensShader == null || ShaderCache.DebrisShader == null) Debug.LogWarning("[PlumeTrails] shock lens / debris shader missing from the bundle (rebuild it)");
-            if (ShaderCache.PadLayerShader == null) Debug.LogWarning("[PlumeTrails] pad layer shader missing from the bundle (rebuild it) - the pad is a height map only");
             CapsuleTrail.TrailShader = bundle.LoadAsset<Shader>("TrailCapsules");
             if (CapsuleTrail.TrailShader == null) Debug.LogWarning("[PlumeTrails] capsule trail shader missing from the bundle (rebuild it)");
-            ShaderCache.PadFluidShader = bundle.LoadAsset<Shader>("PadFluid");
-            ShaderCache.PadFluidCompute = bundle.LoadAsset<ComputeShader>("PadFluid");
-            ShaderCache.BlastFluidCompute = bundle.LoadAsset<ComputeShader>("BlastFluid");
-            if (ShaderCache.BlastFluidCompute == null) Debug.LogWarning("[PlumeTrails] blast fluid compute missing from the bundle (rebuild it) - explosions use the blob model");
-            if (ShaderCache.PadFluidShader == null || ShaderCache.PadFluidCompute == null)
-                Debug.LogWarning("[PlumeTrails] pad fluid shader / compute missing from the bundle (rebuild it) - no GPU pad cloud");
             ShaderCache.HeatHazeShader = bundle.LoadAsset<Shader>("HeatHaze");
             if (ShaderCache.HeatHazeShader == null)
                 Debug.LogWarning("[PlumeTrails] heat haze shader missing from the bundle (rebuild it) - no heat haze");

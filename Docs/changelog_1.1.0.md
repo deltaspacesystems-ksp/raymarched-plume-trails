@@ -1,0 +1,24 @@
+# 1.1.0
+
+- Every engine far from the others (side boosters) leaves its own trail from its own nozzle, not one from the middle of the rocket.
+- Trail only from solid boosters by default; a switch in the window makes every engine leave it.
+- All smoke is cleared on Revert Flight and when leaving to the Space Center.
+- The smoke is drawn before the cloud layers, so EVE clouds cover it (from below the clouds the volumetric ones still do not).
+- Darker smoke with less contrast between the lit and the shaded side; the sky light dims under EVE clouds.
+- Fix: edges of the smoke at the coast / ocean (depth-aware upsample).
+- Removed: volumetric explosions and the launch-pad effects (GPU pad cloud, surface mode, shock wave, deluge) are gone from the mod.
+- Window cleaned: no legacy trail, legacy tabs, explosions or pad options (the last two come back as a separate mod). Avalanche Plumes: SolidSmoke motors count as solid, their particle smoke is hidden under our trail.
+- Engine light is physical: the luminous power comes from the jet power (thrust, Isp) and the share of it that glows for the propellant, with inverse-square range, instead of a hand-tuned curve.
+- With Waterfall the scene light of an engine follows Waterfall's own flame light (intensity, range, colour as its curves drive it); without Waterfall the physical estimate is used.
+- Smoke appears at ignition: a rocket standing on the pad now lays smoke every 0.4 s instead of waiting until it moves.
+- Engines 0.8 m or more apart each leave their own trail, also in the first seconds near the ground.
+- The smoke is drawn after the transparent queue again (both 'over the clouds' options off by default): it looked best in testing.
+- Cast shadow of the smoke on the ground: 48 steps by default (the shadow works with it).
+- Fix: a Waterfall flame no longer stays invisible after the physical plume of that engine stops being drawn (out of range, over the budget, staged away) or after the physical plumes are switched off.
+- Fix: a burnt-out booster that was staged away no longer starts to smoke again (an engine with no thrust emits nothing).
+- Fix: boosters were ignored as 'verniers' when a much stronger liquid engine sat on the same rocket (their thrust was compared with the strongest engine of the vessel): the threshold is now per engine type. A log line every 5 s says what the emitter does.
+- The log says what the trail does every 5 s ('[PlumeTrails] trail:' nodes, segments, size and distance of its box).
+- Our scene light no longer touches Waterfall's own flame lights by default (setting WaterfallLight, off).
+- The ModuleManager patch that stripped Avalanche's SmokeScreen smoke from solid motors is gone (it applied at load whatever the switch said): the smoke is hidden at run time instead, only while the trail is on. Nothing in the mod touches a part config any more except the optional engines.cfg.
+- Physical plumes: no longer absurdly wide (a 1 m nozzle gave a 34 m wide plume) and less black (soot x0.45); Width and Soot sliders in Effects.
+- Physical plumes take the size and the colours (start / end tint) of the Waterfall flame of the engine from its config, when the engine has one (switch in Effects).

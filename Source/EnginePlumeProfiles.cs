@@ -236,6 +236,10 @@ namespace RaymarchedPlumeTrails
         {
             EnginePlumeProfile p = new EnginePlumeProfile();
             if (EngineClusterUtils.IsSolidRocket(engine)) { p.kind = PlumeKind.Solid; return p; }
+            // Avalanche Plumes (and RealPlume-style packs) name the smoke effect of a motor they consider a solid one: believe them, whatever the propellants say
+            ModuleEnginesFX fxEngine = engine as ModuleEnginesFX;
+            if (fxEngine != null && !string.IsNullOrEmpty(fxEngine.powerEffectName) && fxEngine.powerEffectName.IndexOf("SolidSmoke", StringComparison.OrdinalIgnoreCase) >= 0)
+            { ModCompat.NoteAvalanche(); p.kind = PlumeKind.Solid; return p; }
 
             bool hydrogen = false, methane = false, lf = false, ox = false, air = false, mono = false, other = false;
             if (engine != null && engine.propellants != null)

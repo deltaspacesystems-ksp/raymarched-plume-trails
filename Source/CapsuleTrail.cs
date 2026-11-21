@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using UnityEngine;
 
 namespace RaymarchedPlumeTrails
@@ -65,7 +65,7 @@ namespace RaymarchedPlumeTrails
             return 1f - Mathf.SmoothStep(0f, 1f, Mathf.Clamp01((alt - (end - len)) / len));
         }
 
-        public void Push(int emitterId, CelestialBody b, Vector3 world, float radius, float density, bool newChain)
+        public void Push(int emitterId, CelestialBody b, Vector3 world, float radius, float density, bool newChain, float startRadius = -1f)
         {
             if (b == null) return;
             float altFade = AltitudeFade(b, world);
@@ -90,9 +90,10 @@ namespace RaymarchedPlumeTrails
                 Node last = nodes[nodes.Count - 1];
                 // the nodes of one chain are appended in order; the last node of THIS chain decides whether it moved enough
                 for (int i = nodes.Count - 1; i >= 0 && i >= nodes.Count - 8; i--)
-                    if (nodes[i].chain == chain) { last = nodes[i]; if ((last.rel - rel).magnitude < Mathf.Max(0.45f * radius, 0.8f)) return; break; }
+                    if (nodes[i].chain == chain) { last = nodes[i]; if ((last.rel - rel).magnitude < Mathf.Max(0.45f * radius, 0.8f) && Time.time - last.t < 0.4f) return; break; }
+                // a standing emitter (a rocket held on the pad) still lays smoke every 0.4 s: it billows there instead of waiting for the rocket to move
             }
-            nodes.Add(new Node { rel = rel, r0 = StartRadius(radius), t = Time.time, dens = density, chain = chain });
+            nodes.Add(new Node { rel = rel, r0 = startRadius > 0f ? startRadius : StartRadius(radius), t = Time.time, dens = density, chain = chain });
             if (nodes.Count > MaxSegments - 8) Thin();
         }
 
@@ -109,7 +110,12 @@ namespace RaymarchedPlumeTrails
             nodes.Clear(); nodes.AddRange(keep);
         }
 
-        public void EndChain(int emitterId) { int c; if (chainOf.TryGetValue(emitterId, out c)) heads.Remove(c); chainOf.Remove(emitterId); }
+        public void EndChain(int emitterId)
+        {
+            for (int si = 1; si < 16; si++) EndOne(emitterId + si * 100003);
+            EndOne(emitterId);
+        }
+        private void EndOne(int emitterId) { int c; if (chainOf.TryGetValue(emitterId, out c)) heads.Remove(c); chainOf.Remove(emitterId); }
 
         // the head of the emitter's chain this frame (after Push): the points of the jet from the nozzle (pts[0]) to the emission point (pts[n - 1]), world space,
         // the radius at the nozzle, and the colour of the glow of the hot exhaust
@@ -135,6 +141,8 @@ namespace RaymarchedPlumeTrails
         private static float Heat(float f) { return Mathf.Pow(Mathf.Clamp01(1f - f / 0.7f), 1.3f); }
 
         public static float StartRadius(float radius) { return Mathf.Max(radius * 3.5f, 5f); }
+
+        public static void HookSceneChange() { GameEvents.onGameSceneLoadRequested.Add(s => { if (instance != null) instance.Clear(); }); }
 
         public void Clear()
         {
@@ -398,7 +406,16 @@ namespace RaymarchedPlumeTrails
             mb.SetColor("_TrTint", Color.white);
             mr.SetPropertyBlock(mb);
             SmokeRenderRegistry.SetActive(mr, true);
+            if (now >= diagStamp)
+            {
+                // a line in the log every 5 s while a trail exists: a report that says "no smoke" can then be told apart (no nodes? nothing registered? the box far away?)
+                diagStamp = now + 5f;
+                Camera dc = Camera.main;
+                Debug.Log(string.Format("[PlumeTrails] trail: {0} nodes, {1} segments, box {2:F0} m wide at {3:F0} m from the camera, registered={4}, density k={5:F1}",
+                    n, ns, go.transform.localScale.x, dc != null ? Vector3.Distance(dc.transform.position, ctrW) : -1f, SmokeRenderRegistry.Active.Contains(mr), SmokeTuning.NewTrailDensityK));
+            }
         }
+        private float diagStamp;
 
         private static Color Neutral(Color c, float keep)
         {

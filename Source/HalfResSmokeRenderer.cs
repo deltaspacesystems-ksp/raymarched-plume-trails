@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
 
@@ -511,6 +511,11 @@ namespace RaymarchedPlumeTrails
                 cb = new CommandBuffer { name = "RaymarchedPlumeTrails cast shadow" };
                 cam.AddCommandBuffer(ShadowStage, cb);
                 shadowBuffers[cam] = cb;
+                // same event as the smoke (smoke before clouds): the buffers run in the order they were added, and the multiply must come FIRST,
+                // or it darkens the smoke itself - so the smoke buffer goes behind it
+                CommandBuffer sm; CameraEvent se;
+                if (buffers.TryGetValue(cam, out sm) && bufferStage.TryGetValue(cam, out se) && se == ShadowStage)
+                { cam.RemoveCommandBuffer(se, sm); cam.AddCommandBuffer(se, sm); }
             }
 
             cb.Clear();
@@ -616,10 +621,6 @@ namespace RaymarchedPlumeTrails
             if (compositeMaterial == null) return;
             Shader.SetGlobalFloat("_PlumeOpacity", Mathf.Clamp01(SmokeTuning.Opacity));
             Shader.SetGlobalFloat("_SmokeAerialK", AerialK());
-            // Volumes are uploaded here, after every group has ticked, so trails that have
-            // grown together can be drawn as one.
-            SmokeVolumeGroup.RenderAll();
-            PlumeExplosions.RenderAll();
             SmokeQuality.Tick(SmokeRenderRegistry.Active.Count > 0);
             UpdateSunDirection();
 

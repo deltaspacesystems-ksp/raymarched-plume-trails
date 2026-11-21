@@ -1,0 +1,11 @@
+obj/
+Snapshots/
+Releases/
+graphify-out/
+old/
+Docs/odzyskane/
+*.user
+# secrets: never committed
+Tools/spacedock.ini
+Tools/discord_webhook.txt
+GameData/**/PluginData/

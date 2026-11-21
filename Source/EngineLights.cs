@@ -45,6 +45,7 @@ namespace RaymarchedPlumeTrails
 
         private void LateUpdate()
         {
+            if (!SmokeTuning.EngineLights || !SmokeTuning.WaterfallLight || !ModSettings.Enabled) WaterfallBridge.RestoreLights();
             float now = Time.time;
             dead.Clear();
             foreach (KeyValuePair<int, Entry> kv in entries)
