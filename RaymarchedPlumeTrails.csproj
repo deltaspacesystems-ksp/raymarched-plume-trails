@@ -6,22 +6,13 @@
     <RootNamespace>RaymarchedPlumeTrails</RootNamespace>
     <LangVersion>latest</LangVersion>
     <Nullable>disable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <OutputPath>bin\</OutputPath>
-    <Version>1.1.0</Version>
+    <Version>1.1.0-beta.1</Version>
     <AssemblyVersion>1.1.0.0</AssemblyVersion>
     <FileVersion>1.1.0.0</FileVersion>
-    <AssemblyTitle>Raymarched Plume Trails</AssemblyTitle>
-    <Product>Raymarched Plume Trails</Product>
-    <Company>xyzcnc</Company>
-    <Authors>xyzcnc</Authors>
-    <Copyright>Copyright (c) 2026 xyzcnc</Copyright>
-    <Description>Volumetric raymarched rocket smoke trails and exhaust plumes for Kerbal Space Program 1.12.x. Author: xyzcnc. License: CC BY-NC-SA 4.0. Source: https://github.com/deltaspacesystems-ksp/raymarched-plume-trails. Optional integrations (reflection only, nothing is required): Waterfall, Avalanche Plumes, Scatterer, EVE, FAR. Needs the matching asset bundle in GameData/RaymarchedPlumeTrails/Bundles.</Description>
-    <Deterministic>false</Deterministic>
-    <BuildDate>$([System.DateTime]::UtcNow.ToString('yyyy-MM-dd HH:mm'))</BuildDate>
-    <InformationalVersion>$(Version)+build $(BuildDate) UTC</InformationalVersion>
-    <RepositoryUrl>https://github.com/deltaspacesystems-ksp/raymarched-plume-trails</RepositoryUrl>
 
     <!-- Path to your KSP install's Managed folder, which holds Assembly-CSharp.dll and
          the UnityEngine assemblies this plugin compiles against. Those DLLs ship with
@@ -33,13 +24,7 @@
          or via a git-ignored Directory.Build.props next to this file:
            <Project><PropertyGroup>
              <KSPManagedDir>C:\Path\To\KSP\KSP_x64_Data\Managed</KSPManagedDir>
-           </PropertyGroup>  <ItemGroup>
-    <AssemblyMetadata Include="BuildDate" Value="$(BuildDate) UTC" />
-    <AssemblyMetadata Include="KSPVersion" Value="1.12.5" />
-    <AssemblyMetadata Include="License" Value="CC BY-NC-SA 4.0" />
-  </ItemGroup>
-
-</Project> -->
+           </PropertyGroup></Project> -->
     <KSPManagedDir Condition="'$(KSPManagedDir)' == ''">D:\ksp for mod testing\KSP_x64_Data\Managed</KSPManagedDir>
 
     <!-- Optional: point at a GameData/RaymarchedPlumeTrails/Plugins folder to deploy every
@@ -49,13 +34,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Remove="UnityEditorScripts\**\*.cs" />
-    <Compile Remove="old\**\*.cs" />
-    <Compile Remove="StockSmokeEnhancer\**\*.cs" />
-    <!-- offline test harnesses -->
-    <Compile Remove="Tools\**\*.cs" />
-    <!-- kept for reference/rollback only, never built -->
-    <Compile Remove="Snapshots\**\*.cs" />
+    <Compile Include="Source\**\*.cs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -124,3 +103,4 @@
   </Target>
 
 </Project>
+

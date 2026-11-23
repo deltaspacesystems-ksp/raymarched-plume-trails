@@ -1,5 +1,6 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 using System.IO;
+using System.Reflection;
 using UnityEngine;
 using KSP.UI.Screens;
 
@@ -15,7 +16,8 @@ namespace RaymarchedPlumeTrails
         // their original names on purpose - renaming those breaks existing installs.
         public const string DisplayName = "Raymarched Plume Trails";
         // from the assembly (the csproj <Version>), so the window cannot show a different number than the build
-        public static readonly string Version = typeof(ModSettings).Assembly.GetName().Version.ToString(3);
+        public static readonly string Version = typeof(ModSettings).Assembly
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>().InformationalVersion.Split('+')[0];
     }
 
     // toolbar button + tiny window to flip ModSettings.Enabled during flight
@@ -212,8 +214,8 @@ namespace RaymarchedPlumeTrails
         //  switch (and in Advanced the search box and the tab bar); in Advanced the sections of the tab on the left as
         //  plain buttons that scroll to them; the controls in a scroll view; a corner box to resize.
         // ------------------------------------------------------------------------------------------------------------
-        private static readonly string[] TabNames = { "General", "Engines", "Physics", "Legacy shape", "Legacy light", "Effects", "Explosions", "Extras", "Trail" };
-        private static readonly int[] TabOrder = { 0, 8, 1, 2, 5, 7 };      // the order on the tab bar
+        private static readonly string[] TabNames = { "General", "Engines", "Effects", "Trail" };
+        private static readonly int[] TabOrder = { 0, 3, 1, 2 };      // the order on the tab bar
         private static string[] tabLabels;
         private static readonly string[] ModeNames = { "Simple", "Advanced" };
         // the window opens in the SIMPLE view (the switches a player wants); every slider is behind "Advanced"
@@ -237,11 +239,8 @@ namespace RaymarchedPlumeTrails
             curTab = tabIndex; curSec = name; secDrawn = false;
         }
 
-        private static readonly string[] RemovedSections = { "Explosions", "Pad fluid (GPU)", "Pad cloud", "Pad flow rays (experimental)", "Deflector & water", "Steam" };
-
         private static bool Vis(string label)
         {
-            if (curTab == 3 || curTab == 4 || curTab == 6 || System.Array.IndexOf(RemovedSections, curSec) >= 0) return false;      // legacy renderer tabs and the explosions are gone from the window
             bool searching = search.Length > 0;
             if (searching)
             {
@@ -472,13 +471,13 @@ namespace RaymarchedPlumeTrails
                 SmokeTuning.NewTrailRoot = STog(SmokeTuning.NewTrailRoot, "Grows out of the flame", "The exhaust leaves along the nozzle and curls into the track of a turning rocket.");
                 SmokeTuning.NewTrailDensityK = SSlider("Density of the smoke", SmokeTuning.NewTrailDensityK, 1f, 30f, "F1");
                 SmokeTuning.NewTrailGlow = SSlider("Glow of the hot exhaust", SmokeTuning.NewTrailGlow, 0f, 4f, "F2");
-                SmokeTuning.NewTrailMaxRadius = SSlider("Width of old smoke (m)", SmokeTuning.NewTrailMaxRadius, 20f, 200f, "F0");
+                SmokeTuning.NewTrailMaxRadius = SSlider("Old smoke radius cap (m)", SmokeTuning.NewTrailMaxRadius, 2f, 200f, "F0");
                 SmokeTuning.NewTrailLife = SSlider("Lifetime (s)", SmokeTuning.NewTrailLife, 30f, 900f, "F0");
-                SmokeTuning.TrailOnlySolid = STog(SmokeTuning.TrailOnlySolid, "Trail only from solid boosters (off: every engine leaves it)", null);
                 SmokeTuning.NewTrailEndAltitude = SSlider("Trail ends at altitude (km, 0 = no limit)", SmokeTuning.NewTrailEndAltitude, 0f, 100f, "F0");
                 SmokeTuning.NewTrailShadow = STog(SmokeTuning.NewTrailShadow, "Casts a shadow on the ground", null);
                 SmokeTuning.HideStockSmoke = STog(SmokeTuning.HideStockSmoke, "Hide the engines' own particle smoke", "Engine parts often bring a particle smoke of their own; it would hang between the flame and the trail.");
             }
+            SmokeTuning.SrbOnly = STog(SmokeTuning.SrbOnly, "Solid motors only", "Limit trails to solid motors. Turn off to also show enabled liquid fuel profiles.");
 
             Head("Engines");
             SmokeTuning.HeatHaze = STog(SmokeTuning.HeatHaze, "Heat haze", "The air over the nozzle shimmers.");
@@ -493,7 +492,7 @@ namespace RaymarchedPlumeTrails
             GUILayout.FlexibleSpace();
             if (changed > 0 && GUILayout.Button("Reset to defaults")) SmokeTuningConfig.ResetToDefaults();
             GUILayout.EndHorizontal();
-            Desc("Every slider, the legacy renderer and the debug tools are under Advanced.");
+            Desc("Trail, engine and rendering controls are under Advanced.");
         }
 
         private void DrawControls()
@@ -520,28 +519,28 @@ namespace RaymarchedPlumeTrails
             SmokeTuning.TemporalFeedback = Slider("Temporal feedback", SmokeTuning.TemporalFeedback, 0.5f, 0.97f);
             if (Btn("  Smoothest look (low grain: smooth density, little jitter, long temporal average)"))
             {
-                SmokeTuning.GrainStrength = 0.15f; SmokeTuning.GrainScale = 0.35f; SmokeTuning.FineDetail = 0.2f;
-                SmokeTuning.LightJitter = 0.15f; SmokeTuning.TemporalFeedback = 0.95f;
             }
 
             Sec(0, "Config & debug");
             SmokeTuning.DebugLogging = Tog(SmokeTuning.DebugLogging, " Verbose log");
-            SmokeTuning.DebugBox = Tog(SmokeTuning.DebugBox, " Debug: show march box (purple) / ran-out rays (red)");
             SmokeTuning.ShadowCastDebug = Slider("Cast shadow debug", SmokeTuning.ShadowCastDebug, 0f, 5f);
             if (Btn("Print values to log")) PrintValues();
             if (Btn("Save settings now (they are also saved when the window closes)")) SmokeTuningConfig.Save();
             if (Btn("Reset ALL to defaults (deletes tuning.cfg)")) SmokeTuningConfig.ResetToDefaults();
 
             // ======================================================================= Trail
-            Sec(8, "Trail");
+            Sec(3, "Trail");
             SmokeTuning.NewTrail = Tog(SmokeTuning.NewTrail, " Volumetric trail");
+            if (Vis("Trail runtime status")) GUILayout.Label(CapsuleTrail.Instance.DiagnosticSummary());
+            if (Btn("Print trail diagnostics to KSP.log")) CapsuleTrail.Instance.LogDiagnostics();
             SmokeTuning.HideStockSmoke = Tog(SmokeTuning.HideStockSmoke, " Hide the engines' own particle smoke while the trail is on");
-            Sec(8, "Look of the trail");
+            Sec(3, "Look of the trail");
+            SmokeTuning.TrailAdaptiveSampling = Tog(SmokeTuning.TrailAdaptiveSampling, " Adaptive trail sampling");
+            SmokeTuning.TrailDebugMode = Mathf.RoundToInt(Slider("Diagnostic (0 normal, 1 budget, 2 bounds off, 3 light, 4 shadow, 5 cost)", SmokeTuning.TrailDebugMode, 0f, 5f));
             {
-                SmokeTuning.NewTrailMaxRadius = Slider("  end radius (m)", SmokeTuning.NewTrailMaxRadius, 10f, 300f);
+                SmokeTuning.NewTrailMaxRadius = Slider("  expansion radius cap (m)", SmokeTuning.NewTrailMaxRadius, 2f, 300f);
                 SmokeTuning.NewTrailGrowTau = Slider("  growth time (s)", SmokeTuning.NewTrailGrowTau, 2f, 200f);
                 SmokeTuning.NewTrailLife = Slider("  life (s)", SmokeTuning.NewTrailLife, 20f, 1200f);
-                SmokeTuning.TrailOnlySolid = Tog(SmokeTuning.TrailOnlySolid, " Trail only from solid boosters (off: every engine leaves it)");
                 SmokeTuning.NewTrailEndAltitude = Slider("  trail ends at altitude (km, 0 = no limit)", SmokeTuning.NewTrailEndAltitude, 0f, 100f);
                 SmokeTuning.NewTrailFadeLength = Slider("  thins out over (km below that)", SmokeTuning.NewTrailFadeLength, 1f, 50f);
                 if (Vis("trail by engine type"))
@@ -603,8 +602,9 @@ namespace RaymarchedPlumeTrails
                 SmokeTuning.NewTrailSun = Slider("  sun brightness", SmokeTuning.NewTrailSun, 0.5f, 12f);
                 SmokeTuning.NewTrailAmbient = Slider("  sky light", SmokeTuning.NewTrailAmbient, 0f, 2f);
                 SmokeTuning.NewTrailDarkEdge = Slider("  dark edge (1 = none)", SmokeTuning.NewTrailDarkEdge, 0.02f, 1f);
+                SmokeTuning.NewTrailDistanceContrastReduction = Slider("  Distant contrast reduction (0 = off)", SmokeTuning.NewTrailDistanceContrastReduction, 0f, 1f);
             }
-            Sec(8, "Shadow on the ground");
+            Sec(3, "Shadow on the ground");
             SmokeTuning.ShadowCastStrength = Slider("Cast shadow", SmokeTuning.ShadowCastStrength, 0f, 1f);
             SmokeTuning.ShadowIntoSunMask = Tog(SmokeTuning.ShadowIntoSunMask, "  experimental, deferred rendering: put the shadow in the sun's shadow mask instead (did not show in tests - leave off)");
             if (SmokeTuning.ShadowIntoSunMask) SmokeTuning.ShadowMaskFlip = Tog(SmokeTuning.ShadowMaskFlip, "    flip it upside down (only if the shadow lands mirrored)");
@@ -617,6 +617,7 @@ namespace RaymarchedPlumeTrails
             Sec(1, "Engines");
             // Takes effect for engine groups formed after the change - existing groups are only rebuilt when the
             // vessel's part count changes, e.g. at staging.
+            SmokeTuning.SrbOnly = Tog(SmokeTuning.SrbOnly, " Solid motors only");
             SmokeTuning.PhysicalJetBend = Tog(SmokeTuning.PhysicalJetBend, " Plume bends by the motion of the gas (curls into the track of a turning rocket)");
             SmokeTuning.LiquidPlumes = Tog(SmokeTuning.LiquidPlumes, " Plumes for liquid engines too");
             SmokeTuning.LiquidSizeScale = Slider("Liquid plume size", SmokeTuning.LiquidSizeScale, 0.05f, 1f);
@@ -634,140 +635,20 @@ namespace RaymarchedPlumeTrails
             Sec(1, "Waterfall");
             SmokeTuning.WaterfallIntegration = Tog(SmokeTuning.WaterfallIntegration, " Waterfall: smoke starts where the flame ends");
             SmokeTuning.WaterfallHandoff = Slider("  Smoke start (x flame length)", SmokeTuning.WaterfallHandoff, 0f, 1.5f);
-            SmokeTuning.WaterfallHazeLength = Slider("  Haze length (x flame length)", SmokeTuning.WaterfallHazeLength, 0.8f, 3f);
+            SmokeTuning.WaterfallStartWidth = Slider("  start width (x flame radius)", SmokeTuning.WaterfallStartWidth, 0.2f, 1.5f);
 
-            Sec(1, "Solid motor plume");
-            SmokeTuning.SrbTurnSmoothing = Slider("Turn smoothing (s)", SmokeTuning.SrbTurnSmoothing, 0.02f, 1.5f);
-            SmokeTuning.SrbCrossflowBend = Slider("Crossflow bend", SmokeTuning.SrbCrossflowBend, 0f, 6f);
-            SmokeTuning.SpawnInterval = Slider("Puff spawn interval (s)", SmokeTuning.SpawnInterval, 0.005f, 0.2f);
-            SmokeTuning.NozzleFactorEase = Slider("Nozzle size easing (s)", SmokeTuning.NozzleFactorEase, 0.2f, 12f);
-            SmokeTuning.StartSize = Slider("Start radius at nozzle (m)", SmokeTuning.StartSize, 0.2f, 12f);
-            SmokeTuning.SrbJetPhaseTime = Slider("Jet phase (s) - slow start", SmokeTuning.SrbJetPhaseTime, 0.1f, 15f);
-            SmokeTuning.SpeedBillowMin = Slider("Full size below speed (m/s)", SmokeTuning.SpeedBillowMin, 0f, 300f);
-            SmokeTuning.SpeedThinTrailMax = Slider("Thinnest trail at speed (m/s)", SmokeTuning.SpeedThinTrailMax, 50f, 2500f);
-            SmokeTuning.ThinTrailSizeMult = Slider("Size at that speed (x)", SmokeTuning.ThinTrailSizeMult, 0.1f, 2f);
-            SmokeTuning.SrbPostLimitGrowth = Slider("Growth past limit", SmokeTuning.SrbPostLimitGrowth, 0f, 1f);
-
-            Sec(1, "Landing cloud");
-            SmokeTuning.LandingCloudAltitude = Slider("Trigger altitude (m)", SmokeTuning.LandingCloudAltitude, 20f, 1000f);
-            SmokeTuning.LandingCloudSpreadSpeed = Slider("Splash outward speed (m/s)", SmokeTuning.LandingCloudSpreadSpeed, 10f, 250f);
-
-            // ======================================================================= Physics
-            Sec(2, "Real physics");
-            SmokeTuning.PhysicsMode = Tog(SmokeTuning.PhysicsMode, " Real physics: entrainment, buoyancy, wind, wall jet");
-            SmokeTuning.PhysExhaustTemp = Slider("Exhaust temperature (K)", SmokeTuning.PhysExhaustTemp, 800f, 3500f);
-            SmokeTuning.PhysRadiusScale = Slider("Puff visual size (x)", SmokeTuning.PhysRadiusScale, 0.2f, 3f);
-            SmokeTuning.PhysMaxDilution = Slider("Max jet dilution at release", SmokeTuning.PhysMaxDilution, 2f, 200f);
-
-            Sec(2, "Ground & pad");
-
-            Sec(3, "Puff shape");
-            SmokeTuning.MaxPuffSize = Slider("Puff size (m)", SmokeTuning.MaxPuffSize, 4f, 200f);
-            SmokeTuning.SpawnOffset = Slider("Spawn offset (m)", SmokeTuning.SpawnOffset, 2f, 150f);
-            SmokeTuning.SilhouetteWarpStrength = Slider("Warp (m)", SmokeTuning.SilhouetteWarpStrength, 0f, 40f);
-            SmokeTuning.SilhouetteWarpScale = Slider("Lobe size", SmokeTuning.SilhouetteWarpScale, 0.01f, 0.4f);
-            SmokeTuning.VortexStrength = Slider("Swirl (m)", SmokeTuning.VortexStrength, 0f, 25f);
-            SmokeTuning.VortexScale = Slider("Swirl scale", SmokeTuning.VortexScale, 0.01f, 0.6f);
-            SmokeTuning.ColumnWander = Slider("Column wander", SmokeTuning.ColumnWander, 0f, 0.6f);
-            SmokeTuning.NoiseAnimation = Slider("Surface churn", SmokeTuning.NoiseAnimation, 0f, 0.5f);
-            SmokeTuning.SpineBlend = Slider("Spine blend", SmokeTuning.SpineBlend, 0f, 0.5f);
-
-            Sec(3, "Noise & detail");
-            SmokeTuning.GradientNoise = Tog(SmokeTuning.GradientNoise, " Gradient (simplex-like) noise - applies at next start");
-            SmokeTuning.SilhouetteNoiseScale = Slider("Noise scale", SmokeTuning.SilhouetteNoiseScale, 0.02f, 0.5f);
-            SmokeTuning.AntiTile = Slider("Noise anti-tiling (0 = off)", SmokeTuning.AntiTile, 0f, 1f);
-            SmokeTuning.DetailStrength = Slider("Detail", SmokeTuning.DetailStrength, 0f, 1f);
-            SmokeTuning.DetailBias = Slider("Detail add-only", SmokeTuning.DetailBias, 0f, 1f);
-            SmokeTuning.SizeFreqTracking = Slider("Size-tracked freq", SmokeTuning.SizeFreqTracking, 0f, 1f);
-            SmokeTuning.FineDetail = Slider("Fine detail octave", SmokeTuning.FineDetail, 0f, 1f);
-            SmokeTuning.GrainStrength = Slider("Grain", SmokeTuning.GrainStrength, 0f, 1f);
-            SmokeTuning.GrainScale = Slider("Grain scale", SmokeTuning.GrainScale, 0.3f, 4f);
-            SmokeTuning.MacroStrength = Slider("Macro density", SmokeTuning.MacroStrength, 0f, 1f);
-            SmokeTuning.MacroNoiseScale = Slider("Macro scale", SmokeTuning.MacroNoiseScale, 0.002f, 0.08f);
-            SmokeTuning.LightJitter = Slider("Grain: light jitter", SmokeTuning.LightJitter, 0f, 1f);
-            SmokeTuning.MarchJitter = Slider("Grain: march jitter", SmokeTuning.MarchJitter, 0f, 1f);
-
-            Sec(3, "Edges & billows");
-            SmokeTuning.EdgeErosionStrength = Slider("Edge erosion", SmokeTuning.EdgeErosionStrength, 0f, 1f);
-            SmokeTuning.ErodeMix = Slider("Threshold erosion mix", SmokeTuning.ErodeMix, 0f, 1f);
-            SmokeTuning.ErodeDepth = Slider("Erosion depth", SmokeTuning.ErodeDepth, 0.05f, 1f);
-            SmokeTuning.ErodeSharp = Slider("Erosion edge sharpness", SmokeTuning.ErodeSharp, 0f, 0.95f);
-            SmokeTuning.ErodeBoost = Slider("Erosion profile boost", SmokeTuning.ErodeBoost, 0.8f, 2.5f);
-            SmokeTuning.EdgeProtrusion = Slider("Edge protrusion (lobes stand out)", SmokeTuning.EdgeProtrusion, 0f, 1f);
-            SmokeTuning.EdgeRoundLobes = Tog(SmokeTuning.EdgeRoundLobes, " Protrusion: round lobes instead of wisps");
-            SmokeTuning.EdgeWispStretch = Slider("  Wisp stretch (small = long streaks)", SmokeTuning.EdgeWispStretch, 0.05f, 1f);
-            SmokeTuning.EdgeSwirl = Slider("  Wisp swirl (twist)", SmokeTuning.EdgeSwirl, 0f, 4f);
-            SmokeTuning.LobeMix = Slider("Sphere lobes mix", SmokeTuning.LobeMix, 0f, 1f);
-            SmokeTuning.LobeCell = Slider("Sphere lobe cell (x radius)", SmokeTuning.LobeCell, 0.2f, 2f);
-            SmokeTuning.BillowMix = Slider("Billow mix (0 = old detail)", SmokeTuning.BillowMix, 0f, 1f);
-            SmokeTuning.BillowCell = Slider("Billow cell (x radius)", SmokeTuning.BillowCell, 0.2f, 3f);
-            SmokeTuning.BillowAmp = Slider("Billow amplitude (x radius)", SmokeTuning.BillowAmp, 0.02f, 0.6f);
-            SmokeTuning.BillowErode = Slider("Billow erosion (detached clumps)", SmokeTuning.BillowErode, 0f, 1f);
-            SmokeTuning.EdgeFeather = Slider("Edge feather", SmokeTuning.EdgeFeather, 1f, 3f);
-            SmokeTuning.ThinEdgeSoftness = Slider("Thin edge softness", SmokeTuning.ThinEdgeSoftness, 0.15f, 1f);
-            SmokeTuning.ThinDetailFade = Slider("Thin detail fade", SmokeTuning.ThinDetailFade, 0f, 1f);
-
-            // ======================================================================= Lighting
-            Sec(4, "Density");
-            SmokeTuning.Opacity = Slider("Opacity (transparency)", SmokeTuning.Opacity, 0f, 1f);
-            SmokeTuning.Density = Slider("Density", SmokeTuning.Density, 0.02f, 6f);
-            SmokeTuning.Absorption = Slider("Absorption", SmokeTuning.Absorption, 0.2f, 4f);
-
-            Sec(4, "Sun & self-shadow");
-            SmokeTuning.AmbientFloor = Slider("Ambient floor", SmokeTuning.AmbientFloor, 0f, 1f);
-            SmokeTuning.ShadowStrength = Slider("Self-shadow", SmokeTuning.ShadowStrength, 0f, 1f);
-            SmokeTuning.ShadowExtinction = Slider("Shadow softness", SmokeTuning.ShadowExtinction, 0.002f, 0.15f);
-            SmokeTuning.ShadowDarkness = Slider("Shadow darkness", SmokeTuning.ShadowDarkness, 0f, 1f);
-            SmokeTuning.LightReach = Slider("Light reach (m)", SmokeTuning.LightReach, 20f, 400f);
-            SmokeTuning.LightSizeScaling = Slider("Light reach grows w/ puff size", SmokeTuning.LightSizeScaling, 0f, 1f);
-            SmokeTuning.DetailShadeStrength = Slider("Detail self-shade", SmokeTuning.DetailShadeStrength, 0f, 3f);
-            SmokeTuning.NormalShade = Slider("Sun side / shade side (N.L)", SmokeTuning.NormalShade, 0f, 1.5f);
-            SmokeTuning.FacingShade = Slider("Facing shade (normal diffuse)", SmokeTuning.FacingShade, 0f, 1f);
-            SmokeTuning.SunlitBrightness = Slider("Lit brightness", SmokeTuning.SunlitBrightness, 0.5f, 1f);
-            SmokeTuning.NightAmbient = Slider("Night ambient", SmokeTuning.NightAmbient, 0f, 1f);
-            SmokeTuning.TerminatorSoftness = Slider("Terminator (m)", SmokeTuning.TerminatorSoftness, 100f, 20000f);
-
-            Sec(4, "Scattering");
-            SmokeTuning.UseMiePhase = Tog(SmokeTuning.UseMiePhase, " Mie phase (HG+Draine) - replaces the g sliders below");
-            SmokeTuning.MieParticleDiameter = Slider("Mie particle size (um)", SmokeTuning.MieParticleDiameter, 3f, 50f);
-            SmokeTuning.MieFloor = Slider("Mie multi-scatter floor", SmokeTuning.MieFloor, 0f, 1f);
-            SmokeTuning.ForwardScatterG = Slider("Fwd scatter (g)", SmokeTuning.ForwardScatterG, 0f, 0.99f);
-            SmokeTuning.ScatterIntensity = Slider("Scatter int.", SmokeTuning.ScatterIntensity, 0f, 5f);
-            SmokeTuning.MultiScatterG = Slider("Multi-scat g", SmokeTuning.MultiScatterG, 0f, 0.6f);
-            SmokeTuning.MultiScatterIntensity = Slider("Multi-scat int.", SmokeTuning.MultiScatterIntensity, 0f, 10f);
-            SmokeTuning.MSMix = Slider("Multi-scatter mix", SmokeTuning.MSMix, 0f, 1f);
-            SmokeTuning.PowderStrength = Slider("Powder", SmokeTuning.PowderStrength, 0f, 3f);
-            SmokeTuning.DarkEdge = Slider("Dark edge minimum", SmokeTuning.DarkEdge, 0f, 1f);
-            SmokeTuning.PhaseMax = Slider("Sun hotspot limit (0 = off)", SmokeTuning.PhaseMax, 0f, 3f);
-
-            Sec(4, "Sky & ambient");
-            SmokeTuning.ProfileAO = Tog(SmokeTuning.ProfileAO, " Profile ambient occlusion (cheaper)");
-            SmokeTuning.SkyOcclusionStrength = Slider("Sky occlusion", SmokeTuning.SkyOcclusionStrength, 0f, 1f);
-            SmokeTuning.SkyOcclusionDistance = Slider("Sky occl. dist (m)", SmokeTuning.SkyOcclusionDistance, 10f, 150f);
-            SmokeTuning.SkyTintStrength = Slider("Sky tint str.", SmokeTuning.SkyTintStrength, 0f, 1f);
-            SmokeTuning.SceneAmbientBlend = Slider("Scene ambient", SmokeTuning.SceneAmbientBlend, 0f, 1f);
-            SmokeTuning.AnalyticAmbient = Slider("Analytic sky ambient", SmokeTuning.AnalyticAmbient, 0f, 1f);
-            SmokeTuning.SkyTint = Slider("Sky tint", SmokeTuning.SkyTint, 0f, 1f);
-            SmokeTuning.GroundTint = Slider("Ground tint", SmokeTuning.GroundTint, 0f, 1f);
-            SmokeTuning.Washout = Slider("Washout", SmokeTuning.Washout, 0f, 1f);
-            SmokeTuning.WashoutDesaturate = Slider("Washout desat", SmokeTuning.WashoutDesaturate, 0f, 1f);
-
-            // ======================================================================= Effects
-            Sec(5, "Physical plumes");
+            Sec(2, "Physical plumes");
             SmokeTuning.PhysicalPlumes = Tog(SmokeTuning.PhysicalPlumes, " Physical plumes: shock diamonds, core and afterburning from the engine's own numbers");
-            SmokeTuning.PlumeFromWaterfall = Tog(SmokeTuning.PlumeFromWaterfall, "  Take the size and the colours from the Waterfall flame of the engine (its config)");
             SmokeTuning.PlumeHideWaterfall = Tog(SmokeTuning.PlumeHideWaterfall, "  Switch off Waterfall's flame while the physical plume is drawn");
             SmokeTuning.PlumeExposure = Slider("  Brightness (exposure)", SmokeTuning.PlumeExposure, 0.2f, 5f);
             SmokeTuning.PlumeStreak = Slider("  Long streak at altitude (a long exposure: smooth, narrow, hundreds of metres; 0 = off)", SmokeTuning.PlumeStreak, 0f, 1f);
             SmokeTuning.PlumeScale = Slider("  Length (x)", SmokeTuning.PlumeScale, 0.3f, 3f);
-            SmokeTuning.PlumeWidthScale = Slider("  Width (x)", SmokeTuning.PlumeWidthScale, 0.3f, 3f);
-            SmokeTuning.PlumeSootScale = Slider("  Soot (x: darkness of the plume)", SmokeTuning.PlumeSootScale, 0f, 2f);
             SmokeTuning.PlumeSteps = Mathf.RoundToInt(Slider("  Quality (ray steps)", SmokeTuning.PlumeSteps, 32f, 192f));
             SmokeTuning.PlumeMaxEngines = Mathf.RoundToInt(Slider("  Nozzles drawn (nearest first)", SmokeTuning.PlumeMaxEngines, 1f, 40f));
-            SmokeTuning.PlumeDeflect = Tog(SmokeTuning.PlumeDeflect, "  Flame turned by the pad: the plume is deflected by the surface it hits (needs the GPU pad cloud for the geometry)");
-            SmokeTuning.PlumeDeflectSpread = Slider("  Turned flame thickening (x)", SmokeTuning.PlumeDeflectSpread, 0.3f, 3f);
+            SmokeTuning.PlumeDeflect = Tog(SmokeTuning.PlumeDeflect, "  Deflect flame at scenery surfaces");
+            SmokeTuning.PlumeDeflectSpread = Slider("  Deflected flame spread", SmokeTuning.PlumeDeflectSpread, 0.3f, 3f);
 
-            Sec(5, "Heat haze");
+            Sec(2, "Heat haze");
             SmokeTuning.HeatHaze = Tog(SmokeTuning.HeatHaze, " Heat haze over the nozzle (refraction)");
             SmokeTuning.HeatHazeStrength = Slider("  Haze strength", SmokeTuning.HeatHazeStrength, 0f, 1f);
             SmokeTuning.HeatHazeAmount = Slider("  Haze displacement", SmokeTuning.HeatHazeAmount, 0f, 1f);
@@ -776,29 +657,22 @@ namespace RaymarchedPlumeTrails
             SmokeTuning.HeatHazeScale = Slider("  Haze noise size (m)", SmokeTuning.HeatHazeScale, 0.3f, 8f);
             SmokeTuning.HeatHazeSpeed = Slider("  Haze stream speed (m/s)", SmokeTuning.HeatHazeSpeed, 0f, 120f);
 
-            Sec(5, "Over the clouds");
+            Sec(2, "Over the clouds");
             SmokeTuning.SmokeLast = Tog(SmokeTuning.SmokeLast, " Draw the smoke last (after all clouds, before the image effects): EVE's volumetric clouds cover smoke that lies in front of them - try this if the trail has holes at some camera angles");
             SmokeTuning.SmokeBeforeClouds = Tog(SmokeTuning.SmokeBeforeClouds, " TEST: draw the smoke before the transparent queue, so cloud layers (EVE / Scatterer) are drawn OVER it instead of the smoke lying over them");
 
-            Sec(5, "Aerial perspective");
+            Sec(2, "Aerial perspective");
             SmokeTuning.AerialStrength = Slider("Aerial perspective (distant haze)", SmokeTuning.AerialStrength, 0f, 1f);
             SmokeTuning.ScattererSunTint = Tog(SmokeTuning.ScattererSunTint, " Light the smoke with the colour of the sun from Scatterer (orange at sunset)");
             SmokeTuning.ScattererTintStrength = Slider("  Strength of that tint", SmokeTuning.ScattererTintStrength, 0f, 1f);
             SmokeTuning.AerialDistance = Slider("  Haze distance (m, sea level)", SmokeTuning.AerialDistance, 2000f, 60000f);
 
-            Sec(5, "Engine flame light");
+            Sec(2, "Engine flame light");
             SmokeTuning.EngineLights = Tog(SmokeTuning.EngineLights, " Real scene light from engine flames (pad, ground, rocket)");
             SmokeTuning.EngineLightIntensity = Slider("  Scene light intensity", SmokeTuning.EngineLightIntensity, 0f, 6f);
             SmokeTuning.EngineLightRange = Slider("  Scene light range (x)", SmokeTuning.EngineLightRange, 0.3f, 3f);
+            SmokeTuning.FlameLightRange = Slider("Flame light range (m)", SmokeTuning.FlameLightRange, 3f, 200f);
 
-            Sec(5, "Rim & edge glow");
-            SmokeTuning.RimLight = Slider("Rim light (bright edge)", SmokeTuning.RimLight, 0f, 3f);
-            SmokeTuning.EdgeGlow = Slider("Edge glow (silver lining)", SmokeTuning.EdgeGlow, 0f, 1f);
-
-            // ======================================================================= Extras
-            Sec(7, "Altitude bloom (jellyfish)");
-
-            Sec(7, "Retro umbrella");
         }
     }
 }

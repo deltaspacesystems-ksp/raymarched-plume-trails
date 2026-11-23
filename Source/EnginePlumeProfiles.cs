@@ -5,7 +5,7 @@ using UnityEngine;
 namespace RaymarchedPlumeTrails
 {
     // What kind of exhaust an engine makes. Decides whether it smokes at all, how much water vapour it carries
-    // (condensation, see PuffPhysics.CondensedFraction) and how visible / how big its plume is drawn.
+    // and how visible / how big its plume is drawn.
     public enum PlumeKind { Solid, Kerolox, Hydrolox, Methalox, Hypergolic, Nuclear, None }
 
     public class EnginePlumeProfile
@@ -236,10 +236,6 @@ namespace RaymarchedPlumeTrails
         {
             EnginePlumeProfile p = new EnginePlumeProfile();
             if (EngineClusterUtils.IsSolidRocket(engine)) { p.kind = PlumeKind.Solid; return p; }
-            // Avalanche Plumes (and RealPlume-style packs) name the smoke effect of a motor they consider a solid one: believe them, whatever the propellants say
-            ModuleEnginesFX fxEngine = engine as ModuleEnginesFX;
-            if (fxEngine != null && !string.IsNullOrEmpty(fxEngine.powerEffectName) && fxEngine.powerEffectName.IndexOf("SolidSmoke", StringComparison.OrdinalIgnoreCase) >= 0)
-            { ModCompat.NoteAvalanche(); p.kind = PlumeKind.Solid; return p; }
 
             bool hydrogen = false, methane = false, lf = false, ox = false, air = false, mono = false, other = false;
             if (engine != null && engine.propellants != null)

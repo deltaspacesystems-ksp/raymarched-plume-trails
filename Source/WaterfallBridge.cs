@@ -22,57 +22,6 @@ namespace RaymarchedPlumeTrails
         private static FieldInfo fEffRenderers;     // WaterfallEffect.effectRenderers : List<Renderer>
         private static bool failedLogged;
 
-        // THE LIGHT OF THE FLAME as Waterfall itself drives it: its flame effects carry point lights (a "Light" object with a LIGHT module and light modifiers on the
-        // throttle, the atmosphere...). They are read here - intensity, range and colour as they are NOW - and our scene light follows them instead of a guess from the
-        // thrust. Their own rendering is switched off (culling mask 0) while ours is on, so the pad and the ground are not lit twice; the values still run.
-        private static readonly Dictionary<int, Light[]> lightCache = new Dictionary<int, Light[]>();
-        private static readonly Dictionary<Light, int> savedMask = new Dictionary<Light, int>();
-        private static float lightCacheStamp;
-
-        public static void RestoreLights()
-        {
-            if (savedMask.Count == 0) return;
-            foreach (KeyValuePair<Light, int> kv in savedMask) if (kv.Key != null) kv.Key.cullingMask = kv.Value;
-            savedMask.Clear();
-        }
-
-        public static bool ReadLight(Part part, bool takeOver, out Color color, out float intensity, out float range)
-        {
-            color = Color.white; intensity = 0f; range = 0f;
-            if (part == null || !Available) return false;
-            if (Time.time - lightCacheStamp > 5f) { lightCache.Clear(); lightCacheStamp = Time.time; }
-            Light[] ls;
-            int id = part.GetInstanceID();
-            if (!lightCache.TryGetValue(id, out ls))
-            {
-                ls = null;
-                if (part.Modules != null && part.FindModuleImplementing<ModuleEngines>() != null && FindModule(part, part.FindModuleImplementing<ModuleEngines>()) != null)
-                {
-                    List<Light> found = new List<Light>();
-                    foreach (Light l in part.GetComponentsInChildren<Light>(true))
-                        if (l != null && l.gameObject.name == "Light" && (l.type == LightType.Point || l.type == LightType.Spot)) found.Add(l);
-                    if (found.Count > 0) ls = found.ToArray();
-                }
-                lightCache[id] = ls;
-            }
-            if (ls == null) return false;
-            Color acc = Color.black; float sumI = 0f, maxR = 0f;
-            for (int i = 0; i < ls.Length; i++)
-            {
-                Light l = ls[i];
-                if (l == null) continue;
-                if (takeOver) { if (!savedMask.ContainsKey(l)) savedMask[l] = l.cullingMask; l.cullingMask = 0; }
-                else { int m; if (savedMask.TryGetValue(l, out m)) { l.cullingMask = m; savedMask.Remove(l); } }
-                if (!l.enabled && l.intensity <= 0.0001f) continue;
-                float w = l.intensity;
-                if (w <= 0.0001f) continue;
-                acc += l.color * w; sumI += w; maxR = Mathf.Max(maxR, l.range);
-            }
-            if (sumI <= 0f) return true;
-            color = acc / sumI; intensity = sumI; range = maxR;
-            return true;
-        }
-
         public static bool Available { get { Resolve(); return fxType != null && fAllFX != null && fEffRenderers != null; } }
 
         private static void Resolve()
@@ -114,44 +63,6 @@ namespace RaymarchedPlumeTrails
                 any = any ?? m;
             }
             return any;
-        }
-
-        // THE LOOK OF THE FLAME as the config of its author made it: the two tints of its materials (Waterfall's shaders have _StartTint at the nozzle and _EndTint at the
-        // tip, and a _Brightness), averaged over the effects of the module weighted by brightness. The physical plume takes its colours from here when asked to.
-        public struct FlameLook { public Color start, end; public float brightness; public bool valid; }
-        private static readonly Dictionary<PartModule, KeyValuePair<float, FlameLook>> lookCache = new Dictionary<PartModule, KeyValuePair<float, FlameLook>>();
-
-        public static FlameLook ReadLook(PartModule module)
-        {
-            FlameLook look = new FlameLook();
-            if (module == null || fAllFX == null || fEffRenderers == null) return look;
-            KeyValuePair<float, FlameLook> hit;
-            if (lookCache.TryGetValue(module, out hit) && Time.time - hit.Key < 0.5f) return hit.Value;
-            try
-            {
-                IEnumerable effects = fAllFX.GetValue(module) as IEnumerable;
-                if (effects != null)
-                {
-                    Color s = Color.black, e = Color.black; float wSum = 0f, bSum = 0f;
-                    foreach (object eff in effects)
-                    {
-                        IList renderers = fEffRenderers.GetValue(eff) as IList;
-                        if (renderers == null) continue;
-                        for (int i = 0; i < renderers.Count; i++)
-                        {
-                            Renderer r = renderers[i] as Renderer;
-                            Material m = r != null ? r.sharedMaterial : null;
-                            if (m == null || !m.HasProperty("_StartTint") || !m.HasProperty("_EndTint")) continue;
-                            float b = m.HasProperty("_Brightness") ? Mathf.Max(m.GetFloat("_Brightness"), 0.01f) : 1f;
-                            s += m.GetColor("_StartTint") * b; e += m.GetColor("_EndTint") * b; wSum += b; bSum += b;
-                        }
-                    }
-                    if (wSum > 0f) { look.start = s / wSum; look.end = e / wSum; look.brightness = bSum; look.valid = true; }
-                }
-            }
-            catch (Exception) { }
-            lookCache[module] = new KeyValuePair<float, FlameLook>(Time.time, look);
-            return look;
         }
 
         // Switches the flame models of a Waterfall module on or off WITHOUT touching its own bookkeeping (forceRenderingOff only

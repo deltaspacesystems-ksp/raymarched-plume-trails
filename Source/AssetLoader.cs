@@ -3,7 +3,7 @@ using UnityEngine;
 
 namespace RaymarchedPlumeTrails
 {
-    // static shader cache: Shader.Find won't find a
+    // Shared shader cache. Shader.Find will not find a
     // custom shader until the asset bundle loads
     public static class ShaderCache
     {
@@ -68,10 +68,8 @@ namespace RaymarchedPlumeTrails
 
         private static bool assetsLoaded;
 
-        private static bool sceneHooked;
         private void Awake()
         {
-            if (!sceneHooked) { sceneHooked = true; CapsuleTrail.HookSceneChange(); }
             SmokeTuningConfig.Load();
             if (!ModSettings.Enabled) { Debug.Log("[PlumeTrails] switched off: no assets are loaded, nothing hooks into the game (switch it on in the settings window: the assets are loaded then)"); return; }
             LoadAssets();
@@ -124,6 +122,7 @@ namespace RaymarchedPlumeTrails
                     "used to build the bundle probably does not match KSP's.");
                 return;
             }
+
 
             // the composite shader has no material of its own, so it is loaded directly
             ShaderCache.SmokeCompositeShader = bundle.LoadAsset<Shader>(SmokeCompositeShaderAssetName);
@@ -269,29 +268,5 @@ ShaderCache.PlumeCoreShader = bundle.LoadAsset<Shader>("PlumeCore");
             Debug.Log("[PlumeTrails] Baked the " + NoiseResolution + "^3 worley noise of the trail (" + WorleyCells + " cells, " + WorleyOctaves + " octaves).");
         }
 
-        private static void LoadShaderFromMaterial(AssetBundle bundle, string materialAssetName, ref Shader target)
-        {
-            Material mat = bundle.LoadAsset<Material>(materialAssetName);
-            if (mat == null)
-            {
-                Debug.LogError("[PlumeTrails] Material '" + materialAssetName + "' missing from the bundle.");
-                return;
-            }
-
-            target = mat.shader;
-
-            // A shader can load fine and still be unusable - if it failed to compile for
-            // this GPU, Unity silently swaps in the error shader instead of raising.
-            if (!target.isSupported)
-            {
-                Debug.LogError("[PlumeTrails] Shader '" + target.name + "' is NOT supported on this GPU ("
-                    + SystemInfo.graphicsDeviceType + ", shader level " + SystemInfo.graphicsShaderLevel
-                    + "). It needs shader model 3.5 or better. The smoke will not render.");
-                return;
-            }
-
-            Debug.Log("[PlumeTrails] Loaded shader from '" + materialAssetName + "': " + target.name
-                + " (supported)");
-        }
     }
 }

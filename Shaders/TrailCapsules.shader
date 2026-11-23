@@ -26,6 +26,25 @@ Shader "RaymarchedPlumeTrails/TrailCapsules"
         // fraction in the shell, w = fraction * 0.5 clamped to lightVolumeZClamp. _TrEveMap still flips the axes (developer check; 0 = the found mapping).
         // ======================================================================================================================================================
         CGINCLUDE
+        int TakeTrailBlock(inout uint2 mask)
+        {
+            if (mask.x != 0u)
+            {
+                int index = firstbitlow(mask.x);
+                mask.x &= mask.x - 1u;
+                return index;
+            }
+            int highIndex = firstbitlow(mask.y);
+            mask.y &= mask.y - 1u;
+            return highIndex + 32;
+        }
+
+        void AddTrailBlock(inout uint2 mask, int index)
+        {
+            if (index < 32) mask.x |= 1u << index;
+            else mask.y |= 1u << (index - 32);
+        }
+
         sampler3D directLightVolume;
         float4x4 worldToParaboloid;
         float innerLightVolumeRadius;
@@ -79,6 +98,9 @@ Shader "RaymarchedPlumeTrails/TrailCapsules"
             Blend 1 One One
             ZWrite Off
             ZTest Always
+            // The proxy's exit face may lie beyond the camera far plane.
+            // Keep its raster coverage; actual scene occlusion is raymarched.
+            ZClip False
             Cull Front
 
             CGPROGRAM
@@ -114,7 +136,10 @@ Shader "RaymarchedPlumeTrails/TrailCapsules"
             float4 _TrGlowCol;                     // rgb = the colour * strength of the glow of the hot exhaust (the heat of the segments: next to the nozzle)
             float4 _TrLook6;                       // x = the inner fill: from this profile inward the smoke is solid, not eroded (0 = off)
             float4 _TrLook4;                       // x = how much of the extinction the light feels (the light goes deeper than the view ray)
-            float _TrDebug;                        // 1 = no bounding tests (to tell a culling bug from a shape bug)
+            float _TrDebug;
+            float _TrDistanceContrastReduction;
+            float _TrAdaptive;                     // depth slices and opacity-aware sampling
+            float _TrSunSamples;
             float4 _TrTint;                        // rgb = colour of the smoke, a = unused
 
             struct appdata { float4 vertex : POSITION; };
@@ -147,14 +172,34 @@ Shader "RaymarchedPlumeTrails/TrailCapsules"
             bool RaySphere(float3 o, float3 d, float4 s, out float t0, out float t1)
             {
                 float3 oc = o - s.xyz;
-                float b = dot(oc, d);
-                float c = dot(oc, oc) - s.w * s.w;
-                float disc = b * b - c;
+                // Use the perpendicular distance, not b*b - (|oc|^2-r^2):
+                // the latter loses the whole chord for small distant bounds.
+                float a = dot(d, d);
+                t0 = 0.0; t1 = 0.0;
+                if (!(a > 1e-12)) return false;
+                float middle = -dot(oc, d) / a;
+                float3 closest = oc + d * middle;
+                float disc = (s.w * s.w - dot(closest, closest)) / a;
                 t0 = 0.0; t1 = 0.0;
                 if (disc < 0.0) return false;
                 float sq = sqrt(disc);
-                t0 = -b - sq; t1 = -b + sq;
+                t0 = middle - sq; t1 = middle + sq;
                 return t1 > 0.0;
+            }
+
+            uint2 LightBlocks(float3 start, float3 direction, float reach)
+            {
+                uint2 mask = uint2(0u, 0u);
+                [loop] for (int b = 0; b < _TrBlockCount; b++)
+                {
+                    float4 sphere = _TrBlock[b];
+                    float3 offset = start - sphere.xyz;
+                    float along = clamp(-dot(offset, direction), 0.0, reach);
+                    float3 nearest = offset + along * direction;
+                    float r = sphere.w + max(0.02, sphere.w * 0.0001);
+                    if (dot(nearest, nearest) <= r * r) AddTrailBlock(mask, b);
+                }
+                return mask;
             }
 
             // the smoke at a point: the low-detail profile and the properties of the capsules that cover it
@@ -162,17 +207,23 @@ Shader "RaymarchedPlumeTrails/TrailCapsules"
             // where the material at a point was ONE FRAME AGO relative to now (the radius of the capsules grows: the point moved outward with it), for the motion vectors of the
             // temporal upscaling; set by Profile, read right after the main density call
             static float3 gPrevDisp;
+            static float gStepRadius;
+            static float gSurfaceDistance;
             static float gHeat;                    // the heat at the point (the hot exhaust next to the nozzle glows), set by Profile like gPrevDisp
 
-            float Profile(float3 p, uint2 blockMask, out float radius, out float dmul, out float gap)
+            // Lighting only reads the density. The view ray also needs a safe
+            // distance to its next sample and properties for reconstruction.
+            float Profile(float3 p, uint2 blockMask, bool viewRay, out float radius, out float dmul, out float gap)
             {
                 float prof = 0.0, sumW = 0.0, sumWr = 0.0, sumP = 0.0;
                 float3 sumWd = float3(0.0, 0.0, 0.0);
                 gPrevDisp = float3(0.0, 0.0, 0.0);
+                gStepRadius = 1e9;
+                gSurfaceDistance = 1e9;
                 gHeat = 0.0;
                 float sumWh = 0.0;
                 gap = 1e9;
-                if (_TrDebug > 1.5)
+                if (_TrDebug > 1.5 && _TrDebug < 2.5)
                 {
                     for (int s2 = 0; s2 < _TrSegCount; s2++)
                     {
@@ -180,7 +231,10 @@ Shader "RaymarchedPlumeTrails/TrailCapsules"
                         float3 ab = B.xyz - A.xyz; float l2 = dot(ab, ab); float3 pa = p - A.xyz;
                         float h = l2 > 1e-6 ? saturate(dot(pa, ab) / l2) : 0.0; float3 q = pa - ab * h;
                         float r = lerp(A.w, B.w, h) * _TrLook3.x; float d2 = dot(q, q);
-                        if (d2 >= r * r) continue;
+                        float sd = abs(sqrt(d2) - r);
+                        if (sd < gSurfaceDistance) { gSurfaceDistance = sd; gStepRadius = r; }
+                        if (d2 >= r * r) { gap = min(gap, max(0.0, sqrt(d2) - max(A.w, B.w) * _TrLook3.x)); continue; }
+                        gap = 0.0;
                         float pr = (1.0 - sqrt(d2) / r) * lerp(M.x, M.y, h);
                         float w = pr * M.z * _TrLook.x / r;
                         prof = max(prof, pr); sumP += pr; sumW += w; sumWr += w * r;
@@ -188,18 +242,17 @@ Shader "RaymarchedPlumeTrails/TrailCapsules"
                     radius = sumW > 0.0 ? sumWr / sumW : 0.0; dmul = sumP > 0.0 ? sumW / sumP : 0.0;
                     return prof;
                 }
-                for (int b = 0; b < _TrBlockCount; b++)
+                [loop] while (any(blockMask != 0u))
                 {
-                    uint bit = b < 32 ? (blockMask.x >> b) & 1u : (blockMask.y >> (b - 32)) & 1u;
-                    if (bit == 0u) continue;
+                    int b = TakeTrailBlock(blockMask);
                     float4 bs = _TrBlock[b];
                     float3 bd = p - bs.xyz;
-                    if (dot(bd, bd) > bs.w * bs.w) { gap = min(gap, sqrt(dot(bd, bd)) - bs.w); continue; }
+                    if (dot(bd, bd) > bs.w * bs.w) { if (viewRay) gap = min(gap, sqrt(dot(bd, bd)) - bs.w); continue; }
                     for (int c = b * 8; c < b * 8 + 8 && c < _TrChunkCount; c++)
                     {
                         float4 cs = _TrChunk[c];
                         float3 cd = p - cs.xyz;
-                        if (dot(cd, cd) > cs.w * cs.w) { gap = min(gap, sqrt(dot(cd, cd)) - cs.w); continue; }
+                        if (dot(cd, cd) > cs.w * cs.w) { if (viewRay) gap = min(gap, sqrt(dot(cd, cd)) - cs.w); continue; }
                         for (int s = c * 8; s < c * 8 + 8 && s < _TrSegCount; s++)
                         {
                             float4 A = _TrSeg[s * 4], B = _TrSeg[s * 4 + 1], M = _TrSeg[s * 4 + 2];
@@ -210,7 +263,14 @@ Shader "RaymarchedPlumeTrails/TrailCapsules"
                             float3 q = pa - ab * h;
                             float r = lerp(A.w, B.w, h) * _TrLook3.x;
                             float d2 = dot(q, q);
-                            if (d2 >= r * r) { gap = min(gap, sqrt(d2) - r); continue; }
+                            if (viewRay)
+                            {
+                                float surfaceDistance = abs(sqrt(d2) - r);
+                                if (surfaceDistance < gSurfaceDistance) { gSurfaceDistance = surfaceDistance; gStepRadius = r; }
+                            }
+                            // A tapered segment is enclosed by the capsule of its largest
+                            // endpoint radius. The interpolated radius is not a safe skip distance.
+                            if (d2 >= r * r) { if (viewRay) gap = min(gap, max(0.0, sqrt(d2) - max(A.w, B.w) * _TrLook3.x)); continue; }
                             float nd = sqrt(d2) / r;
                             gap = 0.0;          // inside a capsule: never an empty-space jump from here (its own surface is not in the gap)
                             float fade = lerp(M.x, M.y, h);
@@ -220,8 +280,11 @@ Shader "RaymarchedPlumeTrails/TrailCapsules"
                             float w = pr * M.z * lerp(H.z, H.w, h) * _TrLook.x / r;      // the density of this capsule: constant column of smoke / radius
                             prof = max(prof, pr);
                             sumP += pr; sumW += w; sumWr += w * r;
-                            sumWd += w * q * (M.w - 1.0);
-                            sumWh += w * lerp(H.x, H.y, h);
+                            if (viewRay)
+                            {
+                                sumWd += w * q * (M.w - 1.0);
+                                sumWh += w * lerp(H.x, H.y, h);
+                            }
                         }
                     }
                 }
@@ -247,7 +310,7 @@ Shader "RaymarchedPlumeTrails/TrailCapsules"
             float Density(float3 p, uint2 blockMask, out float prof, out float radius, out float noiseProf, out float gap, bool lite)
             {
                 float dmul;
-                prof = Profile(p, blockMask, radius, dmul, gap);
+                prof = Profile(p, blockMask, !lite, radius, dmul, gap);
                 noiseProf = 0.0;
                 if (prof <= 0.0) return 0.0;
                 float n = ErodeNoise(p, radius, lite);
@@ -297,7 +360,10 @@ Shader "RaymarchedPlumeTrails/TrailCapsules"
                 float3 sunL = normalize(mul(R, dot(_SmokeSunDir.xyz, _SmokeSunDir.xyz) > 0.0001 ? normalize(_SmokeSunDir.xyz) : normalize(float3(0.3, 0.8, 0.4))));
                 float3 upL = normalize(mul(R, _SmokeUpDir.xyz));
 
-                float2 suv = i.scr.xy / i.scr.w;
+                // Depth must belong to the same jittered ray as Dw. Project its
+                // sample point rather than reading the unjittered raster pixel.
+                float4 depthScr = ComputeScreenPos(mul(UNITY_MATRIX_VP, float4(wpj, 1.0)));
+                float2 suv = depthScr.xy / depthScr.w;
                 float raw0 = SAMPLE_DEPTH_TEXTURE(_CameraDepthTexture, suv);
                 float eye = LinearEyeDepth(raw0);
                 float3 camFwd = -UNITY_MATRIX_V[2].xyz;
@@ -309,7 +375,7 @@ Shader "RaymarchedPlumeTrails/TrailCapsules"
                 for (int b = 0; b < _TrBlockCount; b++)
                 {
                     float t0, t1;
-                    if (RaySphere(o, d, _TrBlock[b], t0, t1))
+                    if (RaySphere(o, d, _TrBlock[b], t0, t1) && t0 < tScene)
                     {
                         if (b < 32) mask.x |= (1u << b); else mask.y |= (1u << (b - 32));
                         tmin = min(tmin, max(t0, 0.0)); tmax = max(tmax, t1);
@@ -317,6 +383,42 @@ Shader "RaymarchedPlumeTrails/TrailCapsules"
                 }
                 tmax = min(tmax, tScene);
                 if (tmax <= tmin) discard;
+
+                bool adaptive = _TrAdaptive > 0.5 && _TrDebug < 0.5;
+                bool sliced = adaptive && tmax - tmin >= 128.0 && countbits(mask.x) + countbits(mask.y) >= 3u;
+                float4 ends = tmin + (tmax - tmin) * float4(0.125, 0.375, 0.625, 1.0);
+                float4 starts = float4(tmin, ends.xyz);
+                uint4 low = 0u, high = 0u;
+                [branch] if (sliced)
+                {
+                    uint2 blocks = mask;
+                    float firstChunk = tmax, lastChunk = tmin;
+                    [loop] while (any(blocks != 0u))
+                    {
+                        int block = TakeTrailBlock(blocks);
+                        uint bit = 1u << (block & 31);
+                        [loop] for (int c = block * 8; c < min(block * 8 + 8, _TrChunkCount); c++)
+                        {
+                            float4 sphere = _TrChunk[c];
+                            sphere.w += max(0.02, sphere.w * 0.0001);
+                            float entry, exit;
+                            if (!RaySphere(o, d, sphere, entry, exit) || entry > tmax) continue;
+                            firstChunk = min(firstChunk, max(entry, tmin));
+                            lastChunk = max(lastChunk, min(exit, tmax));
+                            uint4 overlaps = uint4(entry <= ends) & uint4(exit >= starts);
+                            if (block < 32) low |= overlaps * bit;
+                            else high |= overlaps * bit;
+                        }
+                    }
+                    tmin = firstChunk;
+                    tmax = lastChunk;
+                    if (tmax <= tmin) discard;
+                    sliced = any(low != mask.x) || any(high != mask.y);
+                }
+                int slice = 0;
+                float sliceEnd = sliced ? min(ends.x, tmax) : tmax;
+                uint2 viewMask = sliced ? uint2(low.x, high.x) : mask;
+
                 // The mask above holds the blocks the VIEW ray touches. The light rays (toward the sun, toward the sky) from a point on it leave through other blocks: with
                 // the view mask they saw nothing there, the smoke of the neighbouring blocks cast no shadow, and the lighting changed at the surface of a block's sphere - flat
                 // lit plates with torn, arc-shaped borders that depended on the camera angle. The light rays are tested against ALL blocks (a cheap sphere test each).
@@ -333,7 +435,7 @@ Shader "RaymarchedPlumeTrails/TrailCapsules"
                 float distAcc = 0.0, distW = 0.0, dbgA = 0.0, dbgB = 0.0;
                 float3 dispAcc = float3(0.0, 0.0, 0.0);
                 float3 litCache = float3(0.7, 0.7, 0.7); float dlCache = 0.0; int litTick = 0;
-                float ds = 2.0;
+                float ds = 0.1;
                 // interleaved gradient noise (low discrepancy, no clumps) plus the golden ratio per frame: the grain is spread evenly and the temporal accumulation removes it
                 // faster than white noise would (a hash of the pixel looks like sandpaper)
                 float ign = frac(52.9829189 * frac(dot(i.pos.xy, float2(0.06711056, 0.00583715))));
@@ -343,66 +445,108 @@ Shader "RaymarchedPlumeTrails/TrailCapsules"
 
                 int iters = 0, denseN = 0;
                 [loop]
-                for (int k = 0; k < 500; k++)
+                for (int k = 0; k < 2048; k++)
                 {
                     if (tt >= tmax || T < 0.02) break;
+                    [branch] if (sliced && (tt >= sliceEnd || !any(viewMask != 0u)))
+                    {
+                        [loop] while (slice < 3 && (tt >= sliceEnd || !any(viewMask != 0u)))
+                        {
+                            if (!any(viewMask != 0u) && tt < sliceEnd)
+                            {
+                                tt = sliceEnd;
+                                litTick = 0;
+                            }
+                            slice++;
+                            sliceEnd = slice == 3 ? tmax : min(ends[slice], tmax);
+                            viewMask = uint2(low[slice], high[slice]);
+                        }
+                        if (tt >= tmax || !any(viewMask != 0u)) break;
+                    }
                     iters++;
                     float3 p = o + d * tt;
                     float prof, rad, nprof, gap;
-                    float den = Density(p, mask, prof, rad, nprof, gap, false);
+                    float den = Density(p, viewMask, prof, rad, nprof, gap, false);
+                    float stepRadius = min(rad > 0.0 ? rad : gStepRadius, gStepRadius);
+                    // Distance alone cannot set the sampling rate of a thin trail.
+                    // Bound in-volume steps by the local radius, including empty
+                    // samples left by erosion within the capsule bounds.
+                    float sampleStep = clamp(0.075 * stepRadius + tt * 0.0015,
+                                             0.1, clamp(0.35 * stepRadius, 0.1, 60.0));
                     float3 pdisp = gPrevDisp;
                     float heat = gHeat;
                     if (prof <= 0.0)
                     {
+                        // A separated smoke interval needs a fresh light evaluation.
+                        litTick = 0;
                         // empty: the step is the distance to the nearest bound (the sphere or the capsule): never over a piece of smoke.
                         // In the eroded shell of a capsule the shape is 0 but the point is INSIDE the capsule (gap 0): a normal step there - the jump by the distance
                         // to the other bounds went straight through the smoke (cuts and holes at every joint of the capsules)
-                        // (inside a capsule: never shorter than what still reaches the end of the ray with the steps left - see below)
-                        ds = gap > 0.0 ? clamp(gap * 0.85, 0.4, 400.0) : max(clamp(0.09 * rad + tt * 0.0015, 0.25, 60.0), min((tmax - tt) / float(500 - k), 25.0));
-                        tt += ds;
+                        ds = gap > 0.0 ? max(0.001, min(gap * 0.85, 400.0)) : sampleStep;
+                        tt = min(tt + ds, sliceEnd);
                         continue;
                     }
-                    // the step follows the radius, but never shorter than what still reaches the end of the ray with the steps left: a ray along the axis of the
-                    // trail (camera above the rocket, looking down) went through the thin jet at the nozzle in steps of a fraction of a metre and ran out of
-                    // steps there - the rest of the column was missing until the camera moved a little
-                    ds = max(clamp(0.09 * rad + tt * 0.0015, 0.25, 60.0), min((tmax - tt) / float(500 - k), 25.0));
+                    // Keep spatial sampling independent of the total view-ray interval.
+                    // Budget pressure must not enlarge a step across a thin smoke feature.
+                    // As in KSA, sample deeper layers less often once the front
+                    // smoke already obscures them. Thin features keep their step.
+                    bool obscured = adaptive && stepRadius >= 6.0 && T < 0.35;
+                    float stepScale = obscured ? lerp(2.0, 1.0, T / 0.35) : 1.0;
+                    ds = min(min(sampleStep * stepScale, max(sampleStep, 0.35 * stepRadius)), sliceEnd - tt);
                     if (den > 0.0005)
                     {
                         denseN++;
-                        // The light changes slowly along the ray (a sample is a few metres, the light march is tens of metres long): it is computed on every SECOND dense sample
-                        // and reused for the next - half the cost of the most expensive part, no visible difference (the dither moves between frames anyway)
+                        // Reuse lighting for at most the next contiguous dense sample.
+                        // Empty geometry or eroded gas resets this cadence below.
                         [branch] if ((litTick++ & 1) == 0)
                         {
                         // toward the sun: a few samples over the length of the local radius
                         float dl = 0.0;
                         float Ls = max(rad * _TrLook4.z, 2.0);
-                        for (int j = 0; j < 4; j++)
+                        bool filterLight = adaptive && _TrBlockCount >= 4;
+                        uint2 sunMask = filterLight ? LightBlocks(p, sunL, Ls) : lightMask;
+                        int maxLightCount = _TrDebug > 0.5 || _TrSunSamples < 2.0 ? 4 : (int)_TrSunSamples;
+                        int lightCount = obscured
+                            ? clamp((int)ceil(maxLightCount * T * (2.0 - T)), 2, maxLightCount)
+                            : maxLightCount;
+                        float sunStep = Ls / float(lightCount);
+                        [branch] if (any(sunMask != 0u))
+                        for (int j = 0; j < lightCount; j++)
                         {
-                            float tj = Ls * (j + lightJit) / 4.0;      // stratified with a FULL jitter: with a fixed position the 4 samples quantized the self-shadow of the sharp-edged lobes into flat plates
+                            float tj = sunStep * (j + lightJit);
                             float pr2, r2, np2, g2;
-                            dl += Density(p + sunL * tj, lightMask, pr2, r2, np2, g2, true) * (Ls / 4.0);
+                            dl += Density(p + sunL * tj, sunMask, pr2, r2, np2, g2, true) * sunStep;
                         }
-                        float dlRaw = dl;
-                        dl *= _TrLook4.x;      // the light is scattered forward and around: it goes much deeper than the extinction of the view ray says
-                        float edge = lerp(_TrLook2.z, 1.0, saturate(prof));              // the dark edge: the rim gets little of the multiple scattering
+                        dl *= _TrLook4.x;
+                        // Fine self-shadow contrast fades with camera distance.
+                        // Use a common midtone without gating density or cloud shadows.
+                        float farMix = _TrDistanceContrastReduction * smoothstep(400.0, 1200.0, tt);
+                        float referenceDepth = min(0.20 * _TrLook.x * _TrLook4.x, 2.0);
+                        dl = lerp(dl, referenceDepth, farMix);
+                        float lightProfile = lerp(saturate(prof), 0.5, farMix);
+                        float edge = lerp(_TrLook2.z, 1.0, lightProfile);              // the dark edge: the rim gets little of the multiple scattering
                         // how much of the sun gets here: the direct beam (beer) and the multiple scattering (softer, goes deeper), the rim gets little of the latter (the dark edge);
                         // the forward lobe adds a silver lining when the smoke is between the eye and the sun
                         float sunReach = lerp(exp(-dl), BeerMS(dl) * edge, 0.55);
                         float scat = sunReach * (1.0 + 6.0 * directPh);
                         float skyF = saturate(0.5 + 0.5 * dot(-d, upL));
                         float3 amb = lerp(_TrAmbGnd.rgb, _TrAmbSky.rgb, skyF);
-                        float occ = BeerMS(prof * 3.0);
+                        float occ = BeerMS(lightProfile * 3.0);
                         // the colour from the palette of the old trail (the shadow colour and the colour of the sun at the smoke's place), by how lit the sample is:
                         // the same smoke, so the two read as one; the floor of the light is the ambient setting, the inside of the smoke gets less of it
                         // the sky light is blocked by the smoke ABOVE: undersides and valleys are darker, tops are bright (shading that does not need the sun at the side)
                         float dlu = 0.0;
+                        // Physical lighting takes its ambient term from the local
+                        // profile and never uses the palette's sky-ray result.
+                        [branch] if (_TrKsa.x < 0.5 && _TrLook4.w > 0.0)
                         for (int ju = 0; ju < 2; ju++)
                         {
                             float tu = Ls * 0.4 * (ju + 0.5) / 2.0;
                             float pu, ru, nu, gu;
                             dlu += Density(p + upL * tu, lightMask, pu, ru, nu, gu, true) * (Ls * 0.4 / 2.0);
                         }
-                        float skyOcc = exp(-dlu * _TrLook4.x);
+                        float skyDepth = lerp(dlu * _TrLook4.x, referenceDepth * 0.4, farMix);
+                        float skyOcc = exp(-skyDepth);
                         float litness = lerp(_TrLook2.y, 1.0, pow(saturate(_TrLook2.x * scat * day * _TrLook3.w), _TrLook4.y));
                         litness *= lerp(0.72, 1.0, occ);
                         litness *= lerp(1.0, lerp(0.6, 1.0, skyOcc), _TrLook4.w);
@@ -414,14 +558,14 @@ Shader "RaymarchedPlumeTrails/TrailCapsules"
                             // a narrow forward lobe for the direct beam (exp) and a broad lobe for the light scattered many times (BeerMS: it goes deep, the
                             // smoke is soft and bright inside), the latter weaker at the rim (dark edge); PLUS the sky, blocked by the smoke around the point
                             // (the core gets less than the rim). The colours are the sun's and the sky's at the place of the smoke (Scatterer).
-                            float edgeK = lerp(_TrKsa.w, 1.0, saturate(prof));
+                            float edgeK = lerp(_TrKsa.w, 1.0, lightProfile);
                             float sc = exp(-dl) * directPh + BeerMS(dl) * indirectPh * edgeK;          // dl: the depth the light feels (self-shadow depth setting)
                             float3 skyAmb = _TrAmbSky.rgb;
                             float skyL = dot(skyAmb, float3(0.3333, 0.3333, 0.3333));
                             skyAmb = lerp(float3(skyL, skyL, skyL), skyAmb, 0.6);
                             // the clouds of EVE above the smoke: the sun through them (the sky light dims a little under a cloud deck too)
                             float cloudT = EveCloudLight(mul(transpose(R), p) + _TrAnchorW.xyz, normalize(mul(transpose(R), sunL)));
-                            lit = _TrSunRaw.rgb * (sc * _TrKsa.y * day * cloudT) + skyAmb * (BeerMS(prof * 3.0) * _TrKsa.z * lerp(0.15, 1.0, cloudT));
+                            lit = _TrSunRaw.rgb * (sc * _TrKsa.y * day * cloudT) + skyAmb * (occ * _TrKsa.z * lerp(0.6, 1.0, cloudT));
                         }
                         lit *= _TrTint.rgb;
                         litCache = lit; dlCache = dl;
@@ -447,6 +591,11 @@ Shader "RaymarchedPlumeTrails/TrailCapsules"
                         distAcc += tt * wgt; distW += wgt; dispAcc += wgt * pdisp;
                         dbgA += wgt * (_TrDebug > 3.5 ? saturate(dl * 0.3) : dot(litCache, float3(0.33, 0.33, 0.33))); dbgB += wgt;
                         T *= stepT;
+                    }
+                    else
+                    {
+                        // Erosion can leave air inside an otherwise valid capsule.
+                        litTick = 0;
                     }
                     tt += ds;
                 }
@@ -476,7 +625,14 @@ Shader "RaymarchedPlumeTrails/TrailCapsules"
                         motionUv = ((v1.xy / -v1.z) - (v0.xy / -v0.z)) * p11_22 * 0.5 * distW;
                 }
                 fo.aux = float4(distAcc, distW, motionUv);
-                if (_TrDebug > 4.5) { fo.col = fixed4(iters / 60.0, denseN / 30.0, 0.0, 1.0); return fo; }        // the cost: red = all steps / 60, green = dense steps / 30
+                if (_TrDebug > 0.5 && _TrDebug < 1.5)
+                {
+                    // Magenta marks a live ray whose loop budget ended before its interval.
+                    bool exhausted = iters >= 2048 && tt < tmax && T >= 0.02;
+                    fo.col = exhausted ? fixed4(1.0, 0.0, 1.0, 1.0) : fixed4(Lc, 1.0 - T);
+                    return fo;
+                }
+                if (_TrDebug > 4.5) { fo.col = fixed4(iters / 2048.0, denseN / 2048.0, 0.0, 1.0); return fo; }
                 if (_TrDebug > 2.5) { float dv = dbgB > 0.0 ? dbgA / dbgB : 0.0; fo.col = fixed4(dv, dv, dv, 1.0 - T); return fo; }
                 fo.col = fixed4(Lc, 1.0 - T);
                 return fo;
@@ -541,13 +697,16 @@ Shader "RaymarchedPlumeTrails/TrailCapsules"
             bool RaySphereS(float3 o, float3 d, float4 s, out float t0, out float t1)
             {
                 float3 oc = o - s.xyz;
-                float b = dot(oc, d);
-                float c = dot(oc, oc) - s.w * s.w;
-                float disc = b * b - c;
+                float a = dot(d, d);
+                t0 = 0.0; t1 = 0.0;
+                if (!(a > 1e-12)) return false;
+                float middle = -dot(oc, d) / a;
+                float3 closest = oc + d * middle;
+                float disc = (s.w * s.w - dot(closest, closest)) / a;
                 t0 = 0.0; t1 = 0.0;
                 if (disc < 0.0) return false;
                 float sq = sqrt(disc);
-                t0 = -b - sq; t1 = -b + sq;
+                t0 = middle - sq; t1 = middle + sq;
                 return t1 > 0.0;
             }
 
@@ -556,10 +715,9 @@ Shader "RaymarchedPlumeTrails/TrailCapsules"
             {
                 float best = 0.0;
                 gap = 1e9;
-                for (int b = 0; b < _TrBlockCount; b++)
+                [loop] while (any(blockMask != 0u))
                 {
-                    uint bit = b < 32 ? (blockMask.x >> b) & 1u : (blockMask.y >> (b - 32)) & 1u;
-                    if (bit == 0u) continue;
+                    int b = TakeTrailBlock(blockMask);
                     float4 bs = _TrBlock[b];
                     float3 bd = p - bs.xyz;
                     if (dot(bd, bd) > bs.w * bs.w) { gap = min(gap, sqrt(dot(bd, bd)) - bs.w); continue; }

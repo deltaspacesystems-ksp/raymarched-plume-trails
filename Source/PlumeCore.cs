@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 using UnityEngine;
 
 namespace RaymarchedPlumeTrails
@@ -30,7 +30,6 @@ namespace RaymarchedPlumeTrails
         private readonly Dictionary<PartModule, float> hideStamp = new Dictionary<PartModule, float>();
         private readonly HashSet<PartModule> hiddenWaterfall = new HashSet<PartModule>();   // Waterfall flames switched off by us: given back when the physical plume is off
         private readonly List<Candidate> cands = new List<Candidate>(64);
-        private static Mesh cubeMesh;
 
         private struct Candidate
         {
@@ -94,10 +93,8 @@ namespace RaymarchedPlumeTrails
             {
                 HideAll();
                 RestoreWaterfall();
-                RestoreEveryWaterfall();
                 return;
             }
-            everyWaterfallRestored = false;
             if (!SmokeTuning.PlumeHideWaterfall) RestoreWaterfall();
             float now = Time.time;
             Vector3 eye = cam.transform.position;
@@ -185,42 +182,16 @@ namespace RaymarchedPlumeTrails
                 PlumeLook.RenderBox(s, SmokeTuning.PlumeScale, out length, out rMax, 0f, streakW);
                 if (SmokeTuning.PlumeDeflect)
                 {
-                    float hitD; Vector3 hitN;
-                    if (SurfaceProbe.Along(c.t.position, axis, length, out hitD, out hitN) && hitD > 0.5f)
+                    RaycastHit hit;
+                    if (Physics.Raycast(c.t.position, axis, out hit, length,
+                        SceneryGeometry.Mask, QueryTriggerInteraction.Ignore)
+                        && hit.distance > 0.5f && hit.collider.GetComponentInParent<Part>() == null)
                     {
+                        float hitD = hit.distance; Vector3 hitN = hit.normal;
                         if (Vector3.Dot(hitN, axis) > 0f) hitN = -hitN;
                         deflectAt = hitD; deflectN = hitN;
                         PlumeLook.RenderBox(s, SmokeTuning.PlumeScale, out length, out rMax, deflectAt, streakW);
                     }
-                }
-
-                // the size of the flame the config of the Waterfall effect draws for this nozzle: the physical plume takes it (the flame is hidden while ours is drawn, and the
-                // two must not be different sizes)
-                WaterfallBridge.FlameLook wlook = new WaterfallBridge.FlameLook();
-                if (SmokeTuning.PlumeFromWaterfall && c.fx != null && WaterfallBridge.Available)
-                {
-                    float wl = 0f, ww = 0f; Vector3 cached;
-                    // measured five times a second per nozzle (it walks the renderers of the effects), not every frame
-                    if (!flameMeasure.TryGetValue(c.key, out cached) || now - cached.z > 0.2f)
-                    {
-                        float ml, mw;
-                        cached = WaterfallBridge.Measure(c.fx, c.t.position, axis, out ml, out mw) ? new Vector3(ml, mw, now) : new Vector3(0f, 0f, now);
-                        flameMeasure[c.key] = cached;
-                    }
-                    wl = cached.x; ww = cached.y;
-                    if (wl > 1f)
-                    {
-                        // THE EXPANSION: Waterfall's flame follows the air (its controllers widen and lengthen it as the pressure drops), and it is measured live, so the
-                        // plume widens with it; smoothed, because it is measured five times a second and the flame itself moves continuously
-                        Vector2 sm;
-                        if (!flameSmooth.TryGetValue(c.key, out sm)) sm = new Vector2(wl, ww);
-                        float k = 1f - Mathf.Exp(-Time.deltaTime / 0.35f);
-                        sm = new Vector2(Mathf.Lerp(sm.x, wl, k), Mathf.Lerp(sm.y, ww, k));
-                        flameSmooth[c.key] = sm;
-                        length = Mathf.Clamp(sm.x, 1f, 320f);
-                        rMax = Mathf.Clamp(Mathf.Max(sm.y * 0.5f * 1.05f, 0.25f), 0.25f, 140f);
-                    }
-                    wlook = WaterfallBridge.ReadLook(c.fx);
                 }
 
                 Plume p;
@@ -253,14 +224,6 @@ namespace RaymarchedPlumeTrails
                 Vector3 nPlume = new Vector3(Vector3.Dot(deflectN, axis), Vector3.Dot(deflectN, right), Vector3.Dot(deflectN, zAx));
                 PlumeLook.Fill(p.mb, s, spec.kind, origin, axis, right, length, rMax, SmokeTuning.PlumeExposure, Mathf.Clamp(Mathf.RoundToInt(SmokeTuning.PlumeSteps * SmokeQuality.Current.marchScale), 20, 192), p.seed,
                     0f, deflectAt, nPlume, SmokeTuning.PlumeDeflectSpread, streakW);
-                if (wlook.valid)
-                {
-                    // its tints: the core is the colour at the nozzle, the rim the colour at the tip (kept bright: a tint is an additive colour)
-                    float nrm = Mathf.Max(0.001f, Mathf.Max(wlook.start.r, wlook.start.g, wlook.start.b));
-                    float nre = Mathf.Max(0.001f, Mathf.Max(wlook.end.r, wlook.end.g, wlook.end.b));
-                    p.mb.SetColor("_PlumeCoreCol", new Color(wlook.start.r / nrm, wlook.start.g / nrm, wlook.start.b / nrm, 1f));
-                    p.mb.SetColor("_PlumeRimCol", new Color(wlook.end.r / nre, wlook.end.g / nre, wlook.end.b / nre, 1f));
-                }
                 p.mr.SetPropertyBlock(p.mb);
 
                 if (SmokeTuning.PlumeHideWaterfall && c.fx != null)
@@ -276,19 +239,6 @@ namespace RaymarchedPlumeTrails
                 }
             }
 
-            // a Waterfall flame is hidden only while OUR plume of that engine is drawn: an engine that fell out of the budget, went out of range or was staged away
-            // must get its own flame back (it was left invisible, with nothing drawn in its place)
-            if (hideStamp.Count > 0)
-            {
-                restoreScratch.Clear();
-                foreach (KeyValuePair<PartModule, float> kv in hideStamp) if (now - kv.Value > 1.2f) restoreScratch.Add(kv.Key);
-                for (int i = 0; i < restoreScratch.Count; i++)
-                {
-                    if (restoreScratch[i] != null) WaterfallBridge.SetFlameVisible(restoreScratch[i], true);
-                    hiddenWaterfall.Remove(restoreScratch[i]); hideStamp.Remove(restoreScratch[i]);
-                }
-            }
-
             // plumes that were not drawn this frame go away (the engine stopped, or it fell out of the budget)
             stale.Clear();
             foreach (KeyValuePair<long, Plume> kv in plumes)
@@ -299,27 +249,6 @@ namespace RaymarchedPlumeTrails
                 if (p.go != null) p.go.SetActive(false);
                 SmokeRenderRegistry.SetActive(p.mr, false);
                 if (now - p.seen > 4f) { Kill(p); plumes.Remove(stale[i]); }
-            }
-        }
-
-        private readonly Dictionary<long, Vector2> flameSmooth = new Dictionary<long, Vector2>();
-        private readonly Dictionary<long, Vector3> flameMeasure = new Dictionary<long, Vector3>();      // nozzle -> (flame length, width, time measured)
-        private readonly List<PartModule> restoreScratch = new List<PartModule>();
-        private bool everyWaterfallRestored;
-
-        // the physical plumes are off: every Waterfall flame on every loaded vessel is shown again, once (not only the ones this component remembers hiding: the set is
-        // lost with the component, and a flame left with forceRenderingOff stays invisible for good)
-        private void RestoreEveryWaterfall()
-        {
-            if (everyWaterfallRestored || !WaterfallBridge.Available) return;
-            everyWaterfallRestored = true;
-            List<Vessel> loaded = FlightGlobals.VesselsLoaded;
-            if (loaded == null) return;
-            for (int vi = 0; vi < loaded.Count; vi++)
-            {
-                Vessel v = loaded[vi];
-                if (v == null) continue;
-                EngineClusterUtils.EnumerateEngines(v, (part, engine, prof, fx) => { if (fx != null) WaterfallBridge.SetFlameVisible(fx, true); });
             }
         }
 
@@ -342,15 +271,9 @@ namespace RaymarchedPlumeTrails
 
         private Plume Create()
         {
-            if (cubeMesh == null)
-            {
-                GameObject tmp = GameObject.CreatePrimitive(PrimitiveType.Cube);
-                cubeMesh = tmp.GetComponent<MeshFilter>().sharedMesh;
-                Destroy(tmp);
-            }
             Plume p = new Plume { seed = Random.value * 50f, born = Time.time, nextLog = Time.time };
             p.go = new GameObject("PlumeTrails.Plume");
-            p.go.AddComponent<MeshFilter>().sharedMesh = cubeMesh;
+            p.go.AddComponent<MeshFilter>().sharedMesh = VolumeProxyMesh.Cube;
             p.mr = p.go.AddComponent<MeshRenderer>();
             p.mr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
             p.mr.receiveShadows = false;

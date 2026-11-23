@@ -5,6 +5,7 @@ namespace RaymarchedPlumeTrails
 {
     public struct EngineSample
     {
+        public Transform nozzle;
         public Vector3 position;
         public Vector3 forward;
         public float throttle;
@@ -19,8 +20,6 @@ namespace RaymarchedPlumeTrails
         // over its thrust transforms so that summing squares over a group gives the total
         // exhaust footprint. The nozzle-size proxy - see NozzleSizeFactor.
         public float nozzleDiameter;
-        // Solid motor? Lets the landing cloud tell a liquid engine it was only let in FOR the
-        // splash from one that is allowed the full trail.
         public bool isSolid;
         public PlumeKind kind;       // what the engine burns (solid, kerolox, hydrolox ...): the trail is drawn per kind
         // Delivered thrust of this transform in kN (engine.finalThrust shared over its thrust transforms).
@@ -62,13 +61,10 @@ namespace RaymarchedPlumeTrails
             return false;
         }
 
-        // Whether this engine may emit at all under the current mode. forceAllEngines
-        // bypasses the SRB-only filter - used for the landing cloud (28 IX), which needs
-        // liquid engines too, without reopening the ascent trail to them.
         private static bool Emits(EnginePlumeProfile prof, bool forceAllEngines)
         {
-            // every engine is sampled (heat haze, the flame light); whether it leaves a TRAIL is decided per engine by SmokeTuning.TrailDensity (trail only from solid boosters)
-            return true;
+            if (forceAllEngines || prof.IsSolid) return true;
+            return !SmokeTuning.SrbOnly && SmokeTuning.LiquidPlumes && prof.enabled;
         }
 
         // Thrust-weighted look of a group from its engines' profiles: size / density multipliers for the liquid
@@ -177,18 +173,10 @@ namespace RaymarchedPlumeTrails
             return maxThrust;
         }
 
-        public static List<EngineSample> GatherEngineSamples(Vessel vessel, bool forceAllEngines = false)
+        public static void GatherEngineSamples(Vessel vessel, List<EngineSample> samples)
         {
-            List<EngineSample> samples = new List<EngineSample>();
+            samples.Clear();
             VesselEngines c = EnginesOf(vessel);
-            // verniers below a fraction of the strongest engine are ignored - of the strongest engine of the SAME KIND: side boosters are small next to a liquid core,
-            // and compared with it they were dropped as verniers, so a rocket with strong liquid engines and solid boosters left no trail from the boosters
-            float[] maxByKind = new float[8];
-            for (int i = 0; i < c.engines.Count; i++)
-            {
-                int k = (int)c.profiles[i].kind;
-                if (k >= 0 && k < maxByKind.Length && c.engines[i].maxThrust > maxByKind[k]) maxByKind[k] = c.engines[i].maxThrust;
-            }
 
             if (c.fLen.Length != c.engines.Count)
             {
@@ -200,13 +188,9 @@ namespace RaymarchedPlumeTrails
                 Part part = c.parts[ei];
                 if (!engine.EngineIgnited || engine.flameout) continue;
                 if (engine.currentThrottle <= 0.001f) continue;
-                // a burnt-out motor that was staged away: its throttle still reads 1 (a solid motor has no throttle) but it delivers no thrust, so it emits nothing
-                if (engine.finalThrust <= 0.002f * Mathf.Max(engine.maxThrust, 0.001f)) continue;
-                int kindIdx = (int)c.profiles[ei].kind;
-                if (kindIdx >= 0 && kindIdx < maxByKind.Length && engine.maxThrust < maxByKind[kindIdx] * RelativeThrustThreshold) continue;
                 EnginePlumeProfile prof = c.profiles[ei];
-                if (!Emits(prof, forceAllEngines)) continue;
-                bool liquidLook = SmokeTuning.SrbOnly && SmokeTuning.LiquidPlumes && !prof.IsSolid;
+                if (!Emits(prof, false)) continue;
+                bool liquidLook = !prof.IsSolid;
                 int nTransforms = Mathf.Max(1, engine.thrustTransforms.Count);
 
                 // the flame Waterfall draws for this engine (re-measured 5x a second: it follows the throttle)
@@ -230,6 +214,7 @@ namespace RaymarchedPlumeTrails
                     if (t == null) continue;
                     samples.Add(new EngineSample
                     {
+                        nozzle = t,
                         position = t.position,
                         forward = t.forward,
                         throttle = engine.currentThrottle,
@@ -257,7 +242,6 @@ namespace RaymarchedPlumeTrails
                 }
             }
 
-            return samples;
         }
 
         // Nozzle exit diameter (m) from the rated thrust of one nozzle (kN). Real exits cluster on D ~ F^0.4:

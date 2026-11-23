@@ -17,7 +17,7 @@ Shader "RaymarchedPlumeTrails/SmokeComposite"
         Cull Off
         ZWrite Off
         ZTest Always
-        // the source is already premultiplied (see SmokeVolume.shader), so the classic
+        // the source is already premultiplied (see TrailCapsules.shader), so the classic
         // over-operator is One / OneMinusSrcAlpha rather than SrcAlpha / OneMinusSrcAlpha
         Blend One OneMinusSrcAlpha
 
@@ -33,6 +33,7 @@ Shader "RaymarchedPlumeTrails/SmokeComposite"
             sampler2D_float _CameraDepthTexture;
             // global, set from HalfResSmokeRenderer: overall smoke opacity slider
             float _PlumeOpacity;
+            #include "SmokeDepthUpsample.cginc"
 
             struct v2f
             {
@@ -50,36 +51,8 @@ Shader "RaymarchedPlumeTrails/SmokeComposite"
 
             fixed4 frag(v2f i) : SV_Target
             {
-                float2 texel = _MainTex_TexelSize.xy;
-
-                // depth this full-res pixel actually belongs to
-                float targetDepth = min(LinearEyeDepth(SAMPLE_DEPTH_TEXTURE(_CameraDepthTexture, i.uv)), 15000.0);
-
-                // the four half-res texels around it, and the scene depth each of them
-                // was rendered against
-                float2 uvs[4];
-                uvs[0] = i.uv + float2(-0.5, -0.5) * texel;
-                uvs[1] = i.uv + float2( 0.5, -0.5) * texel;
-                uvs[2] = i.uv + float2(-0.5,  0.5) * texel;
-                uvs[3] = i.uv + float2( 0.5,  0.5) * texel;
-
-                float bestDiff = 1e20;
-                int best = 0;
-                for (int s = 0; s < 4; s++)
-                {
-                    float d = min(LinearEyeDepth(SAMPLE_DEPTH_TEXTURE(_CameraDepthTexture, uvs[s])), 15000.0);
-                    float diff = abs(d - targetDepth);
-                    if (diff < bestDiff) { bestDiff = diff; best = s; }
-                }
-
-                // Where all four agree on depth there is no edge to protect, so take the
-                // smooth bilinear sample; only fall back to the single nearest texel where
-                // they disagree, which is exactly where point sampling avoids a halo.
-                fixed4 smooth = tex2D(_MainTex, i.uv);
-                fixed4 nearest = tex2D(_MainTex, uvs[best]);
-                float edge = saturate(bestDiff * 0.5);
-                // premultiplied source, so scaling every channel is the correct fade
-                return lerp(smooth, nearest, edge) * _PlumeOpacity;
+                PlumeDepthSelection selection = SelectPlumeDepthSamples(i.uv);
+                return SamplePlumeCurrentColor(selection) * _PlumeOpacity;
             }
             ENDCG
         }
@@ -118,6 +91,7 @@ Shader "RaymarchedPlumeTrails/SmokeComposite"
             float4x4 _PlumeReprojView;
             float _PlumeHistoryValid;
             float _PlumeFeedback;
+            #include "SmokeDepthUpsample.cginc"
 
             struct v2f
             {
@@ -135,28 +109,10 @@ Shader "RaymarchedPlumeTrails/SmokeComposite"
 
             // The same depth-aware upsample the plain composite uses, so silhouettes of the
             // rocket do not grow a halo when the current frame is stretched to full size.
-            float4 CurrentSample(float2 uv)
+            float4 CurrentSample(float2 uv, out PlumeDepthSelection selection)
             {
-                float2 texel = _MainTex_TexelSize.xy;
-                float targetDepth = min(LinearEyeDepth(SAMPLE_DEPTH_TEXTURE(_CameraDepthTexture, uv)), 15000.0);
-
-                float2 uvs[4];
-                uvs[0] = uv + float2(-0.5, -0.5) * texel;
-                uvs[1] = uv + float2( 0.5, -0.5) * texel;
-                uvs[2] = uv + float2(-0.5,  0.5) * texel;
-                uvs[3] = uv + float2( 0.5,  0.5) * texel;
-
-                float bestDiff = 1e20;
-                int best = 0;
-                for (int s = 0; s < 4; s++)
-                {
-                    float d = min(LinearEyeDepth(SAMPLE_DEPTH_TEXTURE(_CameraDepthTexture, uvs[s])), 15000.0);
-                    float diff = abs(d - targetDepth);
-                    if (diff < bestDiff) { bestDiff = diff; best = s; }
-                }
-                float4 smooth = tex2D(_MainTex, uv);
-                float4 nearest = tex2D(_MainTex, uvs[best]);
-                return lerp(smooth, nearest, saturate(bestDiff * 0.5));
+                selection = SelectPlumeDepthSamples(uv);
+                return SamplePlumeCurrentColor(selection);
             }
 
             // Catmull-Rom (sharpness 0.5) in 5 taps: the history is resampled without the blur of a bilinear fetch (that blur, repeated every frame, softens the smoke)
@@ -185,7 +141,8 @@ Shader "RaymarchedPlumeTrails/SmokeComposite"
             float4 fragResolve(v2f i) : SV_Target
             {
                 float2 uv = i.uv;
-                float4 cur = CurrentSample(uv);
+                PlumeDepthSelection selection;
+                float4 cur = CurrentSample(uv, selection);
                 if (_PlumeHistoryValid < 0.5) return cur;
 
                 // 3x3 neighbourhood of the CURRENT frame, read at texel centres. History
@@ -209,24 +166,38 @@ Shader "RaymarchedPlumeTrails/SmokeComposite"
                 // Reproject. Pixels with no smoke have nothing to place, so they look up
                 // their own position; the clamp then removes whatever history disagrees.
                 float2 uvPrev = uv;
-                float4 aux = tex2D(_PlumeAux, uv);
+                float2 sampleUVs[4];
+                sampleUVs[0] = selection.uv0; sampleUVs[1] = selection.uv1;
+                sampleUVs[2] = selection.uv2; sampleUVs[3] = selection.uv3;
+                float4 aux = float4(0, 0, 0, 0);
+                float3 viewPositionMoment = float3(0, 0, 0);
+                float2 p11_22 = float2(unity_CameraProjection._11, unity_CameraProjection._22);
+                float2 p13_23 = float2(unity_CameraProjection._13, unity_CameraProjection._23);
+                [unroll] for (int sampleIndex = 0; sampleIndex < 4; sampleIndex++)
+                {
+                    float4 sampleAux = tex2D(_PlumeAux, sampleUVs[sampleIndex]);
+                    float sampleWeight = selection.weights[sampleIndex];
+                    float2 rayUV = PlumeSampleRayUV(sampleUVs[sampleIndex]);
+                    float3 viewRay = float3((rayUV * 2.0 - 1.0 - p13_23) / p11_22, -1.0);
+                    viewPositionMoment += sampleWeight * sampleAux.x * normalize(viewRay);
+                    aux += sampleWeight * sampleAux;
+                }
                 if (aux.y > 1e-4)
                 {
-                    float dist = aux.x / aux.y;
-                    float2 p11_22 = float2(unity_CameraProjection._11, unity_CameraProjection._22);
-                    float2 p13_23 = float2(unity_CameraProjection._13, unity_CameraProjection._23);
-                    float3 viewRay = float3((uv * 2.0 - 1.0 - p13_23) / p11_22, -1.0);
-                    float3 vpos = normalize(viewRay) * dist;
+                    // Sum actual selected rays' distance moments, rather than
+                    // assigning another texel's depth to the output pixel's ray.
+                    float3 vpos = viewPositionMoment / aux.y;
                     float3 vprev = mul(_PlumeReprojView, float4(vpos, 1.0)).xyz;
-                    if (-vprev.z > 0.05)
-                    {
-                        float2 ndc = (vprev.xy / -vprev.z) * p11_22 + p13_23;
-                        uvPrev = ndc * 0.5 + 0.5;
-                    }
+                    // A point behind the previous camera has no screen history.
+                    // Keeping the current UV here would sample an unrelated pixel.
+                    if (!(-vprev.z > 0.05)) return cur;
+                    float2 ndc = (vprev.xy / -vprev.z) * p11_22 + p13_23;
+                    uvPrev = ndc * 0.5 + 0.5;
                     // the smoke itself moved (it grew): where this point of it was a frame ago, from the volume pass
                     uvPrev += aux.zw / aux.y;
                 }
-                if (any(uvPrev < 0.0) || any(uvPrev > 1.0)) return cur;
+                // Negated inclusive checks also reject unordered/NaN UVs.
+                if (!all(uvPrev >= 0.0) || !all(uvPrev <= 1.0)) return cur;
 
                 float4 histRaw = SampleHistoryCR(uvPrev);
                 // the history is kept inside mean +- 1.25 sigma of the 3x3 of the current frame (a statistical clamp: min/max alone lets a ghost through at the edge of
@@ -241,6 +212,23 @@ Shader "RaymarchedPlumeTrails/SmokeComposite"
                 float miss = saturate(abs(histRaw.a - hist.a) * 4.0);
                 float w = _PlumeFeedback * (1.0 - miss);
                 return lerp(cur, hist, w);
+            }
+            ENDCG
+        }
+
+        // Pass 2: resolved history is already full resolution. Composite it
+        // directly; a second depth-guided selection would alter the resolve.
+        Pass
+        {
+            CGPROGRAM
+            #pragma vertex vert_img
+            #pragma fragment fragResolved
+            #include "UnityCG.cginc"
+            sampler2D _MainTex;
+            float _PlumeOpacity;
+            fixed4 fragResolved(v2f_img i) : SV_Target
+            {
+                return tex2D(_MainTex, i.uv) * _PlumeOpacity;
             }
             ENDCG
         }

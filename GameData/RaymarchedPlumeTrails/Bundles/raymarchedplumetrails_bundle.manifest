@@ -1,34 +1,23 @@
 ManifestFileVersion: 0
-CRC: 2853829824
+CRC: 761290687
 Hashes:
   AssetFileHash:
     serializedVersion: 2
-    Hash: 21e44621da994900385839e329ba81f2
+    Hash: 2f64247270b196ff449204b3f4d37834
   TypeTreeHash:
     serializedVersion: 2
-    Hash: 16539637ca66e19ac3f3683282fca82e
+    Hash: d6617f579a21db6914d356f34a6c9a37
 HashAppended: 0
 ClassTypes:
-- Class: 21
-  Script: {instanceID: 0}
 - Class: 48
   Script: {instanceID: 0}
 - Class: 72
   Script: {instanceID: 0}
 SerializeReferenceClassIdentifiers: []
 Assets:
-- Assets/RaymarchedPlumeTrails/SmokeVolume.shader
-- Assets/RaymarchedPlumeTrails/BlastFluid.compute
 - Assets/RaymarchedPlumeTrails/TrailCapsules.shader
 - Assets/RaymarchedPlumeTrails/SmokeVolumeSplat.compute
-- Assets/RaymarchedPlumeTrails/PadFluid.shader
-- Assets/RaymarchedPlumeTrails/PadLayer.shader
-- Assets/RaymarchedPlumeTrails/PadFluid.compute
 - Assets/RaymarchedPlumeTrails/PlumeCore.shader
-- Assets/RaymarchedPlumeTrails/BlastDebris.shader
 - Assets/RaymarchedPlumeTrails/HeatHaze.shader
-- Assets/RaymarchedPlumeTrails/PadHeight.shader
 - Assets/RaymarchedPlumeTrails/SmokeComposite.shader
-- Assets/RaymarchedPlumeTrails/ShockLens.shader
-- Assets/RaymarchedPlumeTrails/SmokeVolumeMat.mat
 Dependencies: []

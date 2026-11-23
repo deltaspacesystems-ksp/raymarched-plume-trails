@@ -61,10 +61,6 @@ namespace RaymarchedPlumeTrails
             if (streak > 0.01f) len = System.Math.Max(len, len + (System.Math.Min(s.coreLength * 55.0, 1500.0) * scale - len) * streak);
             len = System.Math.Min(len, streak > 0.01f ? 1500.0 : 320.0);
             double r = System.Math.Max(s.Dj, s.De) * 0.9 + s.spread * len + 0.6 * s.De + 0.5 * s.Ls * System.Math.Max(0.0, System.Math.Min(s.tanLip, 3.0)) + (s.PR > 1.5 ? len * System.Math.Max(0.0, System.Math.Min(s.tanLip, 3.0)) : 0.0);
-            // The width: a jet that leaves a 0.9 m nozzle is not 34 m wide. The sum above stacked three spreading terms (the free-jet spread, the lip angle and the
-            // pressure-ratio fan, which alone added length * tan(lip)) and gave 30+ m for an engine of one metre. The barrel of an underexpanded plume is a few exit
-            // diameters, then the mixing jet widens by about a tenth of the distance.
-            r = System.Math.Min(r, (2.4 * System.Math.Max(s.Dj, s.De) + 0.14 * len) * SmokeTuning.PlumeWidthScale);
             length = (float)System.Math.Max(len, 1.0);
             if (deflectAt > 0f && deflectAt < len) r = System.Math.Max(r, (len - deflectAt) * 1.05 + 0.6 * s.De);      // the turned flame runs sideways
             rMax = (float)System.Math.Min(r, 140.0);
@@ -88,7 +84,7 @@ namespace RaymarchedPlumeTrails
             mb.SetVector("_PlumeB", new Vector4((float)s.spread, (float)s.shockStrength * (kind == PropellantKind.Solid ? 0.12f : 1f), (float)s.machDiskX, (float)s.machDiskR));
             mb.SetVector("_PlumeC", new Vector4((float)s.Te, (float)(s.ambientTemp > 0 ? s.ambientTemp : 285.0), (float)thr, (float)l.radBoost));
             mb.SetVector("_PlumeF", new Vector4((float)System.Math.Min(s.tanLip, 3.0), (float)s.oxygen, (float)System.Math.Min(s.PR, 60.0), (float)(2.0 / System.Math.Max(s.gamma - 1.0, 0.05))));
-            mb.SetVector("_PlumeD", new Vector4((float)(ch.sootLoading * l.sootScale * SmokeTuning.PlumeSootScale), (float)ch.afterburn, (float)(ch.emissivityGas * l.gasBoost), exposure));
+            mb.SetVector("_PlumeD", new Vector4((float)(ch.sootLoading * l.sootScale), (float)ch.afterburn, (float)(ch.emissivityGas * l.gasBoost), exposure));
             mb.SetVector("_PlumeE", new Vector4(seed, steps, (float)s.Uc, timeOverride));
             mb.SetVector("_PlumeJ", kind == PropellantKind.Solid ? new Vector4(0.55f, 0.9f, 0f, 0f) : (kind == PropellantKind.Kerolox ? new Vector4(0.12f, 0.25f, 0f, 0f) : Vector4.zero));
             if (kind == PropellantKind.Solid) l.after = new Color(1f, 0.70f, 0.40f, 1f);        // a solid motor burns cream-white (alumina) with an orange fringe

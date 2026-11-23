@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
 
@@ -9,6 +9,8 @@ namespace RaymarchedPlumeTrails
     // is what "visible" means for them.
     public static class SmokeRenderRegistry
     {
+        public static uint HistoryRevision { get; private set; }
+        public static void InvalidateHistory() { unchecked { HistoryRevision++; } }
         public static readonly List<Renderer> Active = new List<Renderer>();
 
         // The property block each renderer was given, kept alongside it.
@@ -113,6 +115,7 @@ namespace RaymarchedPlumeTrails
             public float prevFov, prevAspect;
             public float lastTime = -999f;
             public bool haveHistory;
+            public uint historyRevision;
             public bool armed;                // a temporal buffer was recorded for this frame
             public int frame;
         }
@@ -175,6 +178,7 @@ namespace RaymarchedPlumeTrails
                 ? body.bodyTransform.localToWorldMatrix : Matrix4x4.identity;
 
             bool valid = st.haveHistory
+                && st.historyRevision == SmokeRenderRegistry.HistoryRevision
                 && st.prevBody == body
                 && Time.unscaledTime - st.lastTime < 0.25f
                 && Mathf.Abs(cam.fieldOfView - st.prevFov) < 0.01f
@@ -203,6 +207,7 @@ namespace RaymarchedPlumeTrails
             st.prevAspect = cam.aspect;
             st.lastTime = Time.unscaledTime;
             st.haveHistory = true;
+            st.historyRevision = SmokeRenderRegistry.HistoryRevision;
         }
         private Light sunLight;
         private float sunSearchTimer;
@@ -271,6 +276,18 @@ namespace RaymarchedPlumeTrails
 
         private bool inited, noShaderLogged;
 
+        private void Awake() { GameEvents.onGameStateLoad.Add(OnGameStateLoad); }
+        private void OnGameStateLoad(ConfigNode node)
+        {
+            foreach (TemporalState state in temporal.Values)
+            {
+                state.haveHistory = false;
+                state.armed = false;
+            }
+            foreach (CommandBuffer buffer in buffers.Values) buffer.Clear();
+            foreach (CommandBuffer buffer in shadowBuffers.Values) buffer.Clear();
+            if (maskCb != null) maskCb.Clear();
+        }
         private void Start() { if (ModSettings.Enabled) TryInit(); }
 
         // made when the mod is on and the shaders are loaded (a mod that was off at the start loads nothing: this runs when it is switched on)
@@ -340,6 +357,7 @@ namespace RaymarchedPlumeTrails
 
         private void OnDestroy()
         {
+            GameEvents.onGameStateLoad.Remove(OnGameStateLoad);
             Camera.onPreRender -= OnCameraPreRender;
             ReleaseCameraHooks();
 
@@ -511,11 +529,6 @@ namespace RaymarchedPlumeTrails
                 cb = new CommandBuffer { name = "RaymarchedPlumeTrails cast shadow" };
                 cam.AddCommandBuffer(ShadowStage, cb);
                 shadowBuffers[cam] = cb;
-                // same event as the smoke (smoke before clouds): the buffers run in the order they were added, and the multiply must come FIRST,
-                // or it darkens the smoke itself - so the smoke buffer goes behind it
-                CommandBuffer sm; CameraEvent se;
-                if (buffers.TryGetValue(cam, out sm) && bufferStage.TryGetValue(cam, out se) && se == ShadowStage)
-                { cam.RemoveCommandBuffer(se, sm); cam.AddCommandBuffer(se, sm); }
             }
 
             cb.Clear();
@@ -621,6 +634,10 @@ namespace RaymarchedPlumeTrails
             if (compositeMaterial == null) return;
             Shader.SetGlobalFloat("_PlumeOpacity", Mathf.Clamp01(SmokeTuning.Opacity));
             Shader.SetGlobalFloat("_SmokeAerialK", AerialK());
+            // Volumes are uploaded here, after every group has ticked, so trails that have
+            // grown together can be drawn as one.
+
+
             SmokeQuality.Tick(SmokeRenderRegistry.Active.Count > 0);
             UpdateSunDirection();
 
@@ -792,7 +809,7 @@ namespace RaymarchedPlumeTrails
                 // resolve into this frame's history, then lay that over the scene
                 cb.Blit(HalfResId, tst.hist[tst.write], compositeMaterial, 1);
                 cb.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
-                cb.Blit(tst.hist[tst.write], BuiltinRenderTextureType.CameraTarget, compositeMaterial, 0);
+                cb.Blit(tst.hist[tst.write], BuiltinRenderTextureType.CameraTarget, compositeMaterial, 2);
                 cb.ReleaseTemporaryRT(AuxId);
                 cb.ReleaseTemporaryRT(DepthTmpId);
 

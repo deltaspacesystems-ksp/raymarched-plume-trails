@@ -62,7 +62,7 @@ namespace RaymarchedPlumeTrails
             }
 
             ConfigNode cfg = File.Exists(CfgPath) ? ConfigNode.Load(CfgPath) : null;
-            bool check = true;
+            bool check = false;
             string skip = "", apiOverride = "";
             if (cfg != null)
             {
